@@ -1,0 +1,776 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Morphe Builder</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+    <style>
+        [x-cloak] { display: none !important; }
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: #0f172a; }
+        ::-webkit-scrollbar-thumb { background: #334155; border-radius: 10px; }
+        ::-webkit-scrollbar-thumb:hover { background: #475569; }
+    </style>
+</head>
+<body class="bg-slate-950 text-slate-200 font-sans antialiased" x-data="morphe">
+
+    <script>
+        document.addEventListener('alpine:init', () => {
+            Alpine.data('morphe', () => ({
+                activeTab: 'pipeline',
+                search: '', 
+                building: false,
+                buildMessage: 'Idle',
+                discoveryApps: {{ available_apps | tojson | safe }},
+                pipelineApps: {{ config.apps | tojson | safe }},
+                sources: {{ config.sources | tojson | safe }},
+                metadata: {{ metadata | tojson | safe }},
+                settings: {{ (config.settings if config.settings else {"server_url": "", "cron_schedule": "0 0 * * *", "notification_urls": []}) | tojson | safe }},
+                updates: {},
+                selectedApps: [],
+                showModal: false,
+                showUploadModal: false,
+                isEditing: false,
+                selectedPkg: null,
+                selectedAppName: '',
+                uploadVersion: '',
+                availablePatches: [],
+                loadingPatches: false,
+                buildLogs: '',
+                showLogs: false,
+                toolsUpdating: false,
+                refreshing: false,
+                newNotificationUrl: '',
+                testingNotifications: false,
+
+                diagnostics: {java: true, apkeep: true},
+
+                init() {
+                    this.checkBuildStatus();
+                    this.checkToolsStatus();
+                    this.checkUpdates();
+                    setInterval(() => {
+                        this.checkBuildStatus();
+                        if (this.building || this.showLogs) {
+                            this.fetchLogs();
+                        }
+                    }, 2000);
+                    setInterval(() => {
+                        this.checkToolsStatus();
+                    }, 5000);
+                },
+
+                async checkUpdates() {
+                    try {
+                        const response = await fetch('/api/ui/updates');
+                        this.updates = await response.json();
+                    } catch (e) {
+                        console.error('Failed to check for updates', e);
+                    }
+                },
+
+                async checkToolsStatus() {
+                    try {
+                        const response = await fetch('/api/ui/tools_status');
+                        const data = await response.json();
+                        const wasUpdating = this.toolsUpdating;
+                        this.toolsUpdating = data.updating;
+                        if (data.diagnostics) {
+                            this.diagnostics = data.diagnostics;
+                        }
+                        
+                        if (wasUpdating && !this.toolsUpdating) {
+                            this.refreshDiscovery();
+                        }
+                    } catch (e) {
+                        console.error('Failed to fetch tools status', e);
+                    }
+                },
+
+                async checkBuildStatus() {
+                    try {
+                        const response = await fetch('/api/ui/build_status');
+                        const data = await response.json();
+                        this.building = data.in_progress;
+                        this.buildMessage = data.message;
+                    } catch (e) {
+                        console.error('Failed to fetch build status', e);
+                    }
+                },
+
+                async fetchLogs() {
+                    try {
+                        const response = await fetch('/api/ui/logs');
+                        const data = await response.json();
+                        
+                        const lines = data.logs.split('\n');
+                        this.buildLogs = lines.map(line => {
+                            const lastR = line.lastIndexOf('\r');
+                            return lastR !== -1 ? line.substring(lastR + 1) : line;
+                        }).join('\n');
+
+                        this.$nextTick(() => {
+                            const el = document.getElementById('log-container');
+                            if (el) el.scrollTop = el.scrollHeight;
+                        });
+                    } catch (e) {
+                        console.error('Failed to fetch logs', e);
+                    }
+                },
+
+                async triggerBuild() {
+                    if (this.building) return;
+                    this.building = true;
+                    this.buildMessage = 'Starting...';
+                    
+                    const payload = {
+                        package_ids: this.selectedApps.length > 0 ? this.selectedApps : null
+                    };
+
+                    await fetch('/api/ui/trigger_build', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify(payload)
+                    });
+                },
+
+                async openAddModal(app) {
+                    this.isEditing = false;
+                    this.selectedPkg = app.pkg;
+                    this.selectedAppName = app.name + 'Patched';
+                    this.showModal = true;
+                    this.loadingPatches = true;
+                    this.availablePatches = [];
+                    
+                    try {
+                        const response = await fetch(`/api/ui/patches/${app.pkg}`);
+                        const data = await response.json();
+                        this.availablePatches = data.map(p => ({...p, selected: p.enabled_by_default}));
+                    } catch (e) {
+                        console.error('Failed to fetch patches', e);
+                    } finally {
+                        this.loadingPatches = false;
+                    }
+                },
+
+                async openEditModal(app) {
+                    if (!app) return;
+                    this.isEditing = true;
+                    this.selectedPkg = app.id;
+                    this.selectedAppName = app.name;
+                    this.showModal = true;
+                    this.loadingPatches = true;
+                    this.availablePatches = [];
+
+                    try {
+                        const response = await fetch(`/api/ui/patches/${app.id}`);
+                        const data = await response.json();
+                        const currentPatches = app.include_patches || [];
+                        this.availablePatches = data.map(p => ({
+                            ...p, 
+                            selected: currentPatches.includes(p.name)
+                        }));
+                    } catch (e) {
+                        console.error('Failed to fetch patches', e);
+                    } finally {
+                        this.loadingPatches = false;
+                    }
+                },
+
+                async saveApp() {
+                    const include_patches = this.availablePatches.filter(p => p.selected).map(p => p.name);
+                    await fetch('/api/ui/add_app', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({
+                            package_id: this.selectedPkg,
+                            name: this.selectedAppName,
+                            include_patches: include_patches
+                        })
+                    });
+                    location.reload();
+                },
+
+                async uploadApk() {
+                    if (!this.uploadVersion || !this.$refs.fileInput.files[0]) {
+                        alert('Please provide a version and select a file.');
+                        return;
+                    }
+                    
+                    const formData = new FormData();
+                    formData.append('package_id', this.selectedPkg);
+                    formData.append('version_str', this.uploadVersion);
+                    formData.append('file', this.$refs.fileInput.files[0]);
+
+                    try {
+                        const response = await fetch('/api/ui/upload_apk', {
+                            method: 'POST',
+                            body: formData
+                        });
+                        const data = await response.json();
+                        alert(data.message);
+                        this.showUploadModal = false;
+                        this.checkUpdates();
+                    } catch (e) {
+                        console.error('Upload failed', e);
+                        alert('Upload failed');
+                    }
+                },
+
+                async addSource() {
+                    const repo = prompt('Enter GitHub repository (e.g., User/repo):');
+                    if (!repo) return;
+                    await fetch('/api/ui/add_source', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ repo })
+                    });
+                },
+
+                async toggleSource(source) {
+                    await fetch('/api/ui/toggle_source', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ repo: source.repo, active: !source.active })
+                    });
+                    this.refreshDiscovery();
+                    source.active = !source.active;
+                },
+
+                async deleteSource(source) {
+                    if(!confirm(`Remove source ${source.name}?`)) return;
+                    await fetch('/api/ui/delete_source', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ repo: source.repo })
+                    });
+                    this.sources = this.sources.filter(s => s.repo !== source.repo);
+                    this.refreshDiscovery();
+                },
+
+                async refreshDiscovery(sync = false) {
+                    this.refreshing = true;
+                    try {
+                        const response = await fetch(`/api/ui/discovery${sync ? '?sync=true' : ''}`);
+                        const data = await response.json();
+                        this.discoveryApps = data.apps;
+                        if (sync) {
+                            setTimeout(() => this.refreshDiscovery(false), 3000);
+                        }
+                    } catch (e) {
+                        console.error('Failed to refresh discovery list', e);
+                    } finally {
+                        this.refreshing = false;
+                    }
+                },
+
+                async saveSettings() {
+                    // Ensure notification_urls exists
+                    if (!this.settings.notification_urls) this.settings.notification_urls = [];
+                    
+                    await fetch('/api/ui/save_settings', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify(this.settings)
+                    });
+                    alert('Settings saved!');
+                },
+
+                async testNotifications() {
+                    if (this.settings.notification_urls.length === 0) {
+                        alert('Add at least one URL first.');
+                        return;
+                    }
+                    this.testingNotifications = true;
+                    try {
+                        const response = await fetch('/api/ui/test_notification', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify(this.settings)
+                        });
+                        const data = await response.json();
+                        if (data.status === 'success') {
+                            alert('Test notification sent!');
+                        } else {
+                            alert('Failed to send test notification.');
+                        }
+                    } catch (e) {
+                        console.error('Test failed', e);
+                    } finally {
+                        this.testingNotifications = false;
+                    }
+                },
+
+                addToObtainium(id) {
+                    const baseUrl = this.settings.server_url || window.location.origin;
+                    const apiUrl = `${baseUrl.replace(/\/$/, '')}/api/apps/${id}`;
+                    // Obtainium expects the raw URL after the protocol
+                    window.location.href = `obtainium://add/${apiUrl}`;
+                }
+            }))
+        })
+    </script>
+
+
+    <!-- Upload Modal -->
+    <div x-cloak x-show="showUploadModal" class="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm">
+        <div @click.away="showUploadModal = false" class="bg-slate-900 border border-slate-800 w-full max-w-lg rounded-3xl shadow-2xl overflow-hidden flex flex-col">
+            <div class="p-8 border-b border-slate-800 flex justify-between items-center">
+                <div>
+                    <h2 class="text-2xl font-bold text-white">Upload Manual APK</h2>
+                    <p class="text-slate-500 text-sm mt-1" x-text="selectedPkg"></p>
+                </div>
+                <button @click="showUploadModal = false" class="text-slate-500 hover:text-white transition-colors">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" /></svg>
+                </button>
+            </div>
+
+            <div class="p-8 space-y-6">
+                <div class="space-y-2">
+                    <label class="text-xs font-bold text-slate-500 uppercase tracking-widest">Version Name</label>
+                    <input type="text" x-model="uploadVersion" placeholder="e.g. 1.2.3" class="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-white focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500 outline-none transition-all">
+                    <p class="text-[10px] text-slate-600">This should match a version supported by the patches.</p>
+                </div>
+
+                <div class="space-y-2">
+                    <label class="text-xs font-bold text-slate-500 uppercase tracking-widest">APK File</label>
+                    <input type="file" x-ref="fileInput" class="w-full text-sm text-slate-400 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-xs file:font-bold file:bg-indigo-600 file:text-white hover:file:bg-indigo-500 transition-all cursor-pointer">
+                </div>
+            </div>
+
+            <div class="p-8 bg-slate-950/50 border-t border-slate-800 flex gap-4">
+                <button @click="showUploadModal = false" class="flex-1 px-6 py-3 rounded-xl font-bold text-slate-400 hover:bg-slate-800 transition-all">Cancel</button>
+                <button @click="uploadApk" class="flex-1 px-6 py-3 rounded-xl font-bold bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg shadow-emerald-600/20 transition-all">Upload APK</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal Overlay -->
+    <div x-cloak x-show="showModal" class="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm">
+        <div @click.away="showModal = false" class="bg-slate-900 border border-slate-800 w-full max-w-2xl rounded-3xl shadow-2xl overflow-hidden flex flex-col max-h-[90vh]">
+            <div class="p-8 border-b border-slate-800 flex justify-between items-center">
+                <div>
+                    <h2 class="text-2xl font-bold text-white" x-text="isEditing ? 'Edit Configuration' : 'Configure Patch'"></h2>
+                    <p class="text-slate-500 text-sm mt-1" x-text="selectedPkg"></p>
+                </div>
+                <button @click="showModal = false" class="text-slate-500 hover:text-white transition-colors">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" /></svg>
+                </button>
+            </div>
+
+            <div class="p-8 overflow-y-auto space-y-6">
+                <div class="space-y-2">
+                    <label class="text-xs font-bold text-slate-500 uppercase tracking-widest">App Name</label>
+                    <input type="text" x-model="selectedAppName" class="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-white focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500 outline-none transition-all">
+                </div>
+
+                <div class="space-y-4">
+                    <div class="flex items-center justify-between">
+                        <label class="text-xs font-bold text-slate-500 uppercase tracking-widest">Available Patches</label>
+                        <span class="text-[10px] text-slate-600" x-text="`${availablePatches.filter(p => p.selected).length} Selected`"></span>
+                    </div>
+
+                    <div x-show="loadingPatches" class="py-12 flex flex-col items-center justify-center gap-4 text-slate-500">
+                        <svg class="animate-spin h-8 w-8 text-indigo-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                        <p class="text-sm font-medium animate-pulse">Analyzing package compatibility...</p>
+                    </div>
+
+                    <div x-show="!loadingPatches" class="space-y-2">
+                        <template x-for="patch in availablePatches" :key="patch.name">
+                            <label class="flex items-start gap-4 p-4 bg-slate-950 border border-slate-800 rounded-2xl cursor-pointer hover:border-indigo-500/50 transition-all group">
+                                <input type="checkbox" x-model="patch.selected" class="mt-1 w-5 h-5 rounded border-slate-700 bg-slate-800 text-indigo-600 focus:ring-indigo-500/50">
+                                <div class="flex-1">
+                                    <div class="flex items-center gap-2">
+                                        <span class="font-bold text-slate-200 group-hover:text-indigo-400 transition-colors" x-text="patch.name"></span>
+                                        <template x-if="patch.enabled_by_default">
+                                            <span class="text-[8px] bg-indigo-500/10 text-indigo-400 px-1.5 py-0.5 rounded border border-indigo-500/20 uppercase font-black">Default</span>
+                                        </template>
+                                        <span class="text-[8px] text-slate-600 uppercase font-bold ml-auto" x-text="patch.source"></span>
+                                    </div>
+                                    <p class="text-xs text-slate-500 mt-1" x-text="patch.description"></p>
+                                </div>
+                            </label>
+                        </template>
+                        <template x-if="!loadingPatches && availablePatches.length === 0">
+                            <p class="text-center py-8 text-slate-600 italic text-sm">No patches found for this package.</p>
+                        </template>
+                    </div>
+                </div>
+            </div>
+
+            <div class="p-8 bg-slate-950/50 border-t border-slate-800 flex gap-4">
+                <button @click="showModal = false" class="flex-1 px-6 py-3 rounded-xl font-bold text-slate-400 hover:bg-slate-800 transition-all">Cancel</button>
+                <button @click="saveApp" class="flex-1 px-6 py-3 rounded-xl font-bold bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg shadow-indigo-600/20 transition-all">Save Configuration</button>
+            </div>
+        </div>
+    </div>
+
+    <header class="sticky top-0 z-50 w-full border-b border-slate-800 bg-slate-950/80 backdrop-blur-md">
+        <div class="container mx-auto px-6 h-16 flex items-center justify-between">
+            <div class="flex items-center gap-8">
+                <div class="flex items-center gap-3">
+                    <div class="w-10 h-10 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-xl flex items-center justify-center shadow-lg shadow-indigo-500/20">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="w-6 h-6 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5">
+                            <path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" />
+                        </svg>
+                    </div>
+                    <div>
+                        <h1 class="text-lg font-bold text-white leading-none">Morphe Builder</h1>
+                    </div>
+                </div>
+
+                <nav class="flex items-center gap-1 bg-slate-900 p-1 rounded-xl border border-slate-800">
+                    <button 
+                        @click="activeTab = 'discovery'"
+                        :class="activeTab === 'discovery' ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/20' : 'text-slate-400 hover:text-slate-200'"
+                        class="px-4 py-1.5 rounded-lg text-xs font-bold transition-all">
+                        Discovery
+                    </button>
+                    <button 
+                        @click="activeTab = 'pipeline'"
+                        :class="activeTab === 'pipeline' ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/20' : 'text-slate-400 hover:text-slate-200'"
+                        class="px-4 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-2">
+                        Pipeline
+                        <template x-if="building">
+                            <span class="flex h-2 w-2 relative">
+                                <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-indigo-400 opacity-75"></span>
+                                <span class="relative inline-flex rounded-full h-2 w-2 bg-indigo-500"></span>
+                            </span>
+                        </template>
+                    </button>
+                    <button 
+                        @click="activeTab = 'settings'"
+                        :class="activeTab === 'settings' ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/20' : 'text-slate-400 hover:text-slate-200'"
+                        class="px-4 py-1.5 rounded-lg text-xs font-bold transition-all">
+                        Settings
+                    </button>
+                </nav>
+            </div>
+            
+            <div class="flex items-center gap-4">
+                <div class="flex items-center gap-2 px-3 py-1 bg-slate-900 rounded-full border border-slate-800">
+                    <span class="text-[9px] font-black uppercase tracking-widest" :class="diagnostics.java ? 'text-emerald-500' : 'text-red-500'">Java</span>
+                    <div class="w-1.5 h-1.5 rounded-full" :class="diagnostics.java ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.4)]' : 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.4)]'"></div>
+                </div>
+                <div class="flex items-center gap-2 px-3 py-1 bg-slate-900 rounded-full border border-slate-800">
+                    <span class="text-[9px] font-black uppercase tracking-widest" :class="diagnostics.apkeep ? 'text-emerald-500' : 'text-red-500'">Apkeep</span>
+                    <div class="w-1.5 h-1.5 rounded-full" :class="diagnostics.apkeep ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.4)]' : 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.4)]'"></div>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <main class="container mx-auto px-6 py-10 max-w-7xl">
+        
+        <!-- Tab 1: Discovery -->
+        <div x-show="activeTab === 'discovery'" x-cloak class="space-y-10">
+            <div class="grid grid-cols-1 lg:grid-cols-12 gap-10">
+                <div class="lg:col-span-4 space-y-6">
+                    <div class="flex items-center justify-between">
+                        <h2 class="text-sm font-semibold text-slate-500 uppercase tracking-widest">Sources</h2>
+                        <template x-if="toolsUpdating">
+                            <div class="flex items-center gap-2 text-[10px] text-indigo-400 font-bold animate-pulse">
+                                <svg class="animate-spin h-3 w-3" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                                Syncing...
+                            </div>
+                        </template>
+                    </div>
+                    <div class="p-6 bg-slate-900 border border-slate-800 rounded-2xl space-y-4">
+                        <template x-for="source in sources" :key="source.repo">
+                            <div class="flex items-center justify-between p-3 bg-slate-950 rounded-xl border border-slate-800 group relative overflow-hidden">
+                                <div class="flex flex-col">
+                                    <span class="text-xs font-bold text-white" x-text="source.name"></span>
+                                    <span class="text-[10px] text-slate-500" x-text="source.repo"></span>
+                                </div>
+                                <div class="flex items-center gap-2">
+                                    <button 
+                                        @click="toggleSource(source)"
+                                        :class="source.active ? 'bg-emerald-500/10 text-emerald-500 border-emerald-500/20' : 'bg-slate-800 text-slate-500 border-slate-700'"
+                                        class="px-2 py-0.5 rounded text-[9px] font-bold border transition-all" 
+                                        x-text="source.active ? 'Active' : 'Disabled'">
+                                    </button>
+                                    <button 
+                                        @click="deleteSource(source)"
+                                        class="p-1 text-slate-600 hover:text-red-500 transition-colors">
+                                        <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                                    </button>
+                                </div>
+                            </div>
+                        </template>
+                        <button @click="addSource()" class="w-full py-3 border-2 border-dashed border-slate-800 rounded-xl text-slate-600 hover:text-slate-400 hover:border-slate-700 text-xs font-bold transition-all">+ Add Custom Source</button>
+                    </div>
+                </div>
+
+                <div class="lg:col-span-8 space-y-6">
+                    <div class="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                        <div class="flex items-center gap-4">
+                            <h2 class="text-sm font-semibold text-slate-500 uppercase tracking-widest">Discovery</h2>
+                            <div class="h-4 w-[1px] bg-slate-800"></div>
+                            <span class="text-[10px] font-bold text-slate-400" x-text="`${discoveryApps.length} Apps Found`"></span>
+                        </div>
+                        
+                        <div class="flex items-center gap-3 w-full md:w-auto">
+                            <div class="relative flex-1 md:w-64 group">
+                                <div class="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none">
+                                    <svg class="h-3.5 w-3.5 text-slate-500 group-focus-within:text-indigo-400 transition-colors" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                                    </svg>
+                                </div>
+                                <input 
+                                    type="text" 
+                                    x-model="search"
+                                    placeholder="Search packages..." 
+                                    class="block w-full pl-10 pr-4 py-2 bg-slate-900/50 border border-slate-800 rounded-xl focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500/50 outline-none transition-all text-xs placeholder-slate-600"
+                                >
+                            </div>
+                            <button 
+                                @click="refreshDiscovery(true)"
+                                :disabled="refreshing"
+                                class="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-800 text-white disabled:text-slate-500 rounded-xl text-[11px] font-black transition-all shadow-lg shadow-indigo-600/20 flex items-center gap-2 whitespace-nowrap">
+                                <svg :class="refreshing ? 'animate-spin' : ''" xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2v6h-6"></path><path d="M3 12a9 9 0 0 1 15-6.7L21 8"></path><path d="M3 22v-6h6"></path><path d="M21 12a9 9 0 0 1-15 6.7L3 16"></path></svg>
+                                <span x-text="refreshing ? 'Syncing...' : 'Sync Sources'"></span>
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="bg-slate-900 border border-slate-800 rounded-3xl overflow-hidden shadow-2xl relative">
+                        <div class="overflow-y-auto h-[550px] divide-y divide-slate-800/30 scroll-smooth">
+                            <template x-for="app in discoveryApps.filter(i => i.name.toLowerCase().includes(search.toLowerCase()) || i.pkg.toLowerCase().includes(search.toLowerCase()))" :key="app.pkg">
+                                <div class="flex items-center justify-between px-6 py-5 hover:bg-white/[0.02] transition-all group">
+                                    <div class="flex items-center gap-5">
+                                        <div class="w-10 h-10 bg-slate-950 rounded-xl flex items-center justify-center text-indigo-400 font-black text-sm border border-slate-800 group-hover:border-indigo-500/30 transition-all" x-text="app.name[0]"></div>
+                                        <div class="flex flex-col">
+                                            <span class="text-[13px] font-bold text-slate-100 group-hover:text-white transition-colors" x-text="app.name"></span>
+                                            <span class="text-[10px] font-medium text-slate-500 font-mono tracking-tight" x-text="app.pkg"></span>
+                                        </div>
+                                    </div>
+                                    
+                                    <button 
+                                        @click="openAddModal(app)"
+                                        class="px-5 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest bg-slate-800 hover:bg-white text-slate-400 hover:text-slate-950 transition-all border border-slate-700 hover:border-white shadow-sm">
+                                        Configure
+                                    </button>
+                                </div>
+                            </template>
+                            <template x-if="discoveryApps.length === 0 && !refreshing">
+                                <div class="h-full flex flex-col items-center justify-center p-12 text-center">
+                                    <div class="w-16 h-16 bg-slate-800 rounded-3xl flex items-center justify-center mb-4">
+                                        <svg xmlns="http://www.w3.org/2000/svg" class="w-8 h-8 text-slate-600" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" /></svg>
+                                    </div>
+                                    <h3 class="text-white font-bold">No apps found</h3>
+                                    <p class="text-slate-500 text-xs mt-1">Try syncing your sources to find compatible packages.</p>
+                                </div>
+                            </template>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Tab 2: Pipeline -->
+        <div x-show="activeTab === 'pipeline'" x-cloak class="space-y-8">
+            <div class="flex items-center justify-between">
+                <div>
+                    <h2 class="text-2xl font-bold text-white">Active Pipeline</h2>
+                    <p class="text-slate-500 text-sm mt-1">Manage and build your patched applications.</p>
+                </div>
+                
+                <div class="flex flex-col items-end gap-2">
+                    <button 
+                        @click="triggerBuild()"
+                        :disabled="building"
+                        :class="building ? 'bg-slate-800 text-slate-500 border-slate-700' : 'bg-white hover:bg-slate-200 text-slate-950'"
+                        class="px-8 py-3 rounded-2xl font-bold transition-all flex items-center gap-3 border border-transparent disabled:cursor-not-allowed shadow-xl shadow-white/5">
+                        <template x-if="!building">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="w-5 h-5" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+                        </template>
+                        <template x-if="building">
+                            <svg class="animate-spin h-5 w-5" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                        </template>
+                        <span x-text="building ? buildMessage : (selectedApps.length > 0 ? 'Build Selected (' + selectedApps.length + ')' : 'Build All Apps')"></span>
+                    </button>
+                    <div x-show="lastRun !== 'Never'" class="text-[10px] text-slate-500 font-bold uppercase tracking-widest px-2">
+                        Last Run: <span class="text-slate-400" x-text="lastRun"></span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                {% for app in config.apps %}
+                <div 
+                    :class="selectedApps.includes('{{ app.id }}') ? 'border-indigo-500 bg-indigo-500/5 ring-1 ring-indigo-500/20' : 'border-slate-800 bg-slate-900'"
+                    class="p-6 border rounded-3xl hover:border-slate-700 transition-all group shadow-sm relative overflow-hidden">
+                    <div class="absolute top-0 right-0 p-4 flex gap-1 transition-opacity">
+                        <button 
+                            @click="addToObtainium('{{ app.obtainium_id }}')"
+                            class="bg-slate-800 hover:bg-emerald-600 p-2 rounded-lg text-slate-400 hover:text-white transition-all"
+                            title="Add to Obtainium">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" /></svg>
+                        </button>
+                        <button 
+                            @click="selectedPkg = '{{ app.id }}'; uploadVersion = ''; showUploadModal = true;"
+                            class="bg-slate-800 hover:bg-amber-600 p-2 rounded-lg text-slate-400 hover:text-white transition-all"
+                            title="Upload Manual APK">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" /></svg>
+                        </button>
+                        <button 
+                            @click="openEditModal(pipelineApps[{{ loop.index0 }}])"
+                            class="bg-slate-800 hover:bg-indigo-600 p-2 rounded-lg text-slate-400 hover:text-white transition-all"
+                            title="Edit Configuration">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" /></svg>
+                        </button>
+                        <button 
+                            @click="if(confirm('Remove {{ app.name }}?')) { fetch('/api/ui/delete_app', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ package_id: '{{ app.id }}' })}).then(() => location.reload()); }"
+                            class="bg-slate-800 hover:bg-red-600 p-2 rounded-lg text-slate-400 hover:text-white transition-all"
+                            title="Remove App">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                        </button>
+                    </div>
+
+                    <!-- Selection Toggle -->
+                    <div class="absolute bottom-6 right-6">
+                        <label class="relative inline-flex items-center cursor-pointer group">
+                            <input type="checkbox" value="{{ app.id }}" x-model="selectedApps" class="sr-only peer">
+                            <div class="w-9 h-5 bg-slate-800 rounded-full peer peer-checked:after:translate-x-full rtl:peer-checked:after:-translate-x-full after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-slate-500 peer-checked:after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-indigo-600 border border-slate-700 peer-checked:border-indigo-400"></div>
+                            <span class="ml-3 text-[10px] font-bold text-slate-500 uppercase tracking-tighter group-hover:text-slate-400 transition-colors" x-text="selectedApps.includes('{{ app.id }}') ? 'Selected' : 'Select'"></span>
+                        </label>
+                    </div>
+
+                    <div class="space-y-4" x-data="{ iconError: false }">
+                        <div class="w-12 h-12 bg-slate-800 rounded-2xl flex items-center justify-center text-indigo-400 font-bold text-xl overflow-hidden">
+                            <template x-if="iconError">
+                                <span x-text="(metadata['{{ app.id }}'] ? metadata['{{ app.id }}'].real_name : '{{ app.name }}')[0]"></span>
+                            </template>
+                            <img :src="'/icons/' + '{{ app.id }}' + '.png'" 
+                                 alt=""
+                                 class="w-full h-full object-cover"
+                                 x-show="!iconError"
+                                 @error="iconError = true">
+                        </div>
+                        <div class="relative">
+                            <h3 class="font-bold text-lg text-white group-hover:text-indigo-400 transition-colors" x-text="metadata['{{ app.id }}'] ? metadata['{{ app.id }}'].real_name : '{{ app.name }}'"></h3>
+                            <code class="text-[10px] text-slate-500 block mt-1">{{ app.id }}</code>
+                            
+                            <div class="mt-3">
+                                <template x-if="updates['{{ app.id }}'] && updates['{{ app.id }}'].has_update">
+                                    <div class="flex items-center gap-2">
+                                        <span class="animate-pulse flex h-2 w-2 rounded-full bg-amber-500"></span>
+                                        <span class="text-[10px] font-black text-amber-500 uppercase tracking-tighter" x-text="updates['{{ app.id }}'].current === 'None' ? 'New App: v' + updates['{{ app.id }}'].latest : 'Update Available: v' + updates['{{ app.id }}'].latest"></span>
+                                    </div>
+                                </template>
+                                <template x-if="updates['{{ app.id }}'] && !updates['{{ app.id }}'].has_update">
+                                    <div class="flex items-center gap-2">
+                                        <div class="flex h-3 w-3 items-center justify-center rounded-full bg-emerald-500/20 text-emerald-500">
+                                            <svg xmlns="http://www.w3.org/2000/svg" class="h-2 w-2" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd" /></svg>
+                                        </div>
+                                        <span class="text-[10px] font-bold text-emerald-500 uppercase tracking-tighter">Up to date</span>
+                                    </div>
+                                </template>
+                            </div>
+                        </div>
+                        <div class="flex flex-wrap gap-2">
+                            <span class="text-[9px] font-bold uppercase tracking-widest bg-slate-800 text-slate-400 px-2 py-1 rounded-lg">
+                                {{ app.include_patches | length if app.include_patches else 0 }} Patches
+                            </span>
+                        </div>
+                    </div>
+                </div>
+                {% endfor %}
+            </div>
+
+            <!-- Console -->
+            <div class="mt-12">
+                <div class="bg-slate-900 border border-slate-800 rounded-3xl overflow-hidden shadow-2xl">
+                    <div class="px-6 py-4 border-b border-slate-800 flex items-center justify-between bg-slate-900/50">
+                        <div class="flex items-center gap-3">
+                            <div class="w-2 h-2 rounded-full" :class="building ? 'bg-amber-500 animate-pulse' : 'bg-slate-700'"></div>
+                            <h3 class="text-xs font-bold text-slate-400 uppercase tracking-widest">Build Console</h3>
+                        </div>
+                        <button @click="buildLogs = ''; fetch('/api/ui/logs').then(r => r.json()).then(d => buildLogs = d.logs)" class="text-[10px] text-slate-500 hover:text-white transition-colors uppercase font-bold tracking-tighter">Refresh Logs</button>
+                    </div>
+                    <div id="log-container" class="p-6 h-80 overflow-y-auto font-mono text-[11px] text-slate-400 bg-black/40 selection:bg-indigo-500/30">
+                        <template x-if="!buildLogs">
+                            <p class="text-slate-700 italic">No logs available. Start a build to see output...</p>
+                        </template>
+                        <pre x-text="buildLogs" class="whitespace-pre-wrap break-all"></pre>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Tab 3: Settings -->
+        <div x-show="activeTab === 'settings'" x-cloak class="max-w-2xl mx-auto space-y-8">
+            <div class="bg-slate-900 border border-slate-800 rounded-3xl overflow-hidden shadow-2xl">
+                <div class="p-8 border-b border-slate-800">
+                    <h2 class="text-xl font-bold text-white">System Settings</h2>
+                    <p class="text-slate-500 text-sm mt-1">Configure global builder environment variables.</p>
+                </div>
+                
+                <div class="p-8 space-y-6">
+                    <div class="space-y-2">
+                        <label class="text-xs font-bold text-slate-500 uppercase tracking-widest">Server URL</label>
+                        <div class="flex gap-3">
+                            <input type="text" x-model="settings.server_url" placeholder="https://morphe.yourdomain.com" class="flex-1 bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-white focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500 outline-none transition-all font-mono text-sm">
+                        </div>
+                        <p class="text-[10px] text-slate-600">The public URL of this server. Used to generate download links for Obtainium.</p>
+                    </div>
+
+                    <div class="space-y-2">
+                        <label class="text-xs font-bold text-slate-500 uppercase tracking-widest">Background Build Schedule (Cron)</label>
+                        <div class="flex gap-3">
+                            <input type="text" x-model="settings.cron_schedule" placeholder="0 */4 * * * (Every 4 hours)" class="flex-1 bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-white focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500 outline-none transition-all font-mono text-sm">
+                        </div>
+                        <p class="text-[10px] text-slate-600">Use standard crontab format: <code>minute hour day month day_of_week</code>. Use <a href="https://crontab.guru" target="_blank" class="text-indigo-400 hover:text-indigo-300 transition-colors underline">crontab.guru</a> to format your schedule. Leave empty to disable.</p>
+                    </div>
+
+                    <div class="pt-6 border-t border-slate-800 space-y-4">
+                        <div class="flex items-center justify-between">
+                            <label class="text-xs font-bold text-slate-500 uppercase tracking-widest">Apprise Notifications</label>
+                            <a href="https://github.com/caronc/apprise/wiki" target="_blank" class="text-[10px] text-indigo-400 hover:text-indigo-300 transition-colors font-bold uppercase tracking-tight">Setup Guide</a>
+                        </div>
+                        
+                        <div class="space-y-3">
+                            <template x-for="(url, index) in settings.notification_urls" :key="index">
+                                <div class="flex items-center gap-3 p-3 bg-slate-950 rounded-xl border border-slate-800">
+                                    <span class="flex-1 text-xs font-mono text-slate-400 truncate" x-text="url"></span>
+                                    <button @click="settings.notification_urls.splice(index, 1)" class="p-1 text-slate-600 hover:text-red-500 transition-colors">
+                                        <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                                    </button>
+                                </div>
+                            </template>
+                            
+                            <div class="flex gap-3">
+                                <input 
+                                    type="text" 
+                                    x-model="newNotificationUrl" 
+                                    placeholder="discord://webhook_id/webhook_token" 
+                                    class="flex-1 bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-white focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500 outline-none transition-all font-mono text-xs"
+                                    @keydown.enter="if(newNotificationUrl) { if(!settings.notification_urls) settings.notification_urls = []; settings.notification_urls.push(newNotificationUrl); newNotificationUrl = ''; }"
+                                >
+                                <button 
+                                    @click="if(newNotificationUrl) { if(!settings.notification_urls) settings.notification_urls = []; settings.notification_urls.push(newNotificationUrl); newNotificationUrl = ''; }"
+                                    class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl text-xs font-bold transition-all">
+                                    Add
+                                </button>
+                            </div>
+                        </div>
+                        <p class="text-[10px] text-slate-600">Supports Discord, Telegram, Gotify, Slack, and <a href="https://github.com/caronc/apprise/wiki" target="_blank" class="text-indigo-400 underline">many more</a>.</p>
+                    </div>
+                </div>
+
+                <div class="p-8 bg-slate-950/50 border-t border-slate-800 flex justify-between items-center">
+                    <button 
+                        @click="testNotifications()" 
+                        :disabled="testingNotifications || !settings.notification_urls || settings.notification_urls.length === 0"
+                        class="px-6 py-3 rounded-xl font-bold text-slate-400 hover:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed transition-all text-sm">
+                        <span x-text="testingNotifications ? 'Sending...' : 'Test Notifications'"></span>
+                    </button>
+                    <button @click="saveSettings()" class="px-8 py-3 rounded-xl font-bold bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg shadow-indigo-600/20 transition-all">Save Settings</button>
+                </div>
+            </div>
+        </div>
+    </main>
+</body>
+</html>

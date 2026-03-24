@@ -1,0 +1,7 @@
+bin/
+apks/
+.git/
+.venv/
+__pycache__/
+*.log
+.python-version
