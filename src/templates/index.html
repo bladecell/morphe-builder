@@ -29,6 +29,7 @@
                 metadata: {{ metadata | tojson | safe }},
                 settings: {{ (config.settings if config.settings else {"server_url": "", "cron_schedule": "0 0 * * *", "notification_urls": []}) | tojson | safe }},
                 updates: {},
+                lastRun: '{{ metadata.last_run if metadata and metadata.last_run else "Never" }}',
                 selectedApps: [],
                 showModal: false,
                 showUploadModal: false,
@@ -95,6 +96,7 @@
                         const data = await response.json();
                         this.building = data.in_progress;
                         this.buildMessage = data.message;
+                        this.lastRun = data.last_run;
                     } catch (e) {
                         console.error('Failed to fetch build status', e);
                     }
@@ -220,23 +222,34 @@
                 },
 
                 async addSource() {
-                    const repo = prompt('Enter GitHub repository (e.g., User/repo):');
+                    const repo = prompt('Enter GitHub repository (e.g. User/repo):');
                     if (!repo) return;
-                    await fetch('/api/ui/add_source', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({ repo })
-                    });
+
+                    try {
+                        const res = await fetch('/api/ui/add_source', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ repo })
+                        });
+                        const data = await res.json();
+                        location.reload();
+                    } catch (e) {
+                        console.error('Failed to add source', e);
+                    }
                 },
 
                 async toggleSource(source) {
-                    await fetch('/api/ui/toggle_source', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({ repo: source.repo, active: !source.active })
-                    });
-                    this.refreshDiscovery();
-                    source.active = !source.active;
+                    try {
+                        await fetch('/api/ui/toggle_source', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({ repo: source.repo })
+                        });
+                        source.active = !source.active;
+                        this.refreshDiscovery();
+                    } catch (e) {
+                        console.error('Toggle failed', e);
+                    }
                 },
 
                 async deleteSource(source) {
@@ -305,9 +318,10 @@
 
                 addToObtainium(id) {
                     const baseUrl = this.settings.server_url || window.location.origin;
-                    const apiUrl = `${baseUrl.replace(/\/$/, '')}/api/apps/${id}`;
+                    // Switch to the HTML View as it is more robust for version extraction
+                    const viewUrl = `${baseUrl.replace(/\/$/, '')}/view/${id}`;
                     // Obtainium expects the raw URL after the protocol
-                    window.location.href = `obtainium://add/${apiUrl}`;
+                    window.location.href = `obtainium://add/${viewUrl}`;
                 }
             }))
         })
@@ -604,11 +618,27 @@
                     class="p-6 border rounded-3xl hover:border-slate-700 transition-all group shadow-sm relative overflow-hidden">
                     <div class="absolute top-0 right-0 p-4 flex gap-1 transition-opacity">
                         <button 
-                            @click="addToObtainium('{{ app.obtainium_id }}')"
-                            class="bg-slate-800 hover:bg-emerald-600 p-2 rounded-lg text-slate-400 hover:text-white transition-all"
-                            title="Add to Obtainium">
+                            @click="addToObtainium('{{ app.id }}')"
+                            :disabled="updates['{{ app.id }}'] && !updates['{{ app.id }}'].file_exists"
+                            :class="updates['{{ app.id }}'] && !updates['{{ app.id }}'].file_exists ? 'bg-slate-800 text-slate-700 cursor-not-allowed' : 'bg-slate-800 hover:bg-emerald-600 text-slate-400 hover:text-white'"
+                            class="p-2 rounded-lg transition-all"
+                            title="Add to Obtainium (App API)">
                             <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" /></svg>
                         </button>
+                        <button 
+                            @click="const url = (settings.server_url || window.location.origin) + '/view/' + '{{ app.id }}'; navigator.clipboard.writeText(url); alert('Link copied for Obtainium HTML source:\n' + url);"
+                            class="bg-slate-800 hover:bg-emerald-600 p-2 rounded-lg text-slate-400 hover:text-white transition-all"
+                            title="Copy Link for Obtainium (HTML Source)">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.828a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" /></svg>
+                        </button>
+                        <a 
+                            :href="'/download/' + '{{ app.id }}'"
+                            download
+                            :class="updates['{{ app.id }}'] && !updates['{{ app.id }}'].file_exists ? 'bg-slate-800 text-slate-700 cursor-not-allowed pointer-events-none' : 'bg-slate-800 hover:bg-indigo-600 text-slate-400 hover:text-white'"
+                            class="p-2 rounded-lg transition-all"
+                            title="Direct Download Patched APK">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4-4m0 0L8 8m4-4v12" /></svg>
+                        </a>
                         <button 
                             @click="selectedPkg = '{{ app.id }}'; uploadVersion = ''; showUploadModal = true;"
                             class="bg-slate-800 hover:bg-amber-600 p-2 rounded-lg text-slate-400 hover:text-white transition-all"
@@ -638,16 +668,15 @@
                         </label>
                     </div>
 
-                    <div class="space-y-4" x-data="{ iconError: false }">
-                        <div class="w-12 h-12 bg-slate-800 rounded-2xl flex items-center justify-center text-indigo-400 font-bold text-xl overflow-hidden">
-                            <template x-if="iconError">
+                    <div class="space-y-4">
+                        <div class="w-12 h-12 bg-slate-800 rounded-2xl flex items-center justify-center text-indigo-400 font-bold text-xl overflow-hidden shadow-inner border border-slate-800">
+                            <template x-if="updates['{{ app.id }}'] && !updates['{{ app.id }}'].icon_exists">
                                 <span x-text="(metadata['{{ app.id }}'] ? metadata['{{ app.id }}'].real_name : '{{ app.name }}')[0]"></span>
                             </template>
                             <img :src="'/icons/' + '{{ app.id }}' + '.png'" 
                                  alt=""
                                  class="w-full h-full object-cover"
-                                 x-show="!iconError"
-                                 @error="iconError = true">
+                                 x-show="updates['{{ app.id }}'] && updates['{{ app.id }}'].icon_exists">
                         </div>
                         <div class="relative">
                             <h3 class="font-bold text-lg text-white group-hover:text-indigo-400 transition-colors" x-text="metadata['{{ app.id }}'] ? metadata['{{ app.id }}'].real_name : '{{ app.name }}'"></h3>

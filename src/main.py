@@ -101,32 +101,38 @@ def check_updates():
     config = load_config()
     update_status = {}
     
+    # Check which apps actually have patched files existing
+    patched_dir = DATA_DIR / "apks" / "patched"
+    icons_dir = DATA_DIR / "apks" / "icons"
+    
     for app_info in config.get("apps", []):
         package_id = app_info["id"]
         remote_versions = get_supported_versions(package_id, config)
-        if not remote_versions:
-            continue
-            
-        latest_remote = version.parse(remote_versions[0])
+        
+        # Check if file exists
+        file_exists = (patched_dir / f"{package_id}-patched.apk").exists()
+        icon_exists = (icons_dir / f"{package_id}.png").exists()
+
+        latest_remote_str = remote_versions[0] if remote_versions else "Unknown"
         current_local_str = get_current_version(package_id)
         
-        if current_local_str:
-            current_local = version.parse(current_local_str)
-            if latest_remote > current_local:
-                update_status[package_id] = {
-                    "has_update": True,
-                    "latest": remote_versions[0],
-                    "current": current_local_str
-                }
-            else:
-                update_status[package_id] = {"has_update": False}
-        else:
-            # Not downloaded yet
-            update_status[package_id] = {
-                "has_update": True,
-                "latest": remote_versions[0],
-                "current": "None"
-            }
+        has_update = False
+        if remote_versions and current_local_str:
+            try:
+                if version.parse(latest_remote_str) > version.parse(current_local_str):
+                    has_update = True
+            except:
+                pass
+        elif remote_versions:
+            has_update = True
+            
+        update_status[package_id] = {
+            "has_update": has_update,
+            "latest": latest_remote_str,
+            "current": current_local_str or "None",
+            "file_exists": file_exists,
+            "icon_exists": icon_exists
+        }
             
     return update_status
 
@@ -439,7 +445,7 @@ def build_task(package_ids=None, is_cron=False):
             config = load_config()
             all_apps = {a["id"]: a["name"] for a in config.get("apps", [])}
             
-            # If nothing was patched, only notify if it was a manual build
+            # Correct logic: only notify success if apps were ACTUALLY patched successfully
             if not patched_ids:
                 if not is_cron: # Manual build
                     send_notification(
@@ -486,7 +492,11 @@ def get_build_status():
 
 @app.get("/api/ui/tools_status")
 def get_tools_status():
-    return {"updating": TOOLS_UPDATING, "diagnostics": DIAGNOSTICS}
+    return {
+        "updating": TOOLS_UPDATING, 
+        "diagnostics": DIAGNOSTICS,
+        "data_dir": str(DATA_DIR)
+    }
 
 
 @app.get("/api/ui/logs")
@@ -504,29 +514,84 @@ def get_logs():
 @app.get("/download/{package_name}")
 def download_app_by_name(package_name: str):
     """Serves the latest patched APK for a given package name."""
-    # Try direct filename first if it ends in .apk
-    if package_name.endswith(".apk"):
-        file_path = DATA_DIR / "apks" / "patched" / package_name
-        if file_path.exists():
-            return FileResponse(file_path)
-    
-    # Otherwise treat as package ID
-    file_path = DATA_DIR / "apks" / "patched" / f"{package_name}-patched.apk"
-    if file_path.exists():
-        return FileResponse(file_path)
-    
-    return {"error": "File not found"}
+    print(f"[Download] Request for: {package_name}")
+
+    # Clean package name to handle .apk extension if present
+    base_name = package_name.replace("-patched.apk", "").replace(".apk", "")
+
+    # Priority 1: Exact filename match
+    file_path = DATA_DIR / "apks" / "patched" / package_name
+    if file_path.exists() and file_path.is_file():
+        print(f"[Download] Found via exact match: {file_path}")
+        return FileResponse(file_path, media_type="application/vnd.android.package-archive")
+
+    # Priority 2: Inferred filename
+    inferred_path = DATA_DIR / "apks" / "patched" / f"{base_name}-patched.apk"
+    if inferred_path.exists() and inferred_path.is_file():
+        print(f"[Download] Found via inferred path: {inferred_path}")
+        return FileResponse(inferred_path, media_type="application/vnd.android.package-archive")
+
+    # Search for any file starting with base_name
+    print(f"[Download] File not found. Searching for glob: {base_name}* in {DATA_DIR}/apks/patched")
+    try:
+        patched_dir = DATA_DIR / "apks" / "patched"
+        if patched_dir.exists():
+            matches = list(patched_dir.glob(f"{base_name}*"))
+            if matches:
+                print(f"[Download] Found via glob: {matches[0]}")
+                return FileResponse(matches[0], media_type="application/vnd.android.package-archive")
+    except Exception as e:
+        print(f"[Download] Glob search failed: {e}")
+
+    print(f"[Download] FAILED. Searched: {file_path} and {inferred_path}")
+    return {"error": "File not found", "searched": [str(file_path), str(inferred_path)]}
+
+@app.get("/view/{package_id}", response_class=HTMLResponse)
+async def view_app(package_id: str, request: Request):
+    """Serves a minimal HTML page for Obtainium to parse."""
+    config = load_config()
+    # Try to find by package ID first, then fallback to obtainium_id
+    app_info = next((a for a in config.get("apps", []) if a["id"] == package_id), None)
+    if not app_info:
+        app_info = next((a for a in config.get("apps", []) if a["obtainium_id"] == package_id), None)
+        
+    if not app_info:
+        print(f"[View] App not found for ID: {package_id}")
+        return HTMLResponse("App not found in pipeline", status_code=404)
+        
+    try:
+        supported = get_supported_versions(app_info["id"], config)
+        current_version = supported[0] if supported else "Unknown"
+    except:
+        current_version = "Unknown"
+        
+    # Build absolute URL for the download link to help some parsers
+    settings = config.get("settings", {})
+    base_url = settings.get("server_url", str(request.base_url).rstrip("/"))
+    download_url = f"{base_url}/download/{app_info['id']}-patched.apk"
+        
+    return templates.TemplateResponse(
+        "obtainium.html",
+        {
+            "request": request,
+            "app": app_info,
+            "version": current_version,
+            "download_url": download_url
+        }
+    )
 
 
 @app.get("/api/apps/{obtainium_id}")
 def get_single_app(obtainium_id: str, request: Request):
     """Provides Obtainium metadata for a specific application."""
+    print(f"[Obtainium] Request for ID: {obtainium_id}")
     config = load_config()
     settings = config.get("settings", {})
     base_url = settings.get("server_url", str(request.base_url).rstrip("/"))
     
     app_info = next((a for a in config.get("apps", []) if a["obtainium_id"] == obtainium_id), None)
     if not app_info:
+        print(f"[Obtainium] App with ID {obtainium_id} not found in config.")
         return {"error": "App not found"}
         
     try:
@@ -535,12 +600,16 @@ def get_single_app(obtainium_id: str, request: Request):
     except:
         version = "Unknown"
 
-    return {
-        "id": app_info["obtainium_id"],
+    # CRITICAL: Obtainium needs the 'id' to match the actual Android Package Name
+    # to avoid the "could not get ID from apk" error.
+    response = {
+        "id": app_info["id"], 
         "name": app_info["name"],
         "version": version,
         "download_url": f"{base_url}/download/{app_info['id']}-patched.apk",
     }
+    print(f"[Obtainium] Returning: {response}")
+    return response
 
 
 @app.get("/api/apps")
@@ -559,7 +628,7 @@ def get_apps(request: Request):
 
         response_data.append(
             {
-                "id": app_info["obtainium_id"],
+                "id": app_info["id"], # Match real package name
                 "name": app_info["name"],
                 "version": version,
                 "download_url": f"{base_url}/download/{app_info['id']}-patched.apk",

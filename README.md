@@ -24,7 +24,21 @@ Morphe Builder is an automated Android application patcher with a Web UI and Obt
 
 The easiest way to run Morphe Builder is with Docker. All persistent data (config, APKs, and tools) is stored in the `/data` directory.
 
-#### 1. Docker Run
+#### 1. Use Docker Hub Image (Easiest)
+
+Pull and run the pre-built image from Docker Hub:
+
+```bash
+docker run -d \
+  -p 8000:8000 \
+  -v $(pwd)/data:/data \
+  --name morphe-builder \
+  bladecell/morphe-builder:latest
+```
+
+#### 2. Build and Run Locally
+
+If you prefer to build the image yourself:
 
 ```bash
 docker build -t morphe-builder .
@@ -35,27 +49,6 @@ docker run -d \
   -v $(pwd)/data:/data \
   --name morphe-builder \
   morphe-builder
-```
-
-#### 2. Docker Compose
-
-Create a `docker-compose.yml` file:
-
-```yaml
-services:
-  morphe-builder:
-    build: .
-    container_name: morphe-builder
-    ports:
-      - "8000:8000"
-    volumes:
-      - ./data:/data
-    restart: unless-stopped
-```
-
-Then run:
-```bash
-docker compose up -d
 ```
 
 ### Manual Installation

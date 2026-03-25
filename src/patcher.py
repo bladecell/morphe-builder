@@ -452,6 +452,41 @@ def patch_app(app_config, tools_config, input_apk, output_apk, config):
     cli = DATA_DIR / tools_config["cli_jar"]
     java_bin = config.get("settings", {}).get("java_path", "java")
     
+    # Track which MPP files we actually need to avoid conflict
+    # (Loading every MPP in the world can cause NoSuchMethodErrors if they have incompatible shared deps)
+    included_mpps = set()
+    selected_patch_names = set(app_config.get("include_patches", []))
+
+    for source in config.get("sources", []):
+        if not source.get("active", True):
+            continue
+        
+        mpp_path = get_source_paths(source["repo"])[".mpp"]
+        json_path = get_source_paths(source["repo"])[".json"]
+        
+        if not mpp_path.exists() or not json_path.exists():
+            continue
+
+        # If this source contains any of the selected patches, include its MPP
+        try:
+            with open(json_path, "r") as f:
+                source_data = json.load(f)
+                patches_list = source_data.get("patches", []) if isinstance(source_data, dict) else source_data
+                source_patch_names = {p.get("name") for p in patches_list}
+                
+                # Check intersection: if this source has ANY of the selected patches, we need the MPP
+                if selected_patch_names.intersection(source_patch_names):
+                    included_mpps.add(str(mpp_path))
+        except:
+            # Fallback to including it if JSON fails to parse
+            included_mpps.add(str(mpp_path))
+
+    # Always include the default source if it exists and we have no others
+    if not included_mpps:
+        default_mpp = get_source_paths("MorpheApp/morphe-patches")[".mpp"]
+        if default_mpp.exists():
+            included_mpps.add(str(default_mpp))
+
     command = [
         java_bin,
         "-jar",
@@ -463,12 +498,8 @@ def patch_app(app_config, tools_config, input_apk, output_apk, config):
         str(output_apk),
     ]
 
-    # Add all active source MPP files
-    for source in config.get("sources", []):
-        if source.get("active", True):
-            mpp_path = get_source_paths(source["repo"])[".mpp"]
-            if mpp_path.exists():
-                command.extend(["--patches", str(mpp_path)])
+    for mpp in included_mpps:
+        command.extend(["--patches", mpp])
 
     for p in app_config.get("include_patches", []):
         command.extend(["-e", p])
