@@ -4,7 +4,7 @@ Morphe Builder is an automated Android application patcher with a Web UI and Obt
 
 ## Features
 
-- **Automated Pipeline:** Downloads raw APKs (including bundles/XAPKs), merges them, and applies patches using Morphe CLI.
+- **Automated Pipeline:** Downloads raw APKs (including bundles/XAPKs), merges them, and applies patches using [Morphe CLI](https://github.com/MorpheApp/morphe-cli).
 - **Web UI:** Manage your app pipeline, discover new compatible apps from patch sources, and monitor build logs in real-time.
 - **Update Tracking:** Automatically checks for new versions of apps and patches.
 - **Obtainium Integration:** Serves an API compatible with Obtainium for easy installation and updates on Android devices.
@@ -15,7 +15,7 @@ Morphe Builder is an automated Android application patcher with a Web UI and Obt
 - **Docker:** (Recommended) No other dependencies are required.
 - **Manual Installation:**
   - Python 3.12+
-  - Java 17+ (required for Morphe CLI and APKEditor)
+  - Java 17+ (required for [Morphe CLI](https://github.com/MorpheApp/morphe-cli) and APKEditor)
   - [apkeep](https://github.com/EFForg/apkeep) (for downloading APKs)
 
 ## Getting Started
