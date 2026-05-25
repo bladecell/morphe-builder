@@ -17,9 +17,15 @@ from packaging import version
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+import threading
+
 PROJECT_ROOT = Path(__file__).parent.parent
 app = FastAPI()
 scheduler = AsyncIOScheduler()
+
+# Global lock to prevent multiple scrapers from running concurrently
+SCRAPER_LOCK = threading.Lock()
+SCRAPER_ACTIVE = False
 
 # Enable CORS for local development
 app.add_middleware(
@@ -38,7 +44,7 @@ icons_dir.mkdir(parents=True, exist_ok=True)
 app.mount("/icons", StaticFiles(directory=str(icons_dir)), name="icons")
 
 BUILD_STATUS = {"in_progress": False, "message": "Idle", "last_run": "Never"}
-DIAGNOSTICS = {"java": False, "apkeep": False}
+DIAGNOSTICS = {"java": False, "scraper": False}
 LOG_PATH = DATA_DIR / "bin" / "build.log"
 TOOLS_UPDATING = False
 
@@ -105,33 +111,72 @@ def check_updates():
     patched_dir = DATA_DIR / "apks" / "patched"
     icons_dir = DATA_DIR / "apks" / "icons"
     
+    # Get current versions of all active patch sources
+    from src.patcher import get_patch_versions
+    remote_patch_versions = get_patch_versions(config)
+    
     for app_info in config.get("apps", []):
         package_id = app_info["id"]
-        remote_versions = get_supported_versions(package_id, config)
         
-        # Check if file exists
-        file_exists = (patched_dir / f"{package_id}-patched.apk").exists()
+        # Pinned version check
+        pinned_version = app_info.get("version")
+        if pinned_version:
+            remote_versions = [pinned_version]
+        else:
+            remote_versions = get_supported_versions(package_id, config)
+        
+        # Check if file exists (glob for versioned name or legacy)
+        file_exists = False
+        if list(patched_dir.glob(f"{package_id}-*.apk")):
+            file_exists = True
+        
         icon_exists = (icons_dir / f"{package_id}.png").exists()
 
-        latest_remote_str = remote_versions[0] if remote_versions else "Unknown"
-        current_local_str = get_current_version(package_id)
+        # The 'latest' for update purposes is the first item in the list 
+        # (which is the Latest Recommended, or Latest Experimental if no recommended exist)
+        latest_remote_app_str = remote_versions[0] if remote_versions else "Unknown"
+        
+        # Use config for current state
+        last_build = app_info.get("last_successful_build", {})
+        current_patched_app_str = last_build.get("app_version", "None")
         
         has_update = False
-        if remote_versions and current_local_str:
+        # Update needed if:
+        # 1. Remote app version > current patched app version
+        # 2. Remote patch versions != our last used patch versions for this app
+        # 3. File doesn't exist
+        
+        if latest_remote_app_str != "Unknown" and current_patched_app_str != "None":
             try:
-                if version.parse(latest_remote_str) > version.parse(current_local_str):
+                if version.parse(latest_remote_app_str) > version.parse(current_patched_app_str):
                     has_update = True
             except:
-                pass
-        elif remote_versions:
+                if latest_remote_app_str != current_patched_app_str:
+                    has_update = True
+        elif current_patched_app_str == "None" and latest_remote_app_str != "Unknown":
+            has_update = True
+
+        # Compare only the repos that were used in the last build
+        used_repos = last_build.get("patch_versions", {}).keys()
+        if not used_repos and not has_update:
+            has_update = True
+        else:
+            for repo in used_repos:
+                if remote_patch_versions.get(repo) != last_build.get("patch_versions", {}).get(repo):
+                    has_update = True
+                    break
+            
+        if not file_exists:
             has_update = True
             
         update_status[package_id] = {
             "has_update": has_update,
-            "latest": latest_remote_str,
-            "current": current_local_str or "None",
+            "latest": latest_remote_app_str,
+            "current": current_patched_app_str,
             "file_exists": file_exists,
-            "icon_exists": icon_exists
+            "icon_exists": icon_exists,
+            "status": app_info.get("status", "Unknown"),
+            "error": app_info.get("error")
         }
             
     return update_status
@@ -267,6 +312,31 @@ def update_tools_task(config):
         TOOLS_UPDATING = False
 
 
+def refresh_versions_task():
+    """Background task to refresh the version cache for all apps in the pipeline."""
+    global SCRAPER_ACTIVE
+    if SCRAPER_ACTIVE:
+        print("[Cron] Scraper already active, skipping version refresh...")
+        return
+
+    with SCRAPER_LOCK:
+        SCRAPER_ACTIVE = True
+        config = load_config()
+        from src.patcher import APKMirrorScraper, get_supported_versions
+        scraper = APKMirrorScraper(headless=True)
+        print("[Cron] Refreshing remote version cache...")
+        try:
+            for app in config.get("apps", []):
+                # Add a small delay between apps to avoid bot detection
+                time.sleep(2)
+                get_supported_versions(app["id"], config, scraper=scraper, force_refresh=True)
+        except Exception as e:
+            print(f"[Cron] Version refresh failed: {e}")
+        finally:
+            scraper.close()
+            SCRAPER_ACTIVE = False
+
+
 @app.post("/api/ui/add_source")
 def add_source(payload: AddSourcePayload, background_tasks: BackgroundTasks):
     config = load_config()
@@ -336,6 +406,61 @@ async def upload_apk(
     extract_app_metadata(file_path, package_id)
         
     return {"status": "success", "message": f"Uploaded {file.filename} as {file_path.name}"}
+
+
+SOURCE_UPDATE_CACHE = {"timestamp": 0, "results": {}}
+
+@app.get("/api/ui/source_updates")
+def check_source_updates():
+    """Checks for updates for all active patch sources with a 10-minute cache."""
+    global SOURCE_UPDATE_CACHE
+    now = time.time()
+    
+    # Return cached results if fresh (600 seconds = 10 mins)
+    if now - SOURCE_UPDATE_CACHE["timestamp"] < 600:
+        return SOURCE_UPDATE_CACHE["results"]
+
+    config = load_config()
+    results = {}
+    config_changed = False
+    
+    local_versions = {}
+    versions_file = DATA_DIR / "bin" / "versions.json"
+    if versions_file.exists():
+        with open(versions_file, "r") as f:
+            try:
+                local_versions = json.load(f)
+            except:
+                pass
+
+    for source in config.get("sources", []):
+        repo = source["repo"]
+        current_tag = local_versions.get(repo)
+        
+        # Sync current version to config if missing or different
+        if current_tag and source.get("version") != current_tag:
+            source["version"] = current_tag
+            config_changed = True
+
+        try:
+            api_url = f"https://api.github.com/repos/{repo}/releases/latest"
+            resp = requests.get(api_url, timeout=5)
+            if resp.status_code == 200:
+                latest_tag = resp.json().get("tag_name")
+                results[repo] = {
+                    "latest": latest_tag,
+                    "current": current_tag,
+                    "has_update": latest_tag != current_tag
+                }
+        except:
+            # Fallback to current only if request fails
+            results[repo] = {"latest": current_tag, "current": current_tag, "has_update": False}
+
+    if config_changed:
+        save_config(config)
+        
+    SOURCE_UPDATE_CACHE = {"timestamp": now, "results": results}
+    return results
 
 
 @app.get("/api/ui/discovery")
@@ -413,7 +538,7 @@ class TriggerBuildPayload(BaseModel):
 
 
 def build_task(package_ids=None, is_cron=False):
-    global BUILD_STATUS
+    global BUILD_STATUS, SCRAPER_ACTIVE
     
     # Safety: Prevent scheduled builds from triggering multiple times in the same minute
     current_time_str = time.strftime("%Y-%m-%d %H:%M")
@@ -424,54 +549,62 @@ def build_task(package_ids=None, is_cron=False):
         print("[Cron] Build already in progress, skipping...")
         return
 
-    BUILD_STATUS["in_progress"] = True
-    BUILD_STATUS["message"] = "Starting..."
-    if is_cron:
-        BUILD_STATUS["last_run_minute"] = current_time_str
+    with SCRAPER_LOCK:
+        SCRAPER_ACTIVE = True
+        BUILD_STATUS["in_progress"] = True
+        BUILD_STATUS["message"] = "Starting..."
+        if is_cron:
+            BUILD_STATUS["last_run_minute"] = current_time_str
 
-    # Ensure log directory exists
-    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        # Ensure log directory exists
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-    with open(LOG_PATH, "w", buffering=1, encoding="utf-8", newline="") as log_file:
-        old_stdout = sys.stdout
-        sys.stdout = Tee(sys.stdout, log_file)
-        try:
-            # Pass quiet=True if it's a cron build
-            patched_ids = run_pipeline(package_ids, quiet=is_cron)
-            BUILD_STATUS["message"] = "Finished"
-            BUILD_STATUS["last_run"] = time.strftime("%H:%M:%S")
-            
-            # Get info for notification
-            config = load_config()
-            all_apps = {a["id"]: a["name"] for a in config.get("apps", [])}
-            
-            # Correct logic: only notify success if apps were ACTUALLY patched successfully
-            if not patched_ids:
-                if not is_cron: # Manual build
-                    send_notification(
-                        "Build Finished", 
-                        "The build process completed, but no apps required patching (already up to date)."
-                    )
-                return
-
-            patched_names = [all_apps.get(pid, pid) for pid in patched_ids]
-            names_str = ", ".join(patched_names)
-            
-            send_notification(
-                "Apps Patched Successfully", 
-                f"The following apps were updated/patched: {names_str}"
-            )
-        except Exception as e:
-            error_msg = str(e)
-            print(f"\n[FATAL ERROR] {error_msg}")
-            BUILD_STATUS["message"] = f"Failed: {error_msg}"
-            send_notification(
-                "Build Failed", 
-                f"The pipeline build failed: {error_msg}"
-            )
-        finally:
-            sys.stdout = old_stdout
-            BUILD_STATUS["in_progress"] = False
+        with open(LOG_PATH, "w", buffering=1, encoding="utf-8", newline="") as log_file:
+            old_stdout = sys.stdout
+            sys.stdout = Tee(sys.stdout, log_file)
+            try:
+                # Pass quiet=True if it's a cron build
+                patched_ids = run_pipeline(package_ids, quiet=is_cron)
+                BUILD_STATUS["message"] = "Finished"
+                BUILD_STATUS["last_run"] = time.strftime("%H:%M:%S")
+                
+                # ... notification logic ...
+                config = load_config()
+                all_apps = {a["id"]: a["name"] for a in config.get("apps", [])}
+                requested_ids = package_ids if package_ids else [a["id"] for a in config.get("apps", [])]
+                
+                if not patched_ids:
+                    if not is_cron: # Manual build
+                        send_notification(
+                            "Build Finished", 
+                            "The build process completed, but no apps required patching or all failed. Check logs for details."
+                        )
+                else:
+                    patched_names = [all_apps.get(pid, pid) for pid in patched_ids]
+                    names_str = ", ".join(patched_names)
+                    
+                    if len(patched_ids) < len(requested_ids) and not is_cron:
+                        send_notification(
+                            "Build Finished with Warnings", 
+                            f"Some apps failed to patch. Successfully patched: {names_str}. Check logs for details."
+                        )
+                    else:
+                        send_notification(
+                            "Apps Patched Successfully", 
+                            f"The following apps were updated/patched: {names_str}"
+                        )
+            except Exception as e:
+                error_msg = str(e)
+                print(f"\n[FATAL ERROR] {error_msg}")
+                BUILD_STATUS["message"] = f"Failed: {error_msg}"
+                send_notification(
+                    "Build Failed", 
+                    f"The pipeline build failed: {error_msg}"
+                )
+            finally:
+                sys.stdout = old_stdout
+                BUILD_STATUS["in_progress"] = False
+                SCRAPER_ACTIVE = False
 
 
 @app.post("/api/ui/trigger_build")
@@ -513,38 +646,34 @@ def get_logs():
 
 @app.get("/download/{package_name}")
 def download_app_by_name(package_name: str):
-    """Serves the latest patched APK for a given package name."""
+    """Serves the latest patched APK for a given package name or exact filename."""
     print(f"[Download] Request for: {package_name}")
 
-    # Clean package name to handle .apk extension if present
-    base_name = package_name.replace("-patched.apk", "").replace(".apk", "")
-
-    # Priority 1: Exact filename match
+    # Priority 1: Exact filename match in patched directory
     file_path = DATA_DIR / "apks" / "patched" / package_name
     if file_path.exists() and file_path.is_file():
         print(f"[Download] Found via exact match: {file_path}")
         return FileResponse(file_path, media_type="application/vnd.android.package-archive")
 
-    # Priority 2: Inferred filename
-    inferred_path = DATA_DIR / "apks" / "patched" / f"{base_name}-patched.apk"
-    if inferred_path.exists() and inferred_path.is_file():
-        print(f"[Download] Found via inferred path: {inferred_path}")
-        return FileResponse(inferred_path, media_type="application/vnd.android.package-archive")
+    # Clean package name to handle .apk extension if present for globbing
+    base_name = package_name.replace("-patched.apk", "").replace(".apk", "")
+    # If package_name contains a version (has a dash), split it to get the ID
+    if "-" in base_name:
+        base_name = base_name.split("-")[0]
 
-    # Search for any file starting with base_name
+    # Priority 2: Search for any file starting with base_name (e.g., com.pkg.id-*.apk)
     print(f"[Download] File not found. Searching for glob: {base_name}* in {DATA_DIR}/apks/patched")
     try:
         patched_dir = DATA_DIR / "apks" / "patched"
         if patched_dir.exists():
             matches = list(patched_dir.glob(f"{base_name}*"))
             if matches:
+                # Sort by modification time to get the newest if multiple exist
+                matches.sort(key=lambda x: x.stat().st_mtime, reverse=True)
                 print(f"[Download] Found via glob: {matches[0]}")
                 return FileResponse(matches[0], media_type="application/vnd.android.package-archive")
     except Exception as e:
         print(f"[Download] Glob search failed: {e}")
-
-    print(f"[Download] FAILED. Searched: {file_path} and {inferred_path}")
-    return {"error": "File not found", "searched": [str(file_path), str(inferred_path)]}
 
 @app.get("/view/{package_id}", response_class=HTMLResponse)
 async def view_app(package_id: str, request: Request):
@@ -559,16 +688,32 @@ async def view_app(package_id: str, request: Request):
         print(f"[View] App not found for ID: {package_id}")
         return HTMLResponse("App not found in pipeline", status_code=404)
         
-    try:
-        supported = get_supported_versions(app_info["id"], config)
-        current_version = supported[0] if supported else "Unknown"
-    except:
-        current_version = "Unknown"
+    last_build = app_info.get("last_successful_build", {})
+    current_version = last_build.get("combined_version") or last_build.get("app_version", "Unknown")
+    
+    # Resolve the correct filename: 
+    # 1. Check if metadata has it
+    # 2. Check if the file actually exists
+    # 3. Fallback to globbing the latest on disk
+    filename = last_build.get("filename")
+    patched_dir = DATA_DIR / "apks" / "patched"
+    if not filename or not (patched_dir / filename).exists():
+        matches = list(patched_dir.glob(f"{app_info['id']}-*.apk"))
+        if matches:
+            matches.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+            filename = matches[0].name
+        else:
+            filename = f"{app_info['id']}-patched.apk" # Legacy fallback
+    
+    patch_versions = last_build.get("patch_versions", {})
+    
+    # Just show first few patch versions if many exist
+    patch_version_str = ", ".join([f"{repo.split('/')[-1]}:{v}" for repo, v in patch_versions.items()])
         
     # Build absolute URL for the download link to help some parsers
     settings = config.get("settings", {})
     base_url = settings.get("server_url", str(request.base_url).rstrip("/"))
-    download_url = f"{base_url}/download/{app_info['id']}-patched.apk"
+    download_url = f"{base_url}/download/{filename}"
         
     return templates.TemplateResponse(
         "obtainium.html",
@@ -576,6 +721,7 @@ async def view_app(package_id: str, request: Request):
             "request": request,
             "app": app_info,
             "version": current_version,
+            "patch_version": patch_version_str,
             "download_url": download_url
         }
     )
@@ -594,11 +740,19 @@ def get_single_app(obtainium_id: str, request: Request):
         print(f"[Obtainium] App with ID {obtainium_id} not found in config.")
         return {"error": "App not found"}
         
-    try:
-        supported = get_supported_versions(app_info["id"], config)
-        version = supported[0] if supported else "Unknown"
-    except:
-        version = "Unknown"
+    last_build = app_info.get("last_successful_build", {})
+    version = last_build.get("combined_version") or last_build.get("app_version", "Unknown")
+    
+    # Resolve filename with fallback
+    filename = last_build.get("filename")
+    patched_dir = DATA_DIR / "apks" / "patched"
+    if not filename or not (patched_dir / filename).exists():
+        matches = list(patched_dir.glob(f"{app_info['id']}-*.apk"))
+        if matches:
+            matches.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+            filename = matches[0].name
+        else:
+            filename = f"{app_info['id']}-patched.apk"
 
     # CRITICAL: Obtainium needs the 'id' to match the actual Android Package Name
     # to avoid the "could not get ID from apk" error.
@@ -606,7 +760,7 @@ def get_single_app(obtainium_id: str, request: Request):
         "id": app_info["id"], 
         "name": app_info["name"],
         "version": version,
-        "download_url": f"{base_url}/download/{app_info['id']}-patched.apk",
+        "download_url": f"{base_url}/download/{filename}",
     }
     print(f"[Obtainium] Returning: {response}")
     return response
@@ -619,19 +773,27 @@ def get_apps(request: Request):
     base_url = settings.get("server_url", str(request.base_url).rstrip("/"))
     
     response_data = []
+    patched_dir = DATA_DIR / "apks" / "patched"
     for app_info in config.get("apps", []):
-        try:
-            supported = get_supported_versions(app_info["id"], config)
-            version = supported[0] if supported else "Unknown"
-        except:
-            version = "Unknown"
+        last_build = app_info.get("last_successful_build", {})
+        version = last_build.get("combined_version") or last_build.get("app_version", "Unknown")
+        
+        # Resolve filename with fallback
+        filename = last_build.get("filename")
+        if not filename or not (patched_dir / filename).exists():
+            matches = list(patched_dir.glob(f"{app_info['id']}-*.apk"))
+            if matches:
+                matches.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+                filename = matches[0].name
+            else:
+                filename = f"{app_info['id']}-patched.apk"
 
         response_data.append(
             {
                 "id": app_info["id"], # Match real package name
                 "name": app_info["name"],
                 "version": version,
-                "download_url": f"{base_url}/download/{app_info['id']}-patched.apk",
+                "download_url": f"{base_url}/download/{filename}",
             }
         )
     return {"apps": response_data}
@@ -648,6 +810,10 @@ def setup_cron_job(config):
             # For cron, we pass package_ids=None (default) and is_cron=True
             scheduler.add_job(build_task, CronTrigger.from_crontab(cron), id="periodic_build", kwargs={"is_cron": True})
             print(f"[Cron] Scheduled background build with: {cron}")
+            
+            # Refresh versions every hour to keep UI up to date
+            scheduler.add_job(refresh_versions_task, CronTrigger(hour="*"), id="version_refresh")
+            print("[Cron] Scheduled hourly version cache refresh")
         except Exception as e:
             print(f"[Cron] Failed to schedule: {e}")
 
@@ -660,11 +826,12 @@ async def startup_event():
     setup_cron_job(config)
     DIAGNOSTICS = check_dependencies(config)
     
-    # Auto-sync on first run if tools are missing
     cli_jar = DATA_DIR / config["tools"]["cli_jar"]
     apkeditor_jar = DATA_DIR / config["tools"]["apkeditor_jar"]
     if not cli_jar.exists() or not apkeditor_jar.exists():
         print("[Init] Tools missing, triggering initial sync...")
         update_tools_task(config)
-        
+    
     scheduler.start()
+    # Trigger an immediate refresh of versions in the background
+    scheduler.add_job(refresh_versions_task, id="initial_version_refresh")

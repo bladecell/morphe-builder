@@ -5,6 +5,7 @@ build/
 dist/
 wheels/
 *.egg-info
+morphe-temporary-files/
 
 # Virtual environments
 .venv

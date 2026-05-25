@@ -3,15 +3,18 @@ import yaml
 import subprocess
 import os
 import json
+import time
 import tempfile
 import shutil
 import sys
 from pathlib import Path
 from packaging import version
+from src.apkmirror_scraper import APKMirrorScraper, FilterOptions, PackageType, Architecture
 
 PROJECT_ROOT = Path(__file__).parent.parent
 DATA_DIR = Path(os.getenv("DATA_DIR", str(PROJECT_ROOT)))
 VERSIONS_FILE = DATA_DIR / "bin" / "versions.json"
+VERSION_CACHE_FILE = DATA_DIR / "bin" / "version_cache.json"
 
 
 def load_local_versions():
@@ -25,6 +28,22 @@ def load_local_versions():
 def save_local_versions(versions):
     with open(VERSIONS_FILE, "w") as f:
         json.dump(versions, f, indent=4)
+
+
+def load_version_cache():
+    if VERSION_CACHE_FILE.exists():
+        try:
+            with open(VERSION_CACHE_FILE, "r") as f:
+                return json.load(f)
+        except:
+            pass
+    return {}
+
+
+def save_version_cache(cache):
+    VERSION_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(VERSION_CACHE_FILE, "w") as f:
+        json.dump(cache, f, indent=4)
 
 
 def download_with_progress(url, path):
@@ -120,7 +139,7 @@ def get_source_paths(repo_path):
 
 def check_dependencies(config):
     """Checks if required system tools are available."""
-    results = {"java": False, "apkeep": False}
+    results = {"java": False, "scraper": False}
     java_bin = config.get("settings", {}).get("java_path", "java")
     
     try:
@@ -130,9 +149,9 @@ def check_dependencies(config):
         pass
         
     try:
-        subprocess.run(["apkeep", "--version"], capture_output=True, check=True)
-        results["apkeep"] = True
-    except:
+        from src.apkmirror_scraper import APKMirrorScraper
+        results["scraper"] = True
+    except ImportError:
         pass
         
     return results
@@ -167,6 +186,26 @@ def update_tools(config, quiet=False):
             if check_and_download_release(source["repo"], get_source_paths(source["repo"])):
                 any_updated = True
 
+    # SYNC VERSIONS BACK TO CONFIG
+    local_versions = load_local_versions()
+    # Update source versions
+    for source in config.get("sources", []):
+        v = local_versions.get(source["repo"])
+        if v:
+            source["version"] = v
+            
+    # Update tool versions in config
+    if "tools" not in config: config["tools"] = {}
+    repos = config.get("repositories", {})
+    if repos.get("cli") in local_versions:
+        config["tools"]["cli_version"] = local_versions[repos["cli"]]
+    if repos.get("apkeditor") in local_versions:
+        config["tools"]["apkeditor_version"] = local_versions[repos["apkeditor"]]
+
+    if any_updated:
+        from src.main import save_config
+        save_config(config)
+
     if not quiet:
         print("---------------------------------\n")
     return any_updated
@@ -183,143 +222,164 @@ def load_config():
         return yaml.safe_load(file)
 
 
-def get_supported_versions(package_name, config):
-    print(f"Parsing supported versions for {package_name} across all sources...")
-    supported_versions = set()
-
+def get_supported_versions(package_name, config, scraper=None, force_refresh=False):
+    """
+    Fetches available versions for a package, prioritizing source-compatible ones.
+    Returns: [Recommended versions (desc), Experimental versions (desc)]
+    """
+    cache = load_version_cache()
+    entry = cache.get(package_name, {})
+    now = time.time()
+    
+    # Resolve org and repo from config if available
+    app_config = next((a for a in config.get("apps", []) if a["id"] == package_name), {})
+    org = app_config.get("apkmirror_org")
+    repo = app_config.get("apkmirror_repo")
+    
+    # 1. Parse versions from patch sources (Recommended)
+    source_supported = set()
     for source in config.get("sources", []):
-        if not source.get("active", True):
-            continue
-        
+        if not source.get("active", True): continue
         json_path = get_source_paths(source["repo"])[".json"]
-        if not json_path.exists():
-            continue
-
-        with open(json_path, "r") as f:
-            try:
+        if not json_path.exists(): continue
+        try:
+            with open(json_path, "r") as f:
                 data = json.load(f)
-            except:
-                continue
+                patches = data.get("patches", []) if isinstance(data, dict) else data
+                for p in patches:
+                    compat = p.get("compatiblePackages")
+                    if not compat: continue
+                    
+                    # Schema 1: Map { "pkg.id": ["v1", "v2"] }
+                    if isinstance(compat, dict) and package_name in compat:
+                        v_list = compat[package_name]
+                        if isinstance(v_list, list): source_supported.update([str(v).strip() for v in v_list])
+                        elif isinstance(v_list, str): source_supported.add(v_list.strip())
+                    
+                    # Schema 2: List [ { "name": "pkg.id", "versions": [...] } ]
+                    # OR List [ { "packageName": "pkg.id", "targets": [ { "version": "...", "isExperimental": bool } ] } ]
+                    elif isinstance(compat, list):
+                        for pkg in compat:
+                            if not isinstance(pkg, dict): continue
+                            
+                            # Check packageName first (ReVanced style), then name
+                            pkg_id = pkg.get("packageName") or pkg.get("name")
+                            if pkg_id != package_name: continue
+                            
+                            # Check versions (simple list)
+                            v_list = pkg.get("versions")
+                            if v_list:
+                                if isinstance(v_list, list): source_supported.update([str(v).strip() for v in v_list])
+                                elif isinstance(v_list, str): source_supported.add(v_list.strip())
+                                continue
+                            
+                            # Check targets (ReVanced style objects)
+                            targets = pkg.get("targets")
+                            if targets and isinstance(targets, list):
+                                for t in targets:
+                                    v = t.get("version")
+                                    # Only add if NOT experimental, or if we really have nothing else
+                                    if v and not t.get("isExperimental", False):
+                                        source_supported.add(str(v).strip())
+        except Exception as e:
+            print(f"    [!] Error parsing source {source['repo']}: {e}")
+    
+    recommended = sorted(list(source_supported), key=lambda v: version.parse(v), reverse=True)
+    
+    # 2. Check cache for APKMirror versions
+    # 12 hour cache by default
+    cached_remote = entry.get("versions", [])
+    if not force_refresh and entry and (now - entry.get("timestamp", 0) < 43200):
+        remote_versions = cached_remote
+    else:
+        print(f"Fetching available versions for {package_name} from APKMirror...")
+        close_scraper = False
+        if scraper is None:
+            scraper = APKMirrorScraper(headless=True)
+            close_scraper = True
+        try:
+            remote_versions = scraper.get_available_versions(package_name, org=org, repo=repo)
+            if not remote_versions and cached_remote:
+                remote_versions = cached_remote
+            
+            # Update cache
+            cache[package_name] = {"versions": remote_versions, "timestamp": now}
+            save_version_cache(cache)
+        except Exception as e:
+            print(f"    [!] Scraper failed for {package_name}: {e}")
+            remote_versions = cached_remote
+        finally:
+            if close_scraper: scraper.close()
 
-        patches_list = data.get("patches", []) if isinstance(data, dict) else data
-        for patch in patches_list:
-            compat_pkgs = patch.get("compatiblePackages")
-            if not compat_pkgs:
-                continue
+    # 3. Merge and Prioritize
+    # Recommended (from JSON) come first, sorted by version
+    # Then any OTHER versions found on APKMirror (Experimental), sorted by version
+    
+    experimental = [v for v in remote_versions if v not in source_supported]
+    experimental = sorted(experimental, key=lambda v: version.parse(v), reverse=True)
+    
+    if recommended:
+        print(f"    [+] Found {len(recommended)} recommended versions in sources.")
+        # If there are newer versions on APKMirror, log them as experimental
+        if experimental and version.parse(experimental[0]) > version.parse(recommended[0]):
+             print(f"    [!] Found newer experimental versions on APKMirror: {experimental[0]}")
+    else:
+        print(f"    [!] No recommended versions found in sources for {package_name}. Using APKMirror defaults.")
 
-            if isinstance(compat_pkgs, dict):
-                if package_name in compat_pkgs:
-                    versions = compat_pkgs[package_name]
-                    if isinstance(versions, list):
-                        supported_versions.update([str(v).strip() for v in versions])
-                    elif isinstance(versions, str):
-                        supported_versions.add(versions.strip())
-            elif isinstance(compat_pkgs, list):
-                for pkg in compat_pkgs:
-                    if isinstance(pkg, dict) and pkg.get("name") == package_name:
-                        versions = pkg.get("versions") or []
-                        if isinstance(versions, list):
-                            supported_versions.update([str(v).strip() for v in versions])
-                        elif isinstance(versions, str):
-                            supported_versions.add(versions.strip())
-
-    if not supported_versions:
-        return []
-
-    return sorted(list(supported_versions), key=lambda v: version.parse(v), reverse=True)
+    final_list = recommended + experimental
+    return final_list
 
 
-def extract_app_metadata(apk_path, package_id):
-    """Extracts app name and icon from the APK using APKEditor and saves them locally."""
+def extract_app_metadata(apk_path, package_id, scraper=None):
+    """Extracts app name from the APK and icon from APKMirror Scraper."""
     try:
         java_bin = load_config().get("settings", {}).get("java_path", "java")
         apkeditor_path = DATA_DIR / "bin" / "APKEditor.jar"
         
-        if not apkeditor_path.exists():
-            return None
+        app_name = package_id
+        version_name = "Unknown"
 
-        result = subprocess.run(
-            [java_bin, "-jar", str(apkeditor_path), "info", "-i", str(apk_path)],
-            capture_output=True,
-            text=True
-        )
-        
-        if result.returncode != 0:
-            print(f"    [!] APKEditor info failed for {package_id}")
-            return None
+        if apkeditor_path.exists():
+            result = subprocess.run(
+                [java_bin, "-jar", str(apkeditor_path), "info", "-i", str(apk_path)],
+                capture_output=True,
+                text=True
+            )
             
-        lines = result.stdout.splitlines()
-        info = {}
-        for line in lines:
-            if "=" in line:
-                key, value = line.split("=", 1)
-                info[key.strip()] = value.strip().strip('"')
+            if result.returncode == 0:
+                lines = result.stdout.splitlines()
+                info = {}
+                for line in lines:
+                    if "=" in line:
+                        key, value = line.split("=", 1)
+                        info[key.strip()] = value.strip().strip('"')
+                app_name = info.get("AppName", package_id)
+                version_name = info.get("VersionName", "Unknown")
 
-        app_name = info.get("AppName")
-        icon_path = info.get("AppIcon")
-        
+        # Handle icon via scraper
         icon_dir = DATA_DIR / "apks" / "icons"
         icon_dir.mkdir(parents=True, exist_ok=True)
+        target_icon = icon_dir / f"{package_id}.png"
         
-        # Extract icon
-        if icon_path:
-            with tempfile.TemporaryDirectory() as temp_dir:
-                icon_ext = os.path.splitext(icon_path)[1].lower()
-                target_icon_path = icon_path
-                
-                # If main icon is XML, try to find a PNG/WebP fallback
-                if icon_ext == ".xml":
-                    print(f"    [!] Main icon is XML, searching for fallbacks for {package_id}...")
-                    try:
-                        # List all files and look for PNG/WebP versions of the launcher icon
-                        # ic_launcher.xml -> ic_launcher.png
-                        base_name = os.path.basename(icon_path).replace(".xml", "")
-                        result_list = subprocess.run(
-                            ["unzip", "-l", str(apk_path)],
-                            capture_output=True, text=True
-                        )
-                        
-                        potential_icons = []
-                        for line in result_list.stdout.splitlines():
-                            parts = line.split()
-                            if len(parts) >= 4:
-                                path = parts[3]
-                                # Look for PNG/WebP versions of the launcher icon
-                                if (base_name in path or "ic_launcher" in path or "play_store" in path or "store_icon" in path or "logo" in path) and (path.endswith(".png") or path.endswith(".webp")):
-                                    # Exclude tiny UI icons (usually < 5KB)
-                                    try:
-                                        size = int(parts[0])
-                                        if size > 5000:
-                                            potential_icons.append(path)
-                                    except:
-                                        potential_icons.append(path)
-                        
-                        if potential_icons:
-                            # Prioritize: 1. Play store specific, 2. High density, 3. Round icons
-                            potential_icons.sort(key=lambda x: (
-                                "play_store" in x.lower() or "store_icon" in x.lower(),
-                                "xxxhdpi" in x.lower(), 
-                                "xxhdpi" in x.lower(),
-                                "round" in x.lower()
-                            ), reverse=True)
-                            target_icon_path = potential_icons[0]
-                            print(f"    [+] Found fallback icon: {target_icon_path}")
-                    except:
-                        pass
-
-                # Extract the identified icon (if it's not still XML)
-                if target_icon_path and not target_icon_path.endswith(".xml"):
-                    try:
-                        import shutil
-                        subprocess.run(
-                            ["unzip", "-j", str(apk_path), target_icon_path, "-d", temp_dir],
-                            capture_output=True
-                        )
-                        extracted_icon = Path(temp_dir) / os.path.basename(target_icon_path)
-                        if extracted_icon.exists():
-                            shutil.move(extracted_icon, icon_dir / f"{package_id}.png")
-                    except Exception as e:
-                        print(f"    [!] Failed to extract icon file {target_icon_path}: {e}")
+        if not target_icon.exists():
+            print(f"    [!] Icon missing for {package_id}, fetching from APKMirror...")
+            close_scraper = False
+            if scraper is None:
+                scraper = APKMirrorScraper(headless=True)
+                close_scraper = True
+            
+            try:
+                release = scraper.fetch_apk(package_id)
+                if release:
+                    release.download_icon(download_dir=str(icon_dir))
+                    for ext in [".png", ".jpg", ".jpeg", ".svg"]:
+                        icon_file = icon_dir / f"{package_id}_icon{ext}"
+                        if icon_file.exists():
+                            shutil.move(icon_file, target_icon)
+                            break
+            finally:
+                if close_scraper:
+                    scraper.close()
         
         # Save metadata
         metadata_file = DATA_DIR / "bin" / "metadata.json"
@@ -332,8 +392,8 @@ def extract_app_metadata(apk_path, package_id):
                     pass
         
         metadata[package_id] = {
-            "real_name": app_name or package_id,
-            "version": info.get("VersionName", "Unknown")
+            "real_name": app_name,
+            "version": version_name
         }
         
         with open(metadata_file, "w") as f:
@@ -345,120 +405,156 @@ def extract_app_metadata(apk_path, package_id):
         return None
 
 
-def download_apk(package_name, target_version, final_path, tools_config, config):
-    print(f"Downloading {package_name} v{target_version} using apkeep...")
+def get_app_preferences(package_name, config):
+    """Scans patch sources to find if the app has a preferred apkFileType (APK vs BUNDLE)."""
+    for source in config.get("sources", []):
+        if not source.get("active", True): continue
+        json_path = get_source_paths(source["repo"])[".json"]
+        if not json_path.exists(): continue
+        try:
+            with open(json_path, "r") as f:
+                data = json.load(f)
+                patches = data.get("patches", []) if isinstance(data, dict) else data
+                for p in patches:
+                    compat = p.get("compatiblePackages")
+                    if not compat or not isinstance(compat, list): continue
+                    for pkg in compat:
+                        if not isinstance(pkg, dict): continue
+                        p_id = pkg.get("packageName") or pkg.get("name")
+                        if p_id == package_name:
+                            ftype = pkg.get("apkFileType")
+                            if ftype:
+                                return ftype.upper()
+        except: pass
+    return None
+
+
+def download_apk(package_name, target_version, final_path, tools_config, config, scraper=None):
+    print(f"Downloading {package_name} v{target_version} using APKMirror Scraper...")
     java_bin = config.get("settings", {}).get("java_path", "java")
     
-    with tempfile.TemporaryDirectory() as temp_dir:
-        command = [
-            "apkeep",
-            "-a",
-            f"{package_name}@{target_version}",
-            "-d",
-            "apk-pure",
-            temp_dir,
+    close_scraper = False
+    if scraper is None:
+        scraper = APKMirrorScraper(headless=True)
+        close_scraper = True
+
+    try:
+        # Check for preferred file type from patches
+        pref = get_app_preferences(package_name, config)
+        
+        # Determine strategy order based on preference
+        # Standard: Bundle > APK
+        strategies = [
+            FilterOptions(type=PackageType.BUNDLE, arch=None),
+            FilterOptions(type=PackageType.APK, arch=None)
         ]
-        try:
-            process = subprocess.Popen(
-                command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
-            )
-            while True:
-                char = process.stdout.read(1)
-                if not char and process.poll() is not None:
+        
+        if pref:
+            # APK_REQUIRED or APK -> Standalone first
+            if "APK" in pref and "APKM" not in pref:
+                print(f"    [+] Source specifies standalone preference: {pref}. Prioritizing APK.")
+                strategies = [
+                    FilterOptions(type=PackageType.APK, arch=None),
+                    FilterOptions(type=PackageType.BUNDLE, arch=None)
+                ]
+            # APKM or BUNDLE -> Bundle first
+            elif any(x in pref for x in ["BUNDLE", "APKM", "XAPK"]):
+                print(f"    [+] Source specifies bundle preference: {pref}. Prioritizing Bundle.")
+                strategies = [
+                    FilterOptions(type=PackageType.BUNDLE, arch=None),
+                    FilterOptions(type=PackageType.APK, arch=None)
+                ]
+
+        release = None
+        for opts in strategies:
+            try:
+                print(f"    [~] Trying strategy: {opts.pkg_type} (Any Arch)...")
+                release = scraper.fetch_apk(package_name, version=target_version, options=opts, org=org, repo=repo)
+                if release:
+                    print(f"    [+] Found match using strategy: {opts.pkg_type}")
                     break
-                if char:
-                    sys.stdout.write(char)
-                    sys.stdout.flush()
+            except Exception as e:
+                # print(f"    [!] Strategy {opts.pkg_type} failed: {e}")
+                continue
 
-            if process.returncode != 0:
-                raise subprocess.CalledProcessError(process.returncode, command)
+        if not release:
+            raise Exception(f"Could not find {package_name} v{target_version} on APKMirror with any supported strategy")
 
-            # Recursive search for APK/XAPK files in case apkeep creates subdirectories
-            all_found_files = []
-            for root, dirs, files in os.walk(temp_dir):
-                for file in files:
-                    all_found_files.append(os.path.join(root, file))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            downloaded_path = release.download(download_dir=temp_dir)
+            if not downloaded_path:
+                raise Exception("Download failed")
 
-            apk_files = [f for f in all_found_files if f.endswith(".apk")]
-            xapk_files = [
-                f for f in all_found_files if f.endswith(".xapk") or f.endswith(".apkm")
-            ]
+            # Download icon
+            icon_dir = DATA_DIR / "apks" / "icons"
+            icon_dir.mkdir(parents=True, exist_ok=True)
+            release.download_icon(download_dir=str(icon_dir))
+            
+            # Rename icon to pkg.id.png (scraper saves as pkg.id_icon.ext)
+            for ext in [".png", ".jpg", ".jpeg", ".svg"]:
+                icon_file = icon_dir / f"{package_name}_icon{ext}"
+                if icon_file.exists():
+                    target_icon = icon_dir / f"{package_name}.png"
+                    if target_icon.exists(): target_icon.unlink()
+                    shutil.move(icon_file, target_icon)
+                    break
 
-            if apk_files:
-                temp_apk_path = apk_files[0]
-                shutil.move(temp_apk_path, final_path)
-                print(f"Successfully downloaded standalone APK to {final_path}")
-
-            elif xapk_files:
-                xapk_path = xapk_files[0]
-                print(
-                    f"Downloaded bundle ({os.path.basename(xapk_path)}). Merging splits via APKEditor..."
-                )
-
-                # Merge the .xapk into a single Universal APK
+            # Handle merge if it's a bundle file (regardless of what the page text said)
+            is_bundle_file = downloaded_path.lower().endswith((".apkm", ".xapk", ".zip"))
+            
+            if is_bundle_file:
+                print(f"Downloaded bundle ({os.path.basename(downloaded_path)}). Merging splits via APKEditor...")
                 apkeditor_path = DATA_DIR / tools_config["apkeditor_jar"]
                 merge_command = [
                     java_bin,
                     "-jar",
                     str(apkeditor_path),
-                    "m",  # 'm' stands for merge
+                    "m",
                     "-i",
-                    xapk_path,
+                    downloaded_path,
                     "-o",
                     str(final_path),
                 ]
-
-                try:
-                    process = subprocess.Popen(
-                        merge_command,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                    )
-                    while True:
-                        char = process.stdout.read(1)
-                        if not char and process.poll() is not None:
-                            break
-                        if char:
-                            sys.stdout.write(char)
-                            sys.stdout.flush()
-                    
-                    if process.returncode != 0:
-                        raise subprocess.CalledProcessError(
-                            process.returncode, merge_command
-                        )
-                    print(f"Successfully merged Universal APK to {final_path}")
-                except subprocess.CalledProcessError as e:
-                    print(f"Failed to merge APKs. Exit code: {e.returncode}")
-                    raise
-
+                subprocess.run(merge_command, check=True)
+                print(f"Successfully merged Universal APK to {final_path}")
             else:
-                raise FileNotFoundError(
-                    f"apkeep finished, but no .apk or .xapk found. Files in temp: {all_found_files}"
-                )
-            
-            # Extract name and icon
-            extract_app_metadata(final_path, package_name)
+                shutil.move(downloaded_path, final_path)
+                print(f"Successfully downloaded standalone APK to {final_path}")
 
-        except subprocess.CalledProcessError as e:
-            print(f"\n--- apkeep Error Info ---")
-            print(f"Exit Code: {e.returncode}")
-            print("Check the logs above for the specific error output.")
-            print(f"-------------------------\n")
-            raise
+            # Extract name from APK as a final check/metadata update
+            extract_app_metadata(final_path, package_name, scraper=scraper)
+
+    finally:
+        if close_scraper:
+            scraper.close()
 
 
 def patch_app(app_config, tools_config, input_apk, output_apk, config):
     cli = DATA_DIR / tools_config["cli_jar"]
     java_bin = config.get("settings", {}).get("java_path", "java")
     
-    # Track which MPP files we actually need to avoid conflict
-    # (Loading every MPP in the world can cause NoSuchMethodErrors if they have incompatible shared deps)
-    included_mpps = set()
-    selected_patch_names = set(app_config.get("include_patches", []))
+    # Get the real package ID from the input APK to verify compatibility
+    input_package_id = app_config["id"]
+    try:
+        apkeditor_path = DATA_DIR / "bin" / "APKEditor.jar"
+        info_result = subprocess.run(
+            [java_bin, "-jar", str(apkeditor_path), "info", "-i", str(input_apk)],
+            capture_output=True, text=True
+        )
+        for line in info_result.stdout.splitlines():
+            if "package=" in line:
+                input_package_id = line.split("=", 1)[1].strip().strip('"')
+                break
+    except:
+        pass
+
+    # Map each selected patch name to a SINGLE source
+    included_mpps = {} # path -> repo
+    selected_patches = set(app_config.get("include_patches", []))
+    remaining_patches = selected_patches.copy()
 
     for source in config.get("sources", []):
-        if not source.get("active", True):
+        if not source.get("active", True) or not remaining_patches:
             continue
         
         mpp_path = get_source_paths(source["repo"])[".mpp"]
@@ -467,25 +563,35 @@ def patch_app(app_config, tools_config, input_apk, output_apk, config):
         if not mpp_path.exists() or not json_path.exists():
             continue
 
-        # If this source contains any of the selected patches, include its MPP
         try:
             with open(json_path, "r") as f:
                 source_data = json.load(f)
                 patches_list = source_data.get("patches", []) if isinstance(source_data, dict) else source_data
-                source_patch_names = {p.get("name") for p in patches_list}
                 
-                # Check intersection: if this source has ANY of the selected patches, we need the MPP
-                if selected_patch_names.intersection(source_patch_names):
-                    included_mpps.add(str(mpp_path))
-        except:
-            # Fallback to including it if JSON fails to parse
-            included_mpps.add(str(mpp_path))
+                compatible_source_patches = set()
+                for p in patches_list:
+                    p_name = p.get("name")
+                    comp = p.get("compatiblePackages")
+                    is_compat = False
+                    if isinstance(comp, dict) and input_package_id in comp: is_compat = True
+                    elif isinstance(comp, list) and any(cp.get("name") == input_package_id for cp in comp): is_compat = True
+                    elif not comp: is_compat = True
+                        
+                    if is_compat: compatible_source_patches.add(p_name)
+                
+                found_in_this_source = remaining_patches.intersection(compatible_source_patches)
+                if found_in_this_source:
+                    included_mpps[str(mpp_path)] = source["repo"]
+                    remaining_patches -= found_in_this_source
+        except Exception as e:
+            print(f"    [!] Error analyzing source {source['name']}: {e}")
+            pass
 
-    # Always include the default source if it exists and we have no others
-    if not included_mpps:
-        default_mpp = get_source_paths("MorpheApp/morphe-patches")[".mpp"]
+    if remaining_patches or not included_mpps:
+        default_repo = "MorpheApp/morphe-patches"
+        default_mpp = get_source_paths(default_repo)[".mpp"]
         if default_mpp.exists():
-            included_mpps.add(str(default_mpp))
+            included_mpps[str(default_mpp)] = default_repo
 
     command = [
         java_bin,
@@ -498,8 +604,8 @@ def patch_app(app_config, tools_config, input_apk, output_apk, config):
         str(output_apk),
     ]
 
-    for mpp in included_mpps:
-        command.extend(["--patches", mpp])
+    for mpp_path in included_mpps.keys():
+        command.extend(["--patches", mpp_path])
 
     for p in app_config.get("include_patches", []):
         command.extend(["-e", p])
@@ -507,24 +613,68 @@ def patch_app(app_config, tools_config, input_apk, output_apk, config):
         command.extend(["-d", p])
 
     print(f"Running patcher for {app_config['name']}...")
+    has_severe_error = False
     try:
         process = subprocess.Popen(
             command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
         )
         while True:
-            char = process.stdout.read(1)
-            if not char and process.poll() is not None:
+            line = process.stdout.readline()
+            if not line and process.poll() is not None:
                 break
-            if char:
-                sys.stdout.write(char)
+            if line:
+                if "SEVERE:" in line:
+                    has_severe_error = True
+                sys.stdout.write(line)
                 sys.stdout.flush()
 
         if process.returncode != 0:
             raise subprocess.CalledProcessError(process.returncode, command)
 
+        if has_severe_error:
+            print(f"\n[!] {app_config['name']} patched with some SEVERE errors. Deleting failed APK.")
+            if Path(output_apk).exists():
+                Path(output_apk).unlink(missing_ok=True)
+            return False, []
+
         print(f"Successfully patched {app_config['name']} to {output_apk}")
-    except subprocess.CalledProcessError as e:
+        return True, list(included_mpps.values())
+    except Exception as e:
         print(f"Patching failed for {app_config['name']}: {e}")
+        if Path(output_apk).exists():
+            Path(output_apk).unlink(missing_ok=True)
+        return False, []
+
+
+def save_metadata(package_id, data):
+    """Saves app-specific metadata to the persistent store."""
+    metadata_file = DATA_DIR / "bin" / "metadata.json"
+    metadata = {}
+    if metadata_file.exists():
+        with open(metadata_file, "r") as f:
+            try:
+                metadata = json.load(f)
+            except:
+                pass
+    
+    if package_id not in metadata:
+        metadata[package_id] = {}
+    
+    metadata[package_id].update(data)
+    
+    with open(metadata_file, "w") as f:
+        json.dump(metadata, f, indent=4)
+    return metadata[package_id]
+
+
+def get_patch_versions(config):
+    """Returns a dictionary of current versions for all active patch sources."""
+    local_versions = load_local_versions()
+    patch_info = {}
+    for source in config.get("sources", []):
+        if source.get("active", True):
+            patch_info[source["repo"]] = local_versions.get(source["repo"], "Unknown")
+    return patch_info
 
 
 def get_current_version(package_id):
@@ -550,6 +700,9 @@ def get_current_version(package_id):
 def run_pipeline(package_ids=None, quiet=False):
     config = load_config()
     was_updated = update_tools(config, quiet=quiet)
+    
+    # Get current versions of all active patch sources
+    current_patch_versions = get_patch_versions(config)
 
     raw_dir = DATA_DIR / "apks" / "raw"
     patched_dir = DATA_DIR / "apks" / "patched"
@@ -561,55 +714,161 @@ def run_pipeline(package_ids=None, quiet=False):
         apps_to_build = [a for a in apps_to_build if a["id"] in package_ids]
 
     patched_apps = []
-
-    for app in apps_to_build:
-        try:
-            supported = get_supported_versions(app["id"], config)
-            if not supported:
-                print(f"[!] No supported versions found for {app['id']}")
-                continue
-
-            download_success = False
-            target_version = None
-            raw_apk_path = None
-
-            for v in supported:
-                raw_apk_path = raw_dir / f"{app['id']}-{v}.apk"
-                if raw_apk_path.exists():
-                    target_version = v
-                    download_success = True
-                    print(f"Raw APK already exists for {app['id']} v{v}, skipping download.")
-                    extract_app_metadata(raw_apk_path, app['id'])
-                    break
+    
+    scraper = APKMirrorScraper(headless=True)
+    try:
+        for i, app in enumerate(apps_to_build):
+            try:
+                # Mimic human behavior with small delays between apps
+                if i > 0:
+                    time.sleep(5)
                 
-                try:
-                    download_apk(app["id"], v, raw_apk_path, config["tools"], config)
-                    target_version = v
-                    download_success = True
-                    break
-                except Exception as e:
-                    print(f"    [!] Failed to download v{v}. Trying next version...")
-                    if raw_apk_path and raw_apk_path.exists():
-                        raw_apk_path.unlink(missing_ok=True) # Cleanup partial download
+                # ... rest of app processing ...
+                # ...
+                # (keep existing auto-include logic)
+                current_include = set(app.get("include_patches", []))
+                new_defaults_found = False
+                
+                for source in config.get("sources", []):
+                    if not source.get("active", True): continue
+                    json_path = get_source_paths(source["repo"])[".json"]
+                    if not json_path.exists(): continue
+                    try:
+                        with open(json_path, "r") as f:
+                            source_data = json.load(f)
+                            patches_list = source_data.get("patches", []) if isinstance(source_data, dict) else source_data
+                            for p in patches_list:
+                                p_name = p.get("name")
+                                if p.get("use", True) and p.get("enabled_by_default", False):
+                                    # Check package compatibility
+                                    comp = p.get("compatiblePackages")
+                                    is_compat = False
+                                    if isinstance(comp, dict) and app["id"] in comp: is_compat = True
+                                    elif isinstance(comp, list) and any(cp.get("name") == app["id"] for cp in comp): is_compat = True
+                                    elif not comp: is_compat = True
+                                    
+                                    if is_compat and p_name not in current_include:
+                                        print(f"    [+] Auto-adding new default patch: {p_name}")
+                                        app.setdefault("include_patches", []).append(p_name)
+                                        current_include.add(p_name)
+                                        new_defaults_found = True
+                    except:
+                        pass
+                
+                if new_defaults_found:
+                    from src.main import save_config
+                    save_config(config)
+
+                supported = get_supported_versions(app["id"], config, scraper=scraper, force_refresh=True)
+                
+                # PINNED VERSION LOGIC:
+                # ...
+                pinned_version = app.get("version")
+                if pinned_version:
+                    print(f"[!] Pinned version {pinned_version} detected for {app['id']}. Ignoring other versions.")
+                    supported = [pinned_version]
+
+                if not supported:
+                    print(f"[!] No supported versions found for {app['id']}")
+                    app["status"] = "Error"
+                    app["error"] = "No supported versions"
+                    from src.main import save_config
+                    save_config(config)
                     continue
 
-            if not download_success:
-                print(f"[x] Could not download any supported version for {app['id']}")
-                continue
+                download_success = False
+                target_version = None
+                raw_apk_path = None
 
-            patched_apk_path = patched_dir / f"{app['id']}-patched.apk"
-            
-            # CHECK IF WE SHOULD SKIP PATCHING
-            if not was_updated and patched_apk_path.exists() and raw_apk_path.exists():
-                # If patched file is newer than raw file, we already patched this version
-                if patched_apk_path.stat().st_mtime > raw_apk_path.stat().st_mtime:
-                    print(f"[\u2713] {app['name']} is already up to date (version {target_version}), skipping patch.")
+                for v in supported:
+                    raw_apk_path = raw_dir / f"{app['id']}-{v}.apk"
+                    if raw_apk_path.exists():
+                        target_version = v
+                        download_success = True
+                        print(f"Raw APK already exists for {app['id']} v{v}, skipping download.")
+                        extract_app_metadata(raw_apk_path, app['id'], scraper=scraper)
+                        break
+                    
+                    try:
+                        download_apk(app["id"], v, raw_apk_path, config["tools"], config, scraper=scraper)
+                        target_version = v
+                        download_success = True
+                        break
+                    except Exception as e:
+                        print(f"    [!] Failed to download v{v}: {e}. Trying next version...")
+                        if raw_apk_path and raw_apk_path.exists():
+                            raw_apk_path.unlink(missing_ok=True) # Cleanup partial download
+                        continue
+
+                if not download_success:
+                    # ...
+                    print(f"[x] Could not download any supported version for {app['id']}")
+                    app["status"] = "Error"
+                    app["error"] = "Download failed"
+                    from src.main import save_config
+                    save_config(config)
                     continue
 
-            patch_app(app, config["tools"], raw_apk_path, patched_apk_path, config)
-            patched_apps.append(app["id"])
-        except Exception as e:
-            print(f"Error processing {app['id']}: {e}")
+                # ... patching logic ...
+                last_build = app.get("last_successful_build", {})
+                
+                # Helper for combined version string
+                # Simple combined version: app_version-patch_version (using first available patch tag)
+                patch_tag = "v0.0.0"
+                if current_patch_versions:
+                    # Prefer Morphe patches if available
+                    morphe_v = next((v for r, v in current_patch_versions.items() if "morphe-patches" in r.lower()), None)
+                    patch_tag = morphe_v if morphe_v else list(current_patch_versions.values())[0]
+                
+                combined_version = f"{target_version}-{patch_tag}"
+                patched_apk_path = patched_dir / f"{app['id']}-{combined_version}.apk"
+
+                if (not was_updated and
+                    patched_apk_path.exists() and 
+                    last_build.get("combined_version") == combined_version):
+                    
+                    print(f"[\u2713] {app['name']} is already up to date (Version: {combined_version}), skipping patch.")
+                    continue
+
+                # Clean up old patched versions for this app before building new one
+                for old_file in patched_dir.glob(f"{app['id']}-*.apk"):
+                    try:
+                        old_file.unlink()
+                    except:
+                        pass
+
+                success, used_repos = patch_app(app, config["tools"], raw_apk_path, patched_apk_path, config)
+                if success:
+                    patched_apps.append(app["id"])
+                    
+                    # Only save versions for the repos actually used for this app
+                    relevant_patch_versions = {repo: current_patch_versions.get(repo, "Unknown") for repo in used_repos}
+                    
+                    # Update the app entry in our local config object
+                    app["last_successful_build"] = {
+                        "app_version": target_version,
+                        "patch_versions": relevant_patch_versions,
+                        "combined_version": combined_version,
+                        "filename": patched_apk_path.name,
+                        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                    }
+                    app["status"] = "Success"
+                    app["error"] = None
+                    from src.main import save_config
+                    save_config(config)
+                else:
+                    app["status"] = "Failed"
+                    app["error"] = "Patching failed with SEVERE errors"
+                    from src.main import save_config
+                    save_config(config)
+            except Exception as e:
+                print(f"Error processing {app['id']}: {e}")
+                app["status"] = "Error"
+                app["error"] = str(e)
+                from src.main import save_config
+                save_config(config)
+    finally:
+        scraper.close()
             
     return patched_apps
 
@@ -644,7 +903,12 @@ def get_all_available_apps(config):
             if isinstance(compat_pkgs, dict):
                 pkgs_to_add = list(compat_pkgs.keys())
             elif isinstance(compat_pkgs, list):
-                pkgs_to_add = [pkg.get("name") for pkg in compat_pkgs if isinstance(pkg, dict) and "name" in pkg]
+                pkgs_to_add = []
+                for pkg in compat_pkgs:
+                    if not isinstance(pkg, dict): continue
+                    # Prioritize packageName (ReVanced style), then name
+                    p_id = pkg.get("packageName") or pkg.get("name")
+                    if p_id: pkgs_to_add.append(p_id)
 
             for pkg_id in pkgs_to_add:
                 if not pkg_id: continue

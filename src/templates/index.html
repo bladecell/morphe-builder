@@ -29,6 +29,7 @@
                 metadata: {{ metadata | tojson | safe }},
                 settings: {{ (config.settings if config.settings else {"server_url": "", "cron_schedule": "0 0 * * *", "notification_urls": []}) | tojson | safe }},
                 updates: {},
+                sourceUpdates: {},
                 lastRun: '{{ metadata.last_run if metadata and metadata.last_run else "Never" }}',
                 selectedApps: [],
                 showModal: false,
@@ -46,7 +47,7 @@
                 newNotificationUrl: '',
                 testingNotifications: false,
 
-                diagnostics: {java: true, apkeep: true},
+                diagnostics: {java: true, scraper: true},
 
                 init() {
                     this.checkBuildStatus();
@@ -469,8 +470,8 @@
                     <div class="w-1.5 h-1.5 rounded-full" :class="diagnostics.java ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.4)]' : 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.4)]'"></div>
                 </div>
                 <div class="flex items-center gap-2 px-3 py-1 bg-slate-900 rounded-full border border-slate-800">
-                    <span class="text-[9px] font-black uppercase tracking-widest" :class="diagnostics.apkeep ? 'text-emerald-500' : 'text-red-500'">Apkeep</span>
-                    <div class="w-1.5 h-1.5 rounded-full" :class="diagnostics.apkeep ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.4)]' : 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.4)]'"></div>
+                    <span class="text-[9px] font-black uppercase tracking-widest" :class="diagnostics.scraper ? 'text-emerald-500' : 'text-red-500'">Scraper</span>
+                    <div class="w-1.5 h-1.5 rounded-full" :class="diagnostics.scraper ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.4)]' : 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.4)]'"></div>
                 </div>
             </div>
         </div>
@@ -495,8 +496,17 @@
                         <template x-for="source in sources" :key="source.repo">
                             <div class="flex items-center justify-between p-3 bg-slate-950 rounded-xl border border-slate-800 group relative overflow-hidden">
                                 <div class="flex flex-col">
-                                    <span class="text-xs font-bold text-white" x-text="source.name"></span>
-                                    <span class="text-[10px] text-slate-500" x-text="source.repo"></span>
+                                    <div class="flex items-center gap-2">
+                                        <span class="text-xs font-bold text-white" x-text="source.name"></span>
+                                        <template x-if="sourceUpdates[source.repo] && sourceUpdates[source.repo].has_update">
+                                            <span class="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" title="Update Available"></span>
+                                        </template>
+                                    </div>
+                                    <div class="flex items-center gap-2 mt-0.5">
+                                        <span class="text-[9px] font-mono text-slate-500" x-text="sourceUpdates[source.repo]?.current || source.version || 'Unknown'"></span>
+                                        <span class="text-[9px] text-slate-700">•</span>
+                                        <span class="text-[9px] text-slate-600 truncate max-w-[100px]" x-text="source.repo"></span>
+                                    </div>
                                 </div>
                                 <div class="flex items-center gap-2">
                                     <button 
@@ -625,19 +635,14 @@
                             title="Add to Obtainium (App API)">
                             <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" /></svg>
                         </button>
-                        <button 
-                            @click="const url = (settings.server_url || window.location.origin) + '/view/' + '{{ app.id }}'; navigator.clipboard.writeText(url); alert('Link copied for Obtainium HTML source:\n' + url);"
-                            class="bg-slate-800 hover:bg-emerald-600 p-2 rounded-lg text-slate-400 hover:text-white transition-all"
-                            title="Copy Link for Obtainium (HTML Source)">
-                            <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.828a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" /></svg>
-                        </button>
                         <a 
-                            :href="'/download/' + '{{ app.id }}'"
-                            download
+                            :href="'/view/' + '{{ app.id }}'"
+                            target="_blank"
+                            :disabled="updates['{{ app.id }}'] && !updates['{{ app.id }}'].file_exists"
                             :class="updates['{{ app.id }}'] && !updates['{{ app.id }}'].file_exists ? 'bg-slate-800 text-slate-700 cursor-not-allowed pointer-events-none' : 'bg-slate-800 hover:bg-indigo-600 text-slate-400 hover:text-white'"
                             class="p-2 rounded-lg transition-all"
-                            title="Direct Download Patched APK">
-                            <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4-4m0 0L8 8m4-4v12" /></svg>
+                            title="Open Download Page">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" /></svg>
                         </a>
                         <button 
                             @click="selectedPkg = '{{ app.id }}'; uploadVersion = ''; showUploadModal = true;"

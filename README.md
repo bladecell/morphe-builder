@@ -16,7 +16,6 @@ Morphe Builder is an automated Android application patcher with a Web UI and Obt
 - **Manual Installation:**
   - Python 3.12+
   - Java 17+ (required for [Morphe CLI](https://github.com/MorpheApp/morphe-cli) and APKEditor)
-  - [apkeep](https://github.com/EFForg/apkeep) (for downloading APKs)
 
 ## Getting Started
 
@@ -76,6 +75,4 @@ To add an app to Obtainium:
 Alternatively, add the following URL to Obtainium:
 `http://<your-server-ip>:8000/api/apps/<obtainium_id>`
 
-## License
 
-MIT

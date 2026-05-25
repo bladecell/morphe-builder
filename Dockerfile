@@ -8,18 +8,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     unzip \
     && rm -rf /var/lib/apt/lists/*
 
-# Install apkeep (Rust-based downloader) - Architecture aware
-RUN ARCH=$(uname -m) && \
-    if [ "$ARCH" = "x86_64" ]; then \
-        DOWNLOAD_ARCH="x86_64-unknown-linux-gnu"; \
-    elif [ "$ARCH" = "aarch64" ]; then \
-        DOWNLOAD_ARCH="aarch64-unknown-linux-gnu"; \
-    else \
-        echo "Unsupported architecture: $ARCH" && exit 1; \
-    fi && \
-    curl -L "https://github.com/EFForg/apkeep/releases/latest/download/apkeep-$DOWNLOAD_ARCH" -o /usr/local/bin/apkeep \
-    && chmod +x /usr/local/bin/apkeep
-
 # Install uv
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
@@ -28,8 +16,9 @@ WORKDIR /app
 # Copy dependency files
 COPY pyproject.toml uv.lock ./
 
-# Sync dependencies
-RUN uv sync
+# Sync dependencies and install Playwright browsers with system deps
+RUN uv sync && \
+    uv run playwright install --with-deps chromium
 
 # Copy source only
 COPY src/ src/

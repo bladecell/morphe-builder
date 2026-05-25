@@ -16,7 +16,10 @@
     <div class="card">
         <h1>{{ app.name }}</h1>
         <p>Package ID: <code>{{ app.id }}</code></p>
-        <p>Latest Version: <span class="version">{{ version }}</span></p>
+        <p>App Version: <span class="version">{{ version }}</span></p>
+        {% if patch_version %}
+        <p>Patch Version: <span class="version">{{ patch_version }}</span></p>
+        {% endif %}
         <!-- Obtainium looks for links ending in .apk -->
         <a href="{{ download_url }}">Download {{ app.id }}-v{{ version }}.apk</a>
         <p style="font-size: 0.7rem; color: #64748b; margin-top: 2rem;">
