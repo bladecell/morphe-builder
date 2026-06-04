@@ -9,7 +9,7 @@ import shutil
 import sys
 from pathlib import Path
 from packaging import version
-from src.apkmirror_scraper import APKMirrorScraper, FilterOptions, PackageType, Architecture
+from src.apkmirror_downloader import ApkMirror_Downloader, Arch, Dpi, BundleType
 
 PROJECT_ROOT = Path(__file__).parent.parent
 DATA_DIR = Path(os.getenv("DATA_DIR", str(PROJECT_ROOT)))
@@ -149,7 +149,7 @@ def check_dependencies(config):
         pass
         
     try:
-        from src.apkmirror_scraper import APKMirrorScraper
+        from src.apkmirror_downloader import ApkMirror_Downloader
         results["scraper"] = True
     except ImportError:
         pass
@@ -222,112 +222,131 @@ def load_config():
         return yaml.safe_load(file)
 
 
-def get_supported_versions(package_name, config, scraper=None, force_refresh=False):
+def get_supported_versions(package_name, config, scraper=None, force_refresh=False, quiet=False):
     """
-    Fetches available versions for a package, prioritizing source-compatible ones.
-    Returns: [Recommended versions (desc), Experimental versions (desc)]
+    Fetches available versions for a package with prioritization:
+    1. Pinned version in config (Return immediately)
+    2. Newest Recommended version from patch sources (Filtered by selected patches)
+    3. Newest version from APKMirror search (Fallback)
+    Returns: (final_list, None, None)
     """
-    cache = load_version_cache()
-    entry = cache.get(package_name, {})
-    now = time.time()
-    
-    # Resolve org and repo from config if available
     app_config = next((a for a in config.get("apps", []) if a["id"] == package_name), {})
-    org = app_config.get("apkmirror_org")
-    repo = app_config.get("apkmirror_repo")
+    pinned_v = app_config.get("version")
+    if pinned_v:
+        if not quiet: print(f"    [+] Using pinned version from config for {package_name}: {pinned_v}")
+        return [str(pinned_v)], None, None
+
+    selected_patches = set(app_config.get("include_patches", []))
     
-    # 1. Parse versions from patch sources (Recommended)
-    source_supported = set()
+    # 1. Parse Recommended versions from active patch sources
+    # POLICY: Only look at sources that are either "Morphe Patches" (base)
+    # OR sources that actually provide one of the selected patches.
+    versions_by_source = {} # source_name -> set of versions
+    providing_sources = set()
+
     for source in config.get("sources", []):
         if not source.get("active", True): continue
+        s_name = source["name"]
         json_path = get_source_paths(source["repo"])[".json"]
         if not json_path.exists(): continue
+        
         try:
             with open(json_path, "r") as f:
                 data = json.load(f)
                 patches = data.get("patches", []) if isinstance(data, dict) else data
+                
+                s_versions = set()
+                has_selected_patch = False
+                
                 for p in patches:
+                    p_name = p.get("name")
+                    if p_name in selected_patches:
+                        has_selected_patch = True
+                    
                     compat = p.get("compatiblePackages")
                     if not compat: continue
                     
-                    # Schema 1: Map { "pkg.id": ["v1", "v2"] }
+                    v_list = []
                     if isinstance(compat, dict) and package_name in compat:
                         v_list = compat[package_name]
-                        if isinstance(v_list, list): source_supported.update([str(v).strip() for v in v_list])
-                        elif isinstance(v_list, str): source_supported.add(v_list.strip())
-                    
-                    # Schema 2: List [ { "name": "pkg.id", "versions": [...] } ]
-                    # OR List [ { "packageName": "pkg.id", "targets": [ { "version": "...", "isExperimental": bool } ] } ]
                     elif isinstance(compat, list):
                         for pkg in compat:
                             if not isinstance(pkg, dict): continue
-                            
-                            # Check packageName first (ReVanced style), then name
                             pkg_id = pkg.get("packageName") or pkg.get("name")
                             if pkg_id != package_name: continue
-                            
-                            # Check versions (simple list)
-                            v_list = pkg.get("versions")
-                            if v_list:
-                                if isinstance(v_list, list): source_supported.update([str(v).strip() for v in v_list])
-                                elif isinstance(v_list, str): source_supported.add(v_list.strip())
-                                continue
-                            
-                            # Check targets (ReVanced style objects)
+                            v_list = pkg.get("versions") or []
                             targets = pkg.get("targets")
                             if targets and isinstance(targets, list):
-                                for t in targets:
-                                    v = t.get("version")
-                                    # Only add if NOT experimental, or if we really have nothing else
-                                    if v and not t.get("isExperimental", False):
-                                        source_supported.add(str(v).strip())
-        except Exception as e:
-            print(f"    [!] Error parsing source {source['repo']}: {e}")
+                                v_list = [t.get("version") for t in targets if t.get("version") and not t.get("isExperimental", False)]
+                    
+                    if v_list:
+                        if isinstance(v_list, list): s_versions.update([str(v).strip() for v in v_list if v])
+                        elif isinstance(v_list, str): s_versions.add(v_list.strip())
+                
+                if s_versions:
+                    versions_by_source[s_name] = s_versions
+                    if has_selected_patch or s_name == "Morphe Patches":
+                        providing_sources.add(s_name)
+        except: pass
     
-    recommended = sorted(list(source_supported), key=lambda v: version.parse(v), reverse=True)
-    
-    # 2. Check cache for APKMirror versions
-    # 12 hour cache by default
-    cached_remote = entry.get("versions", [])
-    if not force_refresh and entry and (now - entry.get("timestamp", 0) < 43200):
-        remote_versions = cached_remote
+    # If patches are selected, only use versions supported by the providers
+    recommended_set = set()
+    if selected_patches and providing_sources:
+        # Collect versions from providing sources
+        for s_name in providing_sources:
+            if s_name in versions_by_source:
+                # If we haven't picked a version yet, take the first provider's
+                if not recommended_set:
+                    recommended_set = versions_by_source[s_name]
+                else:
+                    # INTERSECT versions if multiple sources provide patches
+                    # (Ensure we pick a version compatible with ALL selected sources)
+                    intersect = recommended_set.intersection(versions_by_source[s_name])
+                    if intersect:
+                        recommended_set = intersect
+                    else:
+                        # If no intersection, fallback to the provider that isn't Morphe
+                        if s_name != "Morphe Patches":
+                            recommended_set = versions_by_source[s_name]
     else:
-        print(f"Fetching available versions for {package_name} from APKMirror...")
-        close_scraper = False
-        if scraper is None:
-            scraper = APKMirrorScraper(headless=True)
-            close_scraper = True
-        try:
-            remote_versions = scraper.get_available_versions(package_name, org=org, repo=repo)
-            if not remote_versions and cached_remote:
-                remote_versions = cached_remote
-            
-            # Update cache
-            cache[package_name] = {"versions": remote_versions, "timestamp": now}
-            save_version_cache(cache)
-        except Exception as e:
-            print(f"    [!] Scraper failed for {package_name}: {e}")
-            remote_versions = cached_remote
-        finally:
-            if close_scraper: scraper.close()
+        # No patches selected yet (Discovery mode), merge all
+        for s_versions in versions_by_source.values():
+            recommended_set.update(s_versions)
 
-    # 3. Merge and Prioritize
-    # Recommended (from JSON) come first, sorted by version
-    # Then any OTHER versions found on APKMirror (Experimental), sorted by version
-    
-    experimental = [v for v in remote_versions if v not in source_supported]
-    experimental = sorted(experimental, key=lambda v: version.parse(v), reverse=True)
-    
+    recommended = sorted(list(recommended_set), key=lambda v: version.parse(v), reverse=True)
     if recommended:
-        print(f"    [+] Found {len(recommended)} recommended versions in sources.")
-        # If there are newer versions on APKMirror, log them as experimental
-        if experimental and version.parse(experimental[0]) > version.parse(recommended[0]):
-             print(f"    [!] Found newer experimental versions on APKMirror: {experimental[0]}")
-    else:
-        print(f"    [!] No recommended versions found in sources for {package_name}. Using APKMirror defaults.")
+        if not quiet: print(f"    [+] Found {len(recommended)} compatible recommended versions. Using newest: {recommended[0]}")
+        return [recommended[0]], None, None
 
-    final_list = recommended + experimental
-    return final_list
+    # 2. Fallback to newest from APKMirror
+    cache = load_version_cache()
+    entry = cache.get(package_name, {})
+    now = time.time()
+    cached_remote = entry.get("versions", [])
+    
+    if not force_refresh and entry and (now - entry.get("timestamp", 0) < 43200):
+        if cached_remote: return cached_remote, None, None
+
+    if not quiet: print(f"Fetching newest version for {package_name} from APKMirror...")
+    close_scraper = False
+    if scraper is None:
+        scraper = ApkMirror_Downloader()
+        close_scraper = True
+
+    try:
+        app_data = scraper.search(package_name=package_name, only_release=True)
+        if app_data and app_data.version:
+            versions = [app_data.version]
+            cache[package_name] = {"versions": versions, "timestamp": now}
+            save_version_cache(cache)
+            if not quiet: print(f"    [+] Found newest on APKMirror: {app_data.version}")
+            return versions, None, None
+        return cached_remote, None, None
+    except Exception as e:
+        if not quiet: print(f"    [!] Scraper failed for {package_name}: {e}")
+        return cached_remote, None, None
+    finally:
+        if close_scraper: scraper.close()
 
 
 def extract_app_metadata(apk_path, package_id, scraper=None):
@@ -365,18 +384,17 @@ def extract_app_metadata(apk_path, package_id, scraper=None):
             print(f"    [!] Icon missing for {package_id}, fetching from APKMirror...")
             close_scraper = False
             if scraper is None:
-                scraper = APKMirrorScraper(headless=True)
+                scraper = ApkMirror_Downloader()
                 close_scraper = True
             
             try:
-                release = scraper.fetch_apk(package_id)
-                if release:
-                    release.download_icon(download_dir=str(icon_dir))
-                    for ext in [".png", ".jpg", ".jpeg", ".svg"]:
-                        icon_file = icon_dir / f"{package_id}_icon{ext}"
-                        if icon_file.exists():
-                            shutil.move(icon_file, target_icon)
-                            break
+                app_data = scraper.search(package_name=package_id, only_release=True)
+                if app_data and app_data.icon_url and app_data.icon_url != "Unknown":
+                    scraper.download_file(
+                        target_url=app_data.icon_url,
+                        dest_directory=str(icon_dir),
+                        filename=f"{package_id}.png"
+                    )
             finally:
                 if close_scraper:
                     scraper.close()
@@ -430,80 +448,74 @@ def get_app_preferences(package_name, config):
 
 
 def download_apk(package_name, target_version, final_path, tools_config, config, scraper=None):
-    print(f"Downloading {package_name} v{target_version} using APKMirror Scraper...")
+    print(f"Downloading {package_name} v{target_version} using ApkMirror_Downloader...")
     java_bin = config.get("settings", {}).get("java_path", "java")
     
     close_scraper = False
     if scraper is None:
-        scraper = APKMirrorScraper(headless=True)
+        scraper = ApkMirror_Downloader()
         close_scraper = True
 
     try:
         # Check for preferred file type from patches
         pref = get_app_preferences(package_name, config)
         
-        # Determine strategy order based on preference
-        # Standard: Bundle > APK
-        strategies = [
-            FilterOptions(type=PackageType.BUNDLE, arch=None),
-            FilterOptions(type=PackageType.APK, arch=None)
-        ]
-        
+        prefer_bundle = False
         if pref:
-            # APK_REQUIRED or APK -> Standalone first
             if "APK" in pref and "APKM" not in pref:
                 print(f"    [+] Source specifies standalone preference: {pref}. Prioritizing APK.")
-                strategies = [
-                    FilterOptions(type=PackageType.APK, arch=None),
-                    FilterOptions(type=PackageType.BUNDLE, arch=None)
-                ]
-            # APKM or BUNDLE -> Bundle first
+                prefer_bundle = False
             elif any(x in pref for x in ["BUNDLE", "APKM", "XAPK"]):
                 print(f"    [+] Source specifies bundle preference: {pref}. Prioritizing Bundle.")
-                strategies = [
-                    FilterOptions(type=PackageType.BUNDLE, arch=None),
-                    FilterOptions(type=PackageType.APK, arch=None)
-                ]
+                prefer_bundle = True
+        else:
+            print(f"    [~] No patch preference found. Using default architecture/bundle settings...")
+            prefer_bundle = True # Default to bundle as APKEditor can merge it cleanly
 
-        release = None
-        for opts in strategies:
-            try:
-                print(f"    [~] Trying strategy: {opts.pkg_type} (Any Arch)...")
-                release = scraper.fetch_apk(package_name, version=target_version, options=opts, org=org, repo=repo)
-                if release:
-                    print(f"    [+] Found match using strategy: {opts.pkg_type}")
-                    break
-            except Exception as e:
-                # print(f"    [!] Strategy {opts.pkg_type} failed: {e}")
-                continue
+        app_data = scraper.search(
+            package_name=package_name,
+            version=target_version,
+            only_release=True,
+            prefer_bundle=prefer_bundle
+        )
 
-        if not release:
-            raise Exception(f"Could not find {package_name} v{target_version} on APKMirror with any supported strategy")
+        if not app_data:
+            raise Exception(f"Could not find {package_name} v{target_version} on APKMirror")
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            downloaded_path = release.download(download_dir=temp_dir)
-            if not downloaded_path:
-                raise Exception("Download failed")
+            temp_file_name = f"{package_name}_{target_version}_download.tmp"
+            
+            downloaded_path = scraper.download_file(
+                target_url=app_data.download_url,
+                dest_directory=temp_dir,
+                filename=temp_file_name
+            )
+            
+            if not downloaded_path or not os.path.exists(downloaded_path):
+                raise Exception("Download failed or file not found.")
 
             # Download icon
             icon_dir = DATA_DIR / "apks" / "icons"
             icon_dir.mkdir(parents=True, exist_ok=True)
-            release.download_icon(download_dir=str(icon_dir))
-            
-            # Rename icon to pkg.id.png (scraper saves as pkg.id_icon.ext)
-            for ext in [".png", ".jpg", ".jpeg", ".svg"]:
-                icon_file = icon_dir / f"{package_name}_icon{ext}"
-                if icon_file.exists():
-                    target_icon = icon_dir / f"{package_name}.png"
-                    if target_icon.exists(): target_icon.unlink()
-                    shutil.move(icon_file, target_icon)
-                    break
+            if app_data.icon_url and app_data.icon_url != "Unknown":
+                scraper.download_file(
+                    target_url=app_data.icon_url,
+                    dest_directory=str(icon_dir),
+                    filename=f"{package_name}.png"
+                )
 
-            # Handle merge if it's a bundle file (regardless of what the page text said)
-            is_bundle_file = downloaded_path.lower().endswith((".apkm", ".xapk", ".zip"))
+            # Check if the downloaded file is a bundle by inspecting its zip contents
+            import zipfile
+            is_bundle_file = False
+            try:
+                with zipfile.ZipFile(downloaded_path, 'r') as z:
+                    if any(name.endswith('.apk') for name in z.namelist()):
+                        is_bundle_file = True
+            except:
+                pass
             
             if is_bundle_file:
-                print(f"Downloaded bundle ({os.path.basename(downloaded_path)}). Merging splits via APKEditor...")
+                print(f"Downloaded bundle. Merging splits via APKEditor...")
                 apkeditor_path = DATA_DIR / tools_config["apkeditor_jar"]
                 merge_command = [
                     java_bin,
@@ -573,11 +585,19 @@ def patch_app(app_config, tools_config, input_apk, output_apk, config):
                     p_name = p.get("name")
                     comp = p.get("compatiblePackages")
                     is_compat = False
-                    if isinstance(comp, dict) and input_package_id in comp: is_compat = True
-                    elif isinstance(comp, list) and any(cp.get("name") == input_package_id for cp in comp): is_compat = True
-                    elif not comp: is_compat = True
+                    if isinstance(comp, dict) and input_package_id in comp: 
+                        is_compat = True
+                    elif isinstance(comp, list):
+                        for cp in comp:
+                            if not isinstance(cp, dict): continue
+                            if cp.get("packageName") == input_package_id or cp.get("name") == input_package_id:
+                                is_compat = True
+                                break
+                    elif not comp: 
+                        is_compat = True
                         
-                    if is_compat: compatible_source_patches.add(p_name)
+                    if is_compat: 
+                        compatible_source_patches.add(p_name)
                 
                 found_in_this_source = remaining_patches.intersection(compatible_source_patches)
                 if found_in_this_source:
@@ -599,6 +619,7 @@ def patch_app(app_config, tools_config, input_apk, output_apk, config):
         str(cli),
         "patch",
         "--continue-on-error",
+        "--exclusive",
         str(input_apk),
         "-o",
         str(output_apk),
@@ -697,7 +718,7 @@ def get_current_version(package_id):
     return str(max(versions_found))
 
 
-def run_pipeline(package_ids=None, quiet=False):
+def run_pipeline(package_ids=None, quiet=False, scraper=None):
     config = load_config()
     was_updated = update_tools(config, quiet=quiet)
     
@@ -715,7 +736,11 @@ def run_pipeline(package_ids=None, quiet=False):
 
     patched_apps = []
     
-    scraper = APKMirrorScraper(headless=True)
+    close_scraper = False
+    if scraper is None:
+        scraper = ApkMirror_Downloader()
+        close_scraper = True
+
     try:
         for i, app in enumerate(apps_to_build):
             try:
@@ -723,43 +748,9 @@ def run_pipeline(package_ids=None, quiet=False):
                 if i > 0:
                     time.sleep(5)
                 
-                # ... rest of app processing ...
-                # ...
-                # (keep existing auto-include logic)
-                current_include = set(app.get("include_patches", []))
-                new_defaults_found = False
+                # Check for patch source updates handled in main loop
                 
-                for source in config.get("sources", []):
-                    if not source.get("active", True): continue
-                    json_path = get_source_paths(source["repo"])[".json"]
-                    if not json_path.exists(): continue
-                    try:
-                        with open(json_path, "r") as f:
-                            source_data = json.load(f)
-                            patches_list = source_data.get("patches", []) if isinstance(source_data, dict) else source_data
-                            for p in patches_list:
-                                p_name = p.get("name")
-                                if p.get("use", True) and p.get("enabled_by_default", False):
-                                    # Check package compatibility
-                                    comp = p.get("compatiblePackages")
-                                    is_compat = False
-                                    if isinstance(comp, dict) and app["id"] in comp: is_compat = True
-                                    elif isinstance(comp, list) and any(cp.get("name") == app["id"] for cp in comp): is_compat = True
-                                    elif not comp: is_compat = True
-                                    
-                                    if is_compat and p_name not in current_include:
-                                        print(f"    [+] Auto-adding new default patch: {p_name}")
-                                        app.setdefault("include_patches", []).append(p_name)
-                                        current_include.add(p_name)
-                                        new_defaults_found = True
-                    except:
-                        pass
-                
-                if new_defaults_found:
-                    from src.main import save_config
-                    save_config(config)
-
-                supported = get_supported_versions(app["id"], config, scraper=scraper, force_refresh=True)
+                supported, _, _ = get_supported_versions(app["id"], config, scraper=scraper, force_refresh=True)
                 
                 # PINNED VERSION LOGIC:
                 # ...
@@ -868,7 +859,8 @@ def run_pipeline(package_ids=None, quiet=False):
                 from src.main import save_config
                 save_config(config)
     finally:
-        scraper.close()
+        if close_scraper:
+            scraper.close()
             
     return patched_apps
 

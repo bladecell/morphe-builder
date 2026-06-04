@@ -47,6 +47,29 @@
                 newNotificationUrl: '',
                 testingNotifications: false,
 
+                patchTabs: [],
+                activePatchTab: '',
+
+                togglePatch(patch) {
+                    // Only one source other than 'Morphe Patches' can be selected at a time
+                    if (patch.selected && patch.source !== 'Morphe Patches') {
+                        const hasConflictingSource = this.availablePatches.some(p => 
+                            p.selected && 
+                            p.source !== 'Morphe Patches' && 
+                            p.source !== patch.source
+                        );
+                        
+                        if (hasConflictingSource) {
+                            // Deselect all patches from other non-Morphe sources
+                            this.availablePatches.forEach(p => {
+                                if (p.source !== 'Morphe Patches' && p.source !== patch.source) {
+                                    p.selected = false;
+                                }
+                            });
+                        }
+                    }
+                },
+
                 diagnostics: {java: true, scraper: true},
 
                 init() {
@@ -61,7 +84,10 @@
                     }, 2000);
                     setInterval(() => {
                         this.checkToolsStatus();
-                    }, 5000);
+                        if (!this.building) {
+                            this.checkUpdates();
+                        }
+                    }, 10000);
                 },
 
                 async checkUpdates() {
@@ -70,6 +96,15 @@
                         this.updates = await response.json();
                     } catch (e) {
                         console.error('Failed to check for updates', e);
+                    }
+                },
+
+                async refreshMetadata() {
+                    try {
+                        const response = await fetch('/api/ui/metadata');
+                        this.metadata = await response.json();
+                    } catch (e) {
+                        console.error('Failed to refresh metadata', e);
                     }
                 },
 
@@ -95,9 +130,16 @@
                     try {
                         const response = await fetch('/api/ui/build_status');
                         const data = await response.json();
+                        const wasBuilding = this.building;
                         this.building = data.in_progress;
                         this.buildMessage = data.message;
                         this.lastRun = data.last_run;
+
+                        if (wasBuilding && !this.building) {
+                            // Build just finished! Trigger a full state refresh.
+                            this.checkUpdates();
+                            this.refreshMetadata();
+                        }
                     } catch (e) {
                         console.error('Failed to fetch build status', e);
                     }
@@ -150,7 +192,22 @@
                     try {
                         const response = await fetch(`/api/ui/patches/${app.pkg}`);
                         const data = await response.json();
-                        this.availablePatches = data.map(p => ({...p, selected: p.enabled_by_default}));
+                        
+                        // Initialize tabs first to know what we have
+                        this.patchTabs = [...new Set(data.map(p => p.source))].sort();
+                        const thirdPartySources = this.patchTabs.filter(s => s !== 'Morphe Patches');
+                        const leadSource = thirdPartySources.length > 0 ? thirdPartySources[0] : null;
+
+                        this.availablePatches = data.map(p => {
+                            let selected = p.enabled_by_default;
+                            // POLICY: On first load, only allow defaults from Morphe AND the first third-party source
+                            if (selected && p.source !== 'Morphe Patches' && p.source !== leadSource) {
+                                selected = false;
+                            }
+                            return {...p, selected: selected};
+                        });
+                        
+                        if (this.patchTabs.length > 0) this.activePatchTab = this.patchTabs[0];
                     } catch (e) {
                         console.error('Failed to fetch patches', e);
                     } finally {
@@ -171,11 +228,18 @@
                         const response = await fetch(`/api/ui/patches/${app.id}`);
                         const data = await response.json();
                         const currentPatches = app.include_patches || [];
+                        
+                        // Initialize tabs
+                        this.patchTabs = [...new Set(data.map(p => p.source))].sort();
+
                         this.availablePatches = data.map(p => ({
-                            ...p, 
+                            ...p,
                             selected: currentPatches.includes(p.name)
                         }));
+
+                        if (this.patchTabs.length > 0) this.activePatchTab = this.patchTabs[0];
                     } catch (e) {
+
                         console.error('Failed to fetch patches', e);
                     } finally {
                         this.loadingPatches = false;
@@ -384,30 +448,62 @@
                 <div class="space-y-4">
                     <div class="flex items-center justify-between">
                         <label class="text-xs font-bold text-slate-500 uppercase tracking-widest">Available Patches</label>
-                        <span class="text-[10px] text-slate-600" x-text="`${availablePatches.filter(p => p.selected).length} Selected`"></span>
-                    </div>
+                        <div class="flex items-center gap-3">
+                            <button 
+                                @click="availablePatches.filter(p => p.source === activePatchTab).forEach(p => { p.selected = p.enabled_by_default; if(p.selected) togglePatch(p); })"
+                                class="text-[10px] font-bold text-emerald-400 hover:text-emerald-300 transition-colors uppercase tracking-tight">
+                                Recommended
+                            </button>
+                            <span class="w-px h-2 bg-slate-800"></span>
+                            <button 
+                                @click="availablePatches.filter(p => p.source === activePatchTab).forEach(p => { p.selected = true; togglePatch(p); })"
+                                class="text-[10px] font-bold text-indigo-400 hover:text-indigo-300 transition-colors uppercase tracking-tight">
+                                Select Tab
+                            </button>
+                            <span class="w-px h-2 bg-slate-800"></span>
+                            <button 
+                                @click="availablePatches.filter(p => p.source === activePatchTab).forEach(p => p.selected = false)"
+                                class="text-[10px] font-bold text-slate-500 hover:text-slate-400 transition-colors uppercase tracking-tight">
+                                Clear Tab
+                            </button>
+                            <span class="w-px h-2 bg-slate-800"></span>
+                            <span class="text-[10px] text-slate-600 font-medium" x-text="`${availablePatches.filter(p => p.selected).length} Selected`"></span>
+                        </div>
+                        </div>
 
-                    <div x-show="loadingPatches" class="py-12 flex flex-col items-center justify-center gap-4 text-slate-500">
+                        <!-- Patch Source Tabs -->
+                        <div x-show="!loadingPatches && patchTabs.length > 1" class="flex flex-wrap gap-2 mb-4">
+                        <template x-for="tab in patchTabs" :key="tab">
+                            <button 
+                                @click="activePatchTab = tab"
+                                :class="activePatchTab === tab ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/20' : 'bg-slate-950 text-slate-400 hover:text-slate-200 border border-slate-800'"
+                                class="px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-wider transition-all"
+                                x-text="tab">
+                            </button>
+                        </template>
+                        </div>
+
+                        <div x-show="loadingPatches" class="py-12 flex flex-col items-center justify-center gap-4 text-slate-500">
                         <svg class="animate-spin h-8 w-8 text-indigo-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
                         <p class="text-sm font-medium animate-pulse">Analyzing package compatibility...</p>
-                    </div>
+                        </div>
 
-                    <div x-show="!loadingPatches" class="space-y-2">
+                        <div x-show="!loadingPatches" class="space-y-2">
                         <template x-for="patch in availablePatches" :key="patch.name">
-                            <label class="flex items-start gap-4 p-4 bg-slate-950 border border-slate-800 rounded-2xl cursor-pointer hover:border-indigo-500/50 transition-all group">
-                                <input type="checkbox" x-model="patch.selected" class="mt-1 w-5 h-5 rounded border-slate-700 bg-slate-800 text-indigo-600 focus:ring-indigo-500/50">
+                            <label x-show="patch.source === activePatchTab" class="flex items-start gap-4 p-4 bg-slate-950 border border-slate-800 rounded-2xl cursor-pointer hover:border-indigo-500/50 transition-all group">
+                                <input type="checkbox" x-model="patch.selected" @change="togglePatch(patch)" class="mt-1 w-5 h-5 rounded border-slate-700 bg-slate-800 text-indigo-600 focus:ring-indigo-500/50">
                                 <div class="flex-1">
                                     <div class="flex items-center gap-2">
                                         <span class="font-bold text-slate-200 group-hover:text-indigo-400 transition-colors" x-text="patch.name"></span>
                                         <template x-if="patch.enabled_by_default">
                                             <span class="text-[8px] bg-indigo-500/10 text-indigo-400 px-1.5 py-0.5 rounded border border-indigo-500/20 uppercase font-black">Default</span>
                                         </template>
-                                        <span class="text-[8px] text-slate-600 uppercase font-bold ml-auto" x-text="patch.source"></span>
                                     </div>
                                     <p class="text-xs text-slate-500 mt-1" x-text="patch.description"></p>
                                 </div>
                             </label>
                         </template>
+
                         <template x-if="!loadingPatches && availablePatches.length === 0">
                             <p class="text-center py-8 text-slate-600 italic text-sm">No patches found for this package.</p>
                         </template>

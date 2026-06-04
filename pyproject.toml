@@ -15,4 +15,5 @@ dependencies = [
     "apprise>=1.9.2",
     "uvicorn>=0.42.0",
     "cloakbrowser>=0.3.30",
+    "selectolax>=0.4.10",
 ]

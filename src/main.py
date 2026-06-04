@@ -12,19 +12,88 @@ import time
 import apprise
 from typing import List
 from pathlib import Path
-from src.patcher import get_supported_versions, get_all_available_apps, run_pipeline, get_source_paths, update_tools, get_current_version, check_dependencies, DATA_DIR
+from src.patcher import get_supported_versions, get_all_available_apps, get_source_paths, update_tools, get_current_version, check_dependencies, DATA_DIR
 from packaging import version
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 import threading
+import asyncio
+import logging
+import queue
+
+# Silence verbose Uvicorn access logs
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
 PROJECT_ROOT = Path(__file__).parent.parent
 app = FastAPI()
-scheduler = AsyncIOScheduler()
+scheduler = BackgroundScheduler()
 
-# Global lock to prevent multiple scrapers from running concurrently
-SCRAPER_LOCK = threading.Lock()
+# Global worker to manage a persistent downloader instance
+class ScraperWorker(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True, name="ScraperWorker")
+        self.task_queue = queue.Queue()
+        self.downloader = None
+        self.error = None
+        self.initialized = threading.Event()
+
+    def run(self):
+        # Playwright Sync API requires NO event loop in the thread
+        try:
+            import asyncio
+            asyncio.set_event_loop(None)
+        except:
+            pass
+        
+        try:
+            from src.patcher import ApkMirror_Downloader
+            print("[Worker] Initializing persistent ApkMirror_Downloader...")
+            self.downloader = ApkMirror_Downloader()
+            self.initialized.set()
+        except Exception as e:
+            print(f"[Worker] Failed to initialize downloader: {e}")
+            self.error = e
+            self.initialized.set()
+            return
+
+        while True:
+            task = self.task_queue.get()
+            func, args, kwargs, result_queue = task
+            if func == "STOP":
+                if self.downloader:
+                    self.downloader.close()
+                break
+
+            try:
+                # Pass downloader as a keyword argument to keep positional args clean
+                res = func(*args, scraper=self.downloader, **kwargs)
+                if result_queue: result_queue.put((res, None))
+            except Exception as e:
+                if result_queue: result_queue.put((None, e))
+            finally:
+                self.task_queue.task_done()
+
+
+    def execute(self, func, *args, **kwargs):
+        """Dispatches a function to be run in the worker thread."""
+        if not self.initialized.is_set():
+            self.initialized.wait(timeout=30)
+        
+        if self.error:
+            raise self.error
+            
+        res_q = queue.Queue()
+        self.task_queue.put((func, args, kwargs, res_q))
+        res, err = res_q.get()
+        if err:
+            raise err
+        return res
+
+    def shutdown(self):
+        self.task_queue.put(("STOP", (), {}, None))
+
+SCRAPER_WORKER = ScraperWorker()
 SCRAPER_ACTIVE = False
 
 # Enable CORS for local development
@@ -101,9 +170,19 @@ def save_config(config_data):
         yaml.dump(config_data, file, sort_keys=False)
 
 
+# Cache for update status to prevent excessive polling load
+UPDATE_CACHE = {"timestamp": 0, "results": None}
+
 @app.get("/api/ui/updates")
 def check_updates():
     """Checks each pipeline app for updates against remote sources."""
+    global UPDATE_CACHE
+    now = time.time()
+    
+    # Return cached results if they are less than 60 seconds old
+    if UPDATE_CACHE["results"] and (now - UPDATE_CACHE["timestamp"] < 60):
+        return UPDATE_CACHE["results"]
+
     config = load_config()
     update_status = {}
     
@@ -121,9 +200,13 @@ def check_updates():
         # Pinned version check
         pinned_version = app_info.get("version")
         if pinned_version:
-            remote_versions = [pinned_version]
+            # Skip APKMirror completely if pinned. 
+            # get_supported_versions will return the pinned version via JSON check
+            remote_versions, _, _ = get_supported_versions(package_id, config, quiet=True)
         else:
-            remote_versions = get_supported_versions(package_id, config)
+            # For unpinned apps, use the worker to find the newest from APKMirror
+            # We use quiet=True here to avoid log spam from polling
+            remote_versions, _, _ = SCRAPER_WORKER.execute(get_supported_versions, package_id, config, quiet=True)
         
         # Check if file exists (glob for versioned name or legacy)
         file_exists = False
@@ -133,7 +216,6 @@ def check_updates():
         icon_exists = (icons_dir / f"{package_id}.png").exists()
 
         # The 'latest' for update purposes is the first item in the list 
-        # (which is the Latest Recommended, or Latest Experimental if no recommended exist)
         latest_remote_app_str = remote_versions[0] if remote_versions else "Unknown"
         
         # Use config for current state
@@ -178,9 +260,9 @@ def check_updates():
             "status": app_info.get("status", "Unknown"),
             "error": app_info.get("error")
         }
-            
-    return update_status
 
+    UPDATE_CACHE = {"timestamp": now, "results": update_status}
+    return update_status
 
 # --- WEB UI ROUTES ---
 
@@ -202,9 +284,9 @@ async def web_ui(request: Request):
 
     # This dictionary MUST match the variables used in your index.html
     return templates.TemplateResponse(
-        "index.html",
-        {
-            "request": request, 
+        request=request,
+        name="index.html",
+        context={
             "config": config, 
             "available_apps": available_apps,
             "metadata": metadata
@@ -238,12 +320,19 @@ def get_patches_for_app(package_id: str):
             if isinstance(compat_pkgs, dict) and package_id in compat_pkgs:
                 use = True
             elif isinstance(compat_pkgs, list):
-                if any(pkg.get("name") == package_id for pkg in compat_pkgs):
-                    use = True
+                for pkg in compat_pkgs:
+                    if not isinstance(pkg, dict): continue
+                    # ReVanced schema uses packageName, others use name
+                    if pkg.get("packageName") == package_id or pkg.get("name") == package_id:
+                        use = True
+                        break
             elif not compat_pkgs:
                 use = True
 
             if use:
+                # Determine if it's enabled by default (check various schema fields)
+                is_default = patch.get("default", patch.get("enabled_by_default", patch.get("use", True)))
+                
                 # Avoid duplicates from different sources
                 if not any(p["name"] == patch.get("name") for p in compatible_patches):
                     compatible_patches.append(
@@ -252,7 +341,7 @@ def get_patches_for_app(package_id: str):
                             "description": patch.get(
                                 "description", "No description available."
                             ),
-                            "enabled_by_default": patch.get("use", True),
+                            "enabled_by_default": is_default,
                             "source": source["name"]
                         }
                     )
@@ -316,25 +405,25 @@ def refresh_versions_task():
     """Background task to refresh the version cache for all apps in the pipeline."""
     global SCRAPER_ACTIVE
     if SCRAPER_ACTIVE:
-        print("[Cron] Scraper already active, skipping version refresh...")
+        print("[Cron] Scraper busy, skipping refresh...")
         return
 
-    with SCRAPER_LOCK:
-        SCRAPER_ACTIVE = True
+    def _do_refresh(scraper):
         config = load_config()
-        from src.patcher import APKMirrorScraper, get_supported_versions
-        scraper = APKMirrorScraper(headless=True)
         print("[Cron] Refreshing remote version cache...")
-        try:
-            for app in config.get("apps", []):
-                # Add a small delay between apps to avoid bot detection
+        for app in config.get("apps", []):
+            # Only refresh unpinned apps from APKMirror
+            if not app.get("version"):
                 time.sleep(2)
                 get_supported_versions(app["id"], config, scraper=scraper, force_refresh=True)
-        except Exception as e:
-            print(f"[Cron] Version refresh failed: {e}")
-        finally:
-            scraper.close()
-            SCRAPER_ACTIVE = False
+
+    try:
+        SCRAPER_ACTIVE = True
+        SCRAPER_WORKER.execute(_do_refresh)
+    except Exception as e:
+        print(f"[Cron] Version refresh failed: {e}")
+    finally:
+        SCRAPER_ACTIVE = False
 
 
 @app.post("/api/ui/add_source")
@@ -463,6 +552,19 @@ def check_source_updates():
     return results
 
 
+@app.get("/api/ui/metadata")
+def get_ui_metadata():
+    """Returns the latest application metadata (names, versions, icons)."""
+    metadata_file = DATA_DIR / "bin" / "metadata.json"
+    if metadata_file.exists():
+        with open(metadata_file, "r") as f:
+            try:
+                return json.load(f)
+            except:
+                return {}
+    return {}
+
+
 @app.get("/api/ui/discovery")
 def refresh_discovery(background_tasks: BackgroundTasks, sync: bool = False):
     config = load_config()
@@ -540,7 +642,6 @@ class TriggerBuildPayload(BaseModel):
 def build_task(package_ids=None, is_cron=False):
     global BUILD_STATUS, SCRAPER_ACTIVE
     
-    # Safety: Prevent scheduled builds from triggering multiple times in the same minute
     current_time_str = time.strftime("%Y-%m-%d %H:%M")
     if is_cron and BUILD_STATUS.get("last_run_minute") == current_time_str:
         return
@@ -549,72 +650,68 @@ def build_task(package_ids=None, is_cron=False):
         print("[Cron] Build already in progress, skipping...")
         return
 
-    with SCRAPER_LOCK:
-        SCRAPER_ACTIVE = True
+    def _do_build(scraper):
+        global SCRAPER_ACTIVE
         BUILD_STATUS["in_progress"] = True
         BUILD_STATUS["message"] = "Starting..."
         if is_cron:
             BUILD_STATUS["last_run_minute"] = current_time_str
 
-        # Ensure log directory exists
         LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-
         with open(LOG_PATH, "w", buffering=1, encoding="utf-8", newline="") as log_file:
             old_stdout = sys.stdout
             sys.stdout = Tee(sys.stdout, log_file)
             try:
-                # Pass quiet=True if it's a cron build
-                patched_ids = run_pipeline(package_ids, quiet=is_cron)
+                from src.patcher import run_pipeline
+                # Pass the persistent scraper to the pipeline
+                patched_ids = run_pipeline(package_ids, quiet=is_cron, scraper=scraper)
                 BUILD_STATUS["message"] = "Finished"
                 BUILD_STATUS["last_run"] = time.strftime("%H:%M:%S")
                 
-                # ... notification logic ...
                 config = load_config()
                 all_apps = {a["id"]: a["name"] for a in config.get("apps", [])}
-                requested_ids = package_ids if package_ids else [a["id"] for a in config.get("apps", [])]
                 
-                if not patched_ids:
-                    if not is_cron: # Manual build
-                        send_notification(
-                            "Build Finished", 
-                            "The build process completed, but no apps required patching or all failed. Check logs for details."
-                        )
-                else:
+                if patched_ids:
                     patched_names = [all_apps.get(pid, pid) for pid in patched_ids]
-                    names_str = ", ".join(patched_names)
-                    
-                    if len(patched_ids) < len(requested_ids) and not is_cron:
-                        send_notification(
-                            "Build Finished with Warnings", 
-                            f"Some apps failed to patch. Successfully patched: {names_str}. Check logs for details."
-                        )
-                    else:
-                        send_notification(
-                            "Apps Patched Successfully", 
-                            f"The following apps were updated/patched: {names_str}"
-                        )
+                    send_notification("Apps Patched Successfully", f"Updated: {', '.join(patched_names)}")
+                elif not is_cron:
+                    send_notification("Build Finished", "No updates or build failed.")
             except Exception as e:
-                error_msg = str(e)
-                print(f"\n[FATAL ERROR] {error_msg}")
-                BUILD_STATUS["message"] = f"Failed: {error_msg}"
-                send_notification(
-                    "Build Failed", 
-                    f"The pipeline build failed: {error_msg}"
-                )
+                print(f"\n[FATAL ERROR] {e}")
+                BUILD_STATUS["message"] = f"Failed: {e}"
+                send_notification("Build Failed", f"Pipeline error: {e}")
             finally:
                 sys.stdout = old_stdout
-                BUILD_STATUS["in_progress"] = False
-                SCRAPER_ACTIVE = False
+                # Invalidate update cache when build finishes
+                global UPDATE_CACHE
+                UPDATE_CACHE["timestamp"] = 0
+
+    try:
+        SCRAPER_ACTIVE = True
+        SCRAPER_WORKER.execute(_do_build)
+    except Exception as e:
+        print(f"[Cron] Build task wrapper failed: {e}")
+    finally:
+        BUILD_STATUS["in_progress"] = False
+        SCRAPER_ACTIVE = False
 
 
 @app.post("/api/ui/trigger_build")
-def trigger_build(payload: TriggerBuildPayload, background_tasks: BackgroundTasks):
+def trigger_build(payload: TriggerBuildPayload):
     if BUILD_STATUS["in_progress"]:
         return {"status": "Build already in progress"}
 
+    # Invalidate cache to ensure UI shows correct status after trigger
+    global UPDATE_CACHE
+    UPDATE_CACHE["timestamp"] = 0
+
     # Use an empty list if None is sent to signify "Build All" but manual
     pkg_ids = payload.package_ids if payload.package_ids is not None else []
-    background_tasks.add_task(build_task, package_ids=pkg_ids, is_cron=False)
+    
+    # Use scheduler instead of BackgroundTasks to ensure it runs in a clean thread
+    # for Playwright compatibility.
+    scheduler.add_job(build_task, id=f"manual_build_{int(time.time())}", kwargs={"package_ids": pkg_ids, "is_cron": False})
+    
     return {"status": "Build started"}
 
 
@@ -716,9 +813,9 @@ async def view_app(package_id: str, request: Request):
     download_url = f"{base_url}/download/{filename}"
         
     return templates.TemplateResponse(
-        "obtainium.html",
-        {
-            "request": request,
+        request=request,
+        name="obtainium.html",
+        context={
             "app": app_info,
             "version": current_version,
             "patch_version": patch_version_str,
@@ -826,6 +923,9 @@ async def startup_event():
     setup_cron_job(config)
     DIAGNOSTICS = check_dependencies(config)
     
+    # Start the persistent scraper worker
+    SCRAPER_WORKER.start()
+    
     cli_jar = DATA_DIR / config["tools"]["cli_jar"]
     apkeditor_jar = DATA_DIR / config["tools"]["apkeditor_jar"]
     if not cli_jar.exists() or not apkeditor_jar.exists():
@@ -835,3 +935,9 @@ async def startup_event():
     scheduler.start()
     # Trigger an immediate refresh of versions in the background
     scheduler.add_job(refresh_versions_task, id="initial_version_refresh")
+
+
+@app.on_event("shutdown")
+def shutdown_event():
+    print("[Shutdown] Stopping scheduler...")
+    scheduler.shutdown()
