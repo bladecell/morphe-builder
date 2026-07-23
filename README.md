@@ -14,8 +14,8 @@ Morphe Builder is an automated Android application patcher with a Web UI and Obt
 
 - **Docker:** (Recommended) No other dependencies are required.
 - **Manual Installation:**
-  - Python 3.12+
-  - Java 17+ (required for [Morphe CLI](https://github.com/MorpheApp/morphe-cli) and APKEditor)
+  - Python 3.14+
+  - Java 21+ (required for [Morphe CLI](https://github.com/MorpheApp/morphe-cli) and APKEditor)
 
 ## Getting Started
 
