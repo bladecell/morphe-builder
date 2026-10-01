@@ -35,11 +35,11 @@ Decided 2026-10-01: retrofit first, then continue with step 2 under the same rul
 All work from here on follows the project Python rules, with pytest tests.
 
 - [ ] Keep the inline sync so the patch list exists before the page re-renders
-- [ ] Normalise and validate the repo input (`github.com/...`, `.git`, casing, extra path)
-- [ ] Show add-source errors in the UI instead of ignoring the response
-- [ ] Stay on the Discovery tab after adding a source
-- [ ] Show real app names in Discovery instead of package IDs (`src/patcher.py:952`)
-- [ ] Make "Sync Sources" bypass the 6-hour throttle
+- [x] Normalise and validate the repo input (`github.com/...`, `.git`, casing, extra path)
+- [x] Show add-source errors in the UI instead of ignoring the response
+- [x] Stay on the Discovery tab after adding a source
+- [x] Show real app names in Discovery instead of package IDs (`src/patcher.py:952`)
+- [x] Make "Sync Sources" bypass the 6-hour throttle
 - [ ] Remove or fix the "no releases" fallback that downloads only the JSON
 - [ ] Surface GitHub rate-limit failures
 

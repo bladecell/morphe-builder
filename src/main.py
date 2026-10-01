@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, BackgroundTasks, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, UploadFile, File, Form
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -16,6 +16,7 @@ from src.patcher import (
     get_supported_versions,
     get_all_available_apps,
     get_source_paths,
+    normalize_repo,
     update_tools,
     get_current_version,
     check_dependencies,
@@ -416,11 +417,11 @@ class AddSourcePayload(BaseModel):
     repo: str
 
 
-def update_tools_task(config):
+def update_tools_task(config, force=False):
     global TOOLS_UPDATING
     TOOLS_UPDATING = True
     try:
-        update_tools(config, quiet=True)
+        update_tools(config, quiet=True, force=force)
     finally:
         TOOLS_UPDATING = False
 
@@ -451,45 +452,33 @@ def refresh_versions_task():
 
 
 @app.post("/api/ui/add_source")
-def add_source(payload: AddSourcePayload, background_tasks: BackgroundTasks):
+def add_source(payload: AddSourcePayload):
+    repo = normalize_repo(payload.repo)
+    if not repo:
+        raise HTTPException(400, "Invalid repository. Use 'owner/repo' or a GitHub URL.")
+
     config = load_config()
     sources = config.get("sources", [])
+    if any(s["repo"].lower() == repo.lower() for s in sources):
+        raise HTTPException(400, f"Source {repo} already exists.")
 
-    # Sanitize repo: strip https://github.com/ if present
-    repo = payload.repo.replace("https://github.com/", "").strip("/")
+    # Sync before saving so a broken repo never ends up half-added, and the
+    # patches .json exists before the frontend re-renders the app list.
+    if not check_and_download_release(repo, get_source_paths(repo), force=True):
+        raise HTTPException(
+            502, f"Could not download patches from {repo}. Check the repo name and its releases."
+        )
 
-    if any(s["repo"] == repo for s in sources):
-        return {"status": "Source already exists"}
-
-    # Format name as 'User Patches'
-    parts = repo.split("/")
-    if len(parts) < 2:
-        return {"status": "Invalid repository format"}
-
-    user = parts[0]
-    name = f"{user} Patches"
-
+    name = f"{repo.split('/')[0]} Patches"
     sources.append({
         "name": name,
         "repo": repo,
-        "active": True
+        "active": True,
+        "version": load_local_versions().get(repo),
     })
+    config["sources"] = sources
     save_config(config)
-
-    # Sync this single source synchronously so the patches .json exists
-    # before the frontend re-renders the app list (no more silent race).
-    synced = check_and_download_release(repo, get_source_paths(repo), force=True)
-    local_versions = load_local_versions()
-    if synced and local_versions.get(repo):
-        for s in config.get("sources", []):
-            if s["repo"] == repo:
-                s["version"] = local_versions[repo]
-        save_config(config)
-    return {
-        "status": "success" if synced else "source_added_sync_failed",
-        "name": name,
-        "synced": synced,
-    }
+    return {"status": "success", "name": name}
 
 
 @app.post("/api/ui/toggle_source")
@@ -606,7 +595,7 @@ def get_ui_metadata():
 def refresh_discovery(background_tasks: BackgroundTasks, sync: bool = False):
     config = load_config()
     if sync:
-        background_tasks.add_task(update_tools_task, config)
+        background_tasks.add_task(update_tools_task, config, True)
     return {"apps": get_all_available_apps(config)}
 
 

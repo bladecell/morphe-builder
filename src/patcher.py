@@ -1,4 +1,5 @@
 import requests
+import re
 import yaml
 import subprocess
 import os
@@ -193,6 +194,23 @@ def check_and_download_release(repo_path, extensions_to_paths, force=False):
     return False
 
 
+REPO_PATTERN = re.compile(r"^[\w.-]+/[\w.-]+$")
+
+
+def normalize_repo(raw):
+    """Reduces a pasted GitHub reference to 'owner/repo', or None if invalid.
+
+    Accepts URLs (with or without scheme/www), a trailing '.git' and extra
+    path segments such as '/tree/main' or '/releases'.
+    """
+    text = re.sub(r"^(https?://)?(www\.)?github\.com/", "", raw.strip(), flags=re.I)
+    parts = [part for part in text.split("/") if part]
+    if len(parts) < 2:
+        return None
+    repo = "/".join(parts[:2]).removesuffix(".git")
+    return repo if REPO_PATTERN.match(repo) else None
+
+
 def get_source_paths(repo_path):
     """Generates consistent local paths for a source's MPP and JSON files."""
     safe_name = repo_path.replace("/", "-").lower()
@@ -222,7 +240,7 @@ def check_dependencies(config):
     return results
 
 
-def update_tools(config, quiet=False):
+def update_tools(config, quiet=False, force=False):
     if not quiet:
         print("--- Checking for Tool Updates ---")
     bin_dir = DATA_DIR / "bin"
@@ -233,13 +251,15 @@ def update_tools(config, quiet=False):
     
     any_updated = False
 
-    if check_and_download_release(repos["cli"], {".jar": DATA_DIR / tools["cli_jar"]}):
+    if check_and_download_release(
+        repos["cli"], {".jar": DATA_DIR / tools["cli_jar"]}, force=force
+    ):
         any_updated = True
 
     # Download APKEditor
     if "apkeditor" in repos and "apkeditor_jar" in tools:
         if check_and_download_release(
-            repos["apkeditor"], {".jar": DATA_DIR / tools["apkeditor_jar"]}
+            repos["apkeditor"], {".jar": DATA_DIR / tools["apkeditor_jar"]}, force=force
         ):
             any_updated = True
 
@@ -248,7 +268,9 @@ def update_tools(config, quiet=False):
         if source.get("active", True):
             if not quiet:
                 print(f"Checking for updates for source: {source['name']} ({source['repo']})...")
-            if check_and_download_release(source["repo"], get_source_paths(source["repo"])):
+            if check_and_download_release(
+                source["repo"], get_source_paths(source["repo"]), force=force
+            ):
                 any_updated = True
 
     # SYNC VERSIONS BACK TO CONFIG
@@ -959,6 +981,7 @@ def get_all_available_apps(config):
                 continue
 
             pkgs_to_add = []
+            entry_names = {}
             if isinstance(compat_pkgs, dict):
                 pkgs_to_add = list(compat_pkgs.keys())
             elif isinstance(compat_pkgs, list):
@@ -967,12 +990,16 @@ def get_all_available_apps(config):
                     if not isinstance(pkg, dict): continue
                     # Prioritize packageName (ReVanced style), then name
                     p_id = pkg.get("packageName") or pkg.get("name")
-                    if p_id: pkgs_to_add.append(p_id)
+                    if p_id:
+                        pkgs_to_add.append(p_id)
+                        # With a packageName present, 'name' is the display name
+                        if pkg.get("packageName") and pkg.get("name"):
+                            entry_names[str(p_id)] = pkg["name"]
 
             for pkg_id in pkgs_to_add:
                 if not pkg_id: continue
                 pkg_id = str(pkg_id)
-                translated_name = app_names_map.get(pkg_id)
+                translated_name = entry_names.get(pkg_id) or app_names_map.get(pkg_id)
                 # If we don't have a name yet, or we found a translated one, set it
                 if pkg_id not in apps_data or translated_name:
                     apps_data[pkg_id] = translated_name or pkg_id

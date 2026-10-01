@@ -73,6 +73,13 @@
                 diagnostics: {java: true, scraper: true},
 
                 init() {
+                    try {
+                        const savedTab = sessionStorage.getItem('activeTab');
+                        if (savedTab) {
+                            this.activeTab = savedTab;
+                            sessionStorage.removeItem('activeTab');
+                        }
+                    } catch (e) {}
                     this.checkBuildStatus();
                     this.checkToolsStatus();
                     this.checkUpdates();
@@ -296,10 +303,16 @@
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({ repo })
                         });
-                        const data = await res.json();
+                        if (!res.ok) {
+                            const data = await res.json();
+                            alert(data.detail || 'Failed to add source');
+                            return;
+                        }
+                        try { sessionStorage.setItem('activeTab', 'discovery'); } catch (e) {}
                         location.reload();
                     } catch (e) {
                         console.error('Failed to add source', e);
+                        alert('Failed to add source');
                     }
                 },
 

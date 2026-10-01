@@ -84,3 +84,9 @@ scripts against live APKMirror.
 Scraper resilience first, then the add-source flow, then config safety, then the
 remaining bugs. The first two are the reported problems; config safety comes before
 the rest because builds overwriting UI changes can undo any other fix.
+
+## 2026-10-02: add_source syncs before saving
+
+A source is only written to `config.yaml` after its first sync succeeds. A bad repo returns
+HTTP 400/502 and leaves no half-added entry. Repo input is reduced to `owner/repo` by
+`normalize_repo`, and duplicates compare case-insensitively.

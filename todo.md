@@ -5,8 +5,8 @@ Current working checklist. The full list lives in `plan.md`.
 ## State
 
 - Scraper resilience changes are done and tested against live APKMirror.
-- Everything is uncommitted: `src/apkmirror_downloader.py`, `src/patcher.py`,
-  plus the earlier hot-patches in `src/main.py` and `src/patcher.py`.
+- Add-source flow items are done and covered by `tests/test_sources.py` (uncommitted UI
+  behaviour not yet checked in a browser).
 - Not yet tested: a full build (download + patch) and anything inside Docker.
 
 ## Next up: retrofit scraper changes to the Python rules (plan step 1a)
@@ -19,11 +19,11 @@ Current working checklist. The full list lives in `plan.md`.
 
 ## Then: add-source flow
 
-- [ ] Normalise and validate the repo input in `add_source` (`src/main.py:454`)
-- [ ] Return a clear error and show it in the UI (`index.html:289`)
-- [ ] Stay on the Discovery tab after adding a source
-- [ ] Use the `name` field from the patch JSON for app names (`src/patcher.py:952`)
-- [ ] Make "Sync Sources" force a check despite the 6-hour throttle
+- [x] Normalise and validate the repo input in `add_source` (`src/main.py:454`)
+- [x] Return a clear error and show it in the UI (`index.html:289`)
+- [x] Stay on the Discovery tab after adding a source
+- [x] Use the `name` field from the patch JSON for app names (`src/patcher.py:952`)
+- [x] Make "Sync Sources" force a check despite the 6-hour throttle
 - [ ] Decide what to do with the JSON-only "no releases" fallback
 
 ## Waiting on a decision
