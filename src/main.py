@@ -464,9 +464,18 @@ def add_source(payload: AddSourcePayload):
 
     # Sync before saving so a broken repo never ends up half-added, and the
     # patches .json exists before the frontend re-renders the app list.
-    if not check_and_download_release(repo, get_source_paths(repo), force=True):
+    # Success is judged by the files on disk: the sync returns False both on
+    # failure and when already up to date.
+    paths = get_source_paths(repo)
+    check_and_download_release(repo, paths, force=True)
+    if not paths[".json"].exists():
         raise HTTPException(
-            502, f"Could not download patches from {repo}. Check the repo name and its releases."
+            502,
+            f"{repo} is missing the patches JSON (patches-list.json or patches.json).",
+        )
+    if not paths[".mpp"].exists():
+        raise HTTPException(
+            502, f"{repo} has no .mpp patch bundle in its latest release (or no releases)."
         )
 
     name = f"{repo.split('/')[0]} Patches"

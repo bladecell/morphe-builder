@@ -24,7 +24,7 @@ Current working checklist. The full list lives in `plan.md`.
 - [x] Stay on the Discovery tab after adding a source
 - [x] Use the `name` field from the patch JSON for app names (`src/patcher.py:952`)
 - [x] Make "Sync Sources" force a check despite the 6-hour throttle
-- [ ] Decide what to do with the JSON-only "no releases" fallback
+- [x] "No releases" fallback: kept; add_source now reports the missing .mpp or JSON
 
 ## Waiting on a decision
 

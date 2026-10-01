@@ -47,25 +47,51 @@ def test_add_source_duplicate_is_case_insensitive(config_store):
     assert exc.value.status_code == 400
 
 
-def test_add_source_sync_failure_does_not_save(config_store, monkeypatch):
+@pytest.fixture
+def source_files(tmp_path, monkeypatch):
+    paths = {".mpp": tmp_path / "p.mpp", ".json": tmp_path / "p.json"}
+    monkeypatch.setattr(main, "get_source_paths", lambda repo: paths)
+    return paths
+
+
+@pytest.mark.parametrize(
+    "present, expected",
+    [([], "patches JSON"), ([".mpp"], "patches JSON"), ([".json"], ".mpp patch bundle")],
+)
+def test_add_source_reports_missing_file(config_store, source_files, monkeypatch, present, expected):
+    for ext in present:
+        source_files[ext].write_text("x")
     monkeypatch.setattr(main, "check_and_download_release", lambda *a, **k: False)
     with pytest.raises(HTTPException) as exc:
         main.add_source(main.AddSourcePayload(repo="new/repo"))
     assert exc.value.status_code == 502
+    assert expected in exc.value.detail
     assert len(config_store["sources"]) == 1
 
 
-def test_add_source_success_forces_sync(config_store, monkeypatch):
+def test_add_source_success_forces_sync(config_store, source_files, monkeypatch):
     calls = []
-    monkeypatch.setattr(
-        main, "check_and_download_release", lambda *a, **k: calls.append(k) or True
-    )
+
+    def fake_sync(repo, paths, force=False):
+        calls.append(force)
+        for path in paths.values():
+            path.write_text("x")
+        return True
+
+    monkeypatch.setattr(main, "check_and_download_release", fake_sync)
     result = main.add_source(main.AddSourcePayload(repo="github.com/new/repo.git"))
     assert result["status"] == "success"
-    assert calls == [{"force": True}]
+    assert calls == [True]
     assert config_store["sources"][-1] == {
         "name": "new Patches", "repo": "new/repo", "active": True, "version": "v1",
     }
+
+
+def test_add_source_already_synced_files_succeed(config_store, source_files, monkeypatch):
+    for path in source_files.values():
+        path.write_text("x")
+    monkeypatch.setattr(main, "check_and_download_release", lambda *a, **k: False)
+    assert main.add_source(main.AddSourcePayload(repo="new/repo"))["status"] == "success"
 
 
 def test_discovery_uses_display_names(tmp_path, monkeypatch):
