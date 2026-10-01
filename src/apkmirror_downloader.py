@@ -16,6 +16,22 @@ logging.basicConfig(
 logger = logging.getLogger("ApkMirrorDownloader")
 
 
+class _StdoutHandler(logging.Handler):
+    """Prints to the current sys.stdout, so scraper logs show up in the
+    build console (which swaps sys.stdout during a build)."""
+
+    def emit(self, record):
+        print(self.format(record))
+
+
+_stdout_handler = _StdoutHandler()
+_stdout_handler.setFormatter(
+    logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
+)
+logger.addHandler(_stdout_handler)
+logger.propagate = False
+
+
 class Arch(str, Enum):
     UNIVERSAL = "universal"
     ARM64_V8A = "arm64-v8a"
@@ -66,9 +82,29 @@ class ApkMirror_Downloader:
     BASE_NETLOC = "www.apkmirror.com"
 
     def __init__(self):
+        self._launch()
+
+    def _launch(self):
         logger.info("Initializing cloakbrowser context session...")
         self.browser = launch()
         self.page = self.browser.new_page()
+
+    def _goto(self, url):
+        """Navigates to url. If the page or the browser has died, relaunches
+        the browser and retries once."""
+        try:
+            self.page.goto(url, wait_until="domcontentloaded")
+        except Exception as e:
+            message = str(e).lower()
+            if "crash" not in message and "closed" not in message:
+                raise
+            logger.warning(f"Browser died during navigation ({e}). Relaunching and retrying once...")
+            try:
+                self.browser.close()
+            except Exception:
+                pass  # browser may already be dead
+            self._launch()
+            self.page.goto(url, wait_until="domcontentloaded")
 
     def _build_search_url(
         self, package_name, version=None, archs=None, dpis=None, bundles=None
@@ -113,7 +149,11 @@ class ApkMirror_Downloader:
     ) -> AppMetadata | None:
         url = self._build_search_url(package_name, version)
         logger.info(f"Navigating to search results endpoint for '{package_name}'...")
-        self.page.goto(url)
+        try:
+            self._goto(url)
+        except Exception as e:
+            logger.error(f"Navigation to search page failed: {e}")
+            return None
 
         try:
             self.page.wait_for_selector(
@@ -131,17 +171,19 @@ class ApkMirror_Downloader:
             logger.info(
                 "Multiple results found. Extracting matching release row target..."
             )
-            master_release_url = self._extract_first_valid_row(
-                parser, version, only_release
-            )
-            if not master_release_url:
+            master_row = self._extract_first_valid_row(parser, version, only_release)
+            if not master_row:
                 logger.warning(
                     "No matching release rows survived filtering parameter constraints."
                 )
                 return None
 
+            master_release_url = urljoin(
+                self.BASE_URL,
+                master_row.css_first("a.fontBlack").attributes.get("href", ""),
+            )
             logger.info(f"Navigating to release page: {master_release_url}")
-            self.page.goto(master_release_url)
+            self._goto(master_release_url)
 
             # Wait for whatever layout loads next (could be a variant table OR direct final download link)
             try:
@@ -171,7 +213,7 @@ class ApkMirror_Downloader:
             logger.info(
                 f"Navigating to isolated variant details page: {variant_page_url}"
             )
-            self.page.goto(variant_page_url)
+            self._goto(variant_page_url)
             try:
                 self.page.wait_for_selector(".downloadButton", timeout=15000)
             except Exception:
@@ -189,9 +231,32 @@ class ApkMirror_Downloader:
         )
         return self._extract_final_metadata(parser)
 
-    def _extract_first_valid_row(
-        self, parser, target_version, only_release
-    ) -> str | None:
+    def latest_version(self, package_name, only_release=True) -> str | None:
+        """Returns the newest version listed on the search results page,
+        without visiting the release and variant pages."""
+        logger.info(f"Looking up newest version for '{package_name}'...")
+        self._goto(self._build_search_url(package_name))
+        self.page.wait_for_selector(".appRow", timeout=15000)
+
+        row = self._extract_first_valid_row(
+            HTMLParser(self.page.content()), None, only_release
+        )
+        if not row:
+            logger.warning("No matching release rows found in search results.")
+            return None
+
+        # Each result row is followed by an .infoSlide holding its details
+        info = row.next
+        while info is not None and info.tag.startswith("-"):
+            info = info.next
+        if info is None:
+            return None
+        for name in info.css(".infoSlide-name"):
+            if name.text(strip=True) == "Version:":
+                return name.parent.css_first(".infoSlide-value").text(strip=True)
+        return None
+
+    def _extract_first_valid_row(self, parser, target_version, only_release):
         app_rows = parser.css(".appRow")
         for row in app_rows:
             title_element = row.css_first("a.fontBlack")
@@ -207,8 +272,7 @@ class ApkMirror_Downloader:
             if target_version and target_version.lower() not in title_text:
                 continue
 
-            relative_url = title_element.attributes.get("href", "")
-            return urljoin(self.BASE_URL, relative_url)
+            return row
 
         return None
 
@@ -336,7 +400,7 @@ class ApkMirror_Downloader:
             "Navigating to intermediate redirect page to capture explicit token..."
         )
         try:
-            self.page.goto(target_url)
+            self._goto(target_url)
 
             try:
                 self.page.wait_for_selector("#download-link", timeout=10000)
@@ -370,7 +434,7 @@ class ApkMirror_Downloader:
 
             with self.page.expect_download(timeout=60000) as download_info:
                 try:
-                    self.page.goto(absolute_file_url)
+                    self.page.goto(absolute_file_url, wait_until="domcontentloaded")
                 except Exception as e:
                     if "Download is starting" in str(e):
                         logger.debug(

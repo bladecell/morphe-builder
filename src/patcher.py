@@ -46,9 +46,18 @@ def save_version_cache(cache):
         json.dump(cache, f, indent=4)
 
 
+def _safe_version_sort_key(v):
+    """Sort key that never throws on malformed version strings."""
+    try:
+        return (1, version.parse(v), "")
+    except Exception:
+        return (0, version.parse("0"), str(v))
+
+
 def download_with_progress(url, path):
     """Downloads a file with a text-based progress bar printed to stdout."""
-    response = requests.get(url, stream=True)
+    response = requests.get(url, stream=True, timeout=30)
+    response.raise_for_status()
     total_size = int(response.headers.get("content-length", 0))
     block_size = 1024 * 64  # 64KB
 
@@ -74,7 +83,28 @@ def download_with_progress(url, path):
     sys.stdout.flush()
 
 
-def check_and_download_release(repo_path, extensions_to_paths):
+# How often (seconds) each repo may hit the GitHub API for update checks.
+# Prevents every build from burning the unauthenticated 60 req/hour limit.
+UPDATE_CHECK_INTERVAL = 6 * 3600
+
+# Candidate JSON filenames shipped by patch sources (Morphe vs ReVanced style).
+JSON_FILENAME_CANDIDATES = ["patches-list.json", "patches.json"]
+
+
+def _try_download_json_candidates(repo_path, ref, output_path):
+    """Tries candidate JSON filenames from a repo ref via raw.githubusercontent.
+    Returns True on the first success."""
+    for filename in JSON_FILENAME_CANDIDATES:
+        raw_url = f"https://raw.githubusercontent.com/{repo_path}/{ref}/{filename}"
+        try:
+            download_with_progress(raw_url, output_path)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def check_and_download_release(repo_path, extensions_to_paths, force=False):
     api_url = f"https://api.github.com/repos/{repo_path}/releases/latest"
     local_versions = load_local_versions()
     current_tag = local_versions.get(repo_path)
@@ -82,50 +112,85 @@ def check_and_download_release(repo_path, extensions_to_paths):
     # Safeguard: Check if any required files are missing locally
     missing_files = [path for path in extensions_to_paths.values() if not path.exists()]
 
+    # Throttle: skip the API call entirely if we checked recently and have files
+    last_check = local_versions.get(f"{repo_path}#last_check")
+    if (
+        not force
+        and not missing_files
+        and last_check
+        and (time.time() - last_check) < UPDATE_CHECK_INTERVAL
+    ):
+        return False
+
+    release_data = None
     try:
-        response = requests.get(api_url)
+        response = requests.get(api_url, timeout=30)
+        if response.status_code == 404:
+            # Repo has no releases: fall back to default-branch raw files for .json
+            print(f"[!] {repo_path} has no releases. Falling back to default branch...")
+            if ".json" in extensions_to_paths:
+                for branch in ("main", "master"):
+                    if _try_download_json_candidates(
+                        repo_path, branch, extensions_to_paths[".json"]
+                    ):
+                        local_versions[repo_path] = "default-branch"
+                        local_versions[f"{repo_path}#last_check"] = time.time()
+                        save_local_versions(local_versions)
+                        return True
+            return False
         response.raise_for_status()
         release_data = response.json()
-        latest_tag = release_data.get("tag_name")
-
-        if current_tag == latest_tag and not missing_files:
-            print(f"[\u2713] {repo_path} is up to date ({current_tag}).")
-            return False
-
-        if current_tag != latest_tag:
-            print(f"[!] Update found for {repo_path}: {current_tag} -> {latest_tag}")
-        else:
-            print(f"[!] Missing local files for {repo_path}. Re-downloading...")
-
-        for ext, output_path in extensions_to_paths.items():
-            found = False
-            for asset in release_data.get("assets", []):
-                if asset["name"].endswith(ext):
-                    asset_url = asset["browser_download_url"]
-                    print(f"    -> Downloading {asset['name']}...")
-                    download_with_progress(asset_url, output_path)
-                    found = True
-                    break
-
-            # Fallback for Morphe patches-list.json (not included in release assets)
-            if not found and ext == ".json":
-                print(
-                    f"    -> JSON asset not found. Fetching patches-list.json from source ({latest_tag})..."
-                )
-                raw_url = f"https://raw.githubusercontent.com/{repo_path}/{latest_tag}/patches-list.json"
-                try:
-                    download_with_progress(raw_url, output_path)
-                    found = True
-                except:
-                    print(f"    [!] Failed to download JSON from {raw_url}")
-
-        local_versions[repo_path] = latest_tag
-        save_local_versions(local_versions)
-        return True
-
     except requests.exceptions.RequestException as e:
         print(f"[x] Failed to fetch updates for {repo_path}: {e}")
         return False
+
+    latest_tag = release_data.get("tag_name")
+
+    if current_tag == latest_tag and not missing_files:
+        print(f"[\u2713] {repo_path} is up to date ({current_tag}).")
+        local_versions[f"{repo_path}#last_check"] = time.time()
+        save_local_versions(local_versions)
+        return False
+
+    if current_tag != latest_tag:
+        print(f"[!] Update found for {repo_path}: {current_tag} -> {latest_tag}")
+    else:
+        print(f"[!] Missing local files for {repo_path}. Re-downloading...")
+
+    all_found = True
+    for ext, output_path in extensions_to_paths.items():
+        found = False
+        for asset in release_data.get("assets", []):
+            if asset["name"].endswith(ext):
+                asset_url = asset["browser_download_url"]
+                print(f"    -> Downloading {asset['name']}...")
+                try:
+                    download_with_progress(asset_url, output_path)
+                    found = True
+                except Exception as e:
+                    print(f"    [!] Failed to download {asset['name']}: {e}")
+                break
+
+        # Fallback: fetch the patches JSON from the repo at the release tag
+        # (Morphe/ReVanced-style sources don't ship it as a release asset)
+        if not found and ext == ".json":
+            print(
+                f"    -> JSON asset not found. Fetching patches JSON from source ({latest_tag})..."
+            )
+            if _try_download_json_candidates(repo_path, latest_tag, output_path):
+                found = True
+
+        if not found:
+            print(f"    [!] Could not obtain {ext} for {repo_path}. Not marking as synced.")
+            all_found = False
+
+    if all_found:
+        local_versions[repo_path] = latest_tag
+        local_versions[f"{repo_path}#last_check"] = time.time()
+        save_local_versions(local_versions)
+        return True
+
+    return False
 
 
 def get_source_paths(repo_path):
@@ -313,7 +378,9 @@ def get_supported_versions(package_name, config, scraper=None, force_refresh=Fal
         for s_versions in versions_by_source.values():
             recommended_set.update(s_versions)
 
-    recommended = sorted(list(recommended_set), key=lambda v: version.parse(v), reverse=True)
+    recommended = sorted(
+        list(recommended_set), key=_safe_version_sort_key, reverse=True
+    )
     if recommended:
         if not quiet: print(f"    [+] Found {len(recommended)} compatible recommended versions. Using newest: {recommended[0]}")
         return [recommended[0]], None, None
@@ -334,12 +401,12 @@ def get_supported_versions(package_name, config, scraper=None, force_refresh=Fal
         close_scraper = True
 
     try:
-        app_data = scraper.search(package_name=package_name, only_release=True)
-        if app_data and app_data.version:
-            versions = [app_data.version]
+        newest = scraper.latest_version(package_name)
+        if newest:
+            versions = [newest]
             cache[package_name] = {"versions": versions, "timestamp": now}
             save_version_cache(cache)
-            if not quiet: print(f"    [+] Found newest on APKMirror: {app_data.version}")
+            if not quiet: print(f"    [+] Found newest on APKMirror: {newest}")
             return versions, None, None
         return cached_remote, None, None
     except Exception as e:

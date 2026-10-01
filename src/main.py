@@ -12,11 +12,22 @@ import time
 import apprise
 from typing import List
 from pathlib import Path
-from src.patcher import get_supported_versions, get_all_available_apps, get_source_paths, update_tools, get_current_version, check_dependencies, DATA_DIR
+from src.patcher import (
+    get_supported_versions,
+    get_all_available_apps,
+    get_source_paths,
+    update_tools,
+    get_current_version,
+    check_dependencies,
+    check_and_download_release,
+    load_local_versions,
+    DATA_DIR,
+)
 from packaging import version
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+import requests
 import threading
 import asyncio
 import logging
@@ -178,10 +189,17 @@ def check_updates():
     """Checks each pipeline app for updates against remote sources."""
     global UPDATE_CACHE
     now = time.time()
-    
+
     # Return cached results if they are less than 60 seconds old
     if UPDATE_CACHE["results"] and (now - UPDATE_CACHE["timestamp"] < 60):
         return UPDATE_CACHE["results"]
+
+    # Avoid enqueueing behind a long-running build: return stale cached
+    # results immediately (the next poll after the build finishes will refresh).
+    if BUILD_STATUS.get("in_progress") or SCRAPER_ACTIVE:
+        if UPDATE_CACHE["results"] is not None:
+            return UPDATE_CACHE["results"]
+        return {}
 
     config = load_config()
     update_status = {}
@@ -357,10 +375,9 @@ class AddAppPayload(BaseModel):
 @app.post("/api/ui/add_app")
 def add_app_to_config(payload: AddAppPayload):
     config = load_config()
-    # Update existing or add new
-    config["apps"] = [
-        a for a in config.get("apps", []) if a["id"] != payload.package_id
-    ]
+    existing = next(
+        (a for a in config.get("apps", []) if a["id"] == payload.package_id), None
+    )
 
     new_app = {
         "id": payload.package_id,
@@ -369,6 +386,13 @@ def add_app_to_config(payload: AddAppPayload):
         "include_patches": payload.include_patches,
         "exclude_patches": [],
     }
+    # Preserve state (pinned version, last build, status) when editing an existing app
+    if existing is not None:
+        new_app = {**existing, **new_app}
+
+    config["apps"] = [
+        a for a in config.get("apps", []) if a["id"] != payload.package_id
+    ]
     config.setdefault("apps", []).append(new_app)
     save_config(config)
     return {"status": "success"}
@@ -430,29 +454,42 @@ def refresh_versions_task():
 def add_source(payload: AddSourcePayload, background_tasks: BackgroundTasks):
     config = load_config()
     sources = config.get("sources", [])
-    
+
     # Sanitize repo: strip https://github.com/ if present
     repo = payload.repo.replace("https://github.com/", "").strip("/")
-    
+
     if any(s["repo"] == repo for s in sources):
         return {"status": "Source already exists"}
-    
+
     # Format name as 'User Patches'
     parts = repo.split("/")
     if len(parts) < 2:
         return {"status": "Invalid repository format"}
-        
+
     user = parts[0]
     name = f"{user} Patches"
-    
+
     sources.append({
         "name": name,
         "repo": repo,
         "active": True
     })
     save_config(config)
-    background_tasks.add_task(update_tools_task, config)
-    return {"status": "Source added, syncing in background"}
+
+    # Sync this single source synchronously so the patches .json exists
+    # before the frontend re-renders the app list (no more silent race).
+    synced = check_and_download_release(repo, get_source_paths(repo), force=True)
+    local_versions = load_local_versions()
+    if synced and local_versions.get(repo):
+        for s in config.get("sources", []):
+            if s["repo"] == repo:
+                s["version"] = local_versions[repo]
+        save_config(config)
+    return {
+        "status": "success" if synced else "source_added_sync_failed",
+        "name": name,
+        "synced": synced,
+    }
 
 
 @app.post("/api/ui/toggle_source")
