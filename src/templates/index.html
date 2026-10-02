@@ -43,6 +43,7 @@
                 buildLogs: '',
                 showLogs: false,
                 toolsUpdating: false,
+                syncError: null,
                 refreshing: false,
                 newNotificationUrl: '',
                 testingNotifications: false,
@@ -121,6 +122,7 @@
                         const data = await response.json();
                         const wasUpdating = this.toolsUpdating;
                         this.toolsUpdating = data.updating;
+                        this.syncError = data.sync_error;
                         if (data.diagnostics) {
                             this.diagnostics = data.diagnostics;
                         }
@@ -601,6 +603,11 @@
                             </div>
                         </template>
                     </div>
+                    <template x-if="syncError">
+                        <div class="px-4 py-3 bg-red-500/10 border border-red-500/20 rounded-xl text-[11px] font-bold text-red-400">
+                            Sync failed: <span x-text="syncError"></span>
+                        </div>
+                    </template>
                     <div class="p-6 bg-slate-900 border border-slate-800 rounded-2xl space-y-4">
                         <template x-for="source in sources" :key="source.repo">
                             <div class="flex items-center justify-between p-3 bg-slate-950 rounded-xl border border-slate-800 group relative overflow-hidden">

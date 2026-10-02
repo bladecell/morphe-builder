@@ -23,6 +23,7 @@ from src.patcher import (
     check_and_download_release,
     load_local_versions,
     DATA_DIR,
+    GitHubRateLimitError,
 )
 from packaging import version
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -128,6 +129,7 @@ BUILD_STATUS = {"in_progress": False, "message": "Idle", "last_run": "Never"}
 DIAGNOSTICS = {"java": False, "scraper": False}
 LOG_PATH = DATA_DIR / "bin" / "build.log"
 TOOLS_UPDATING = False
+SYNC_ERROR: str | None = None  # Last background sync failure shown in the UI, or None
 
 DEFAULT_CONFIG = {
     "repositories": {
@@ -418,10 +420,13 @@ class AddSourcePayload(BaseModel):
 
 
 def update_tools_task(config, force=False):
-    global TOOLS_UPDATING
+    global TOOLS_UPDATING, SYNC_ERROR
     TOOLS_UPDATING = True
+    SYNC_ERROR = None
     try:
         update_tools(config, quiet=True, force=force)
+    except GitHubRateLimitError as e:
+        SYNC_ERROR = str(e)
     finally:
         TOOLS_UPDATING = False
 
@@ -467,7 +472,10 @@ def add_source(payload: AddSourcePayload):
     # Success is judged by the files on disk: the sync returns False both on
     # failure and when already up to date.
     paths = get_source_paths(repo)
-    check_and_download_release(repo, paths, force=True)
+    try:
+        check_and_download_release(repo, paths, force=True)
+    except GitHubRateLimitError as e:
+        raise HTTPException(429, str(e)) from e
     if not paths[".json"].exists():
         raise HTTPException(
             502,
@@ -759,6 +767,7 @@ def get_build_status():
 def get_tools_status():
     return {
         "updating": TOOLS_UPDATING, 
+        "sync_error": SYNC_ERROR,
         "diagnostics": DIAGNOSTICS,
         "data_dir": str(DATA_DIR)
     }

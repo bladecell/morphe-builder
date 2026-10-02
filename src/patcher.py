@@ -8,6 +8,7 @@ import time
 import tempfile
 import shutil
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from packaging import version
 from src.apkmirror_downloader import ApkMirror_Downloader, Arch, Dpi, BundleType
@@ -92,6 +93,49 @@ UPDATE_CHECK_INTERVAL = 6 * 3600
 JSON_FILENAME_CANDIDATES = ["patches-list.json", "patches.json"]
 
 
+class GitHubRateLimitError(Exception):
+    """Raised when the GitHub API refuses a request because of a rate limit.
+
+    Attributes:
+        reset_epoch: Reset time in epoch seconds, or None when GitHub gave none.
+    """
+
+    def __init__(self, reset_epoch: float | None = None) -> None:
+        self.reset_epoch = reset_epoch
+        if reset_epoch is None:
+            when = "Try again later."
+        else:
+            reset = datetime.fromtimestamp(reset_epoch, tz=UTC)
+            when = f"Resets at {reset:%Y-%m-%d %H:%M} UTC."
+        super().__init__(f"GitHub API rate limit reached. {when}")
+
+
+def _rate_limit_from_response(
+    response: requests.Response,
+) -> GitHubRateLimitError | None:
+    """Builds a rate limit error if the response is a GitHub rate limit refusal.
+
+    Args:
+        response: Response from the GitHub API.
+
+    Returns:
+        The error to raise, or None when the response is not a rate limit
+        (for example a 403 on a private repository).
+    """
+    if response.status_code not in (403, 429):
+        return None
+    headers = response.headers
+    try:
+        if headers.get("retry-after") is not None:
+            return GitHubRateLimitError(time.time() + float(headers["retry-after"]))
+        if headers.get("x-ratelimit-remaining") == "0":
+            reset = headers.get("x-ratelimit-reset")
+            return GitHubRateLimitError(float(reset) if reset else None)
+    except ValueError:
+        return GitHubRateLimitError()
+    return None
+
+
 def _try_download_json_candidates(repo_path, ref, output_path):
     """Tries candidate JSON filenames from a repo ref via raw.githubusercontent.
     Returns True on the first success."""
@@ -106,6 +150,20 @@ def _try_download_json_candidates(repo_path, ref, output_path):
 
 
 def check_and_download_release(repo_path, extensions_to_paths, force=False):
+    """Syncs a repo's latest release assets into the given local paths.
+
+    Args:
+        repo_path: GitHub 'owner/repo'.
+        extensions_to_paths: Map of wanted asset extension to local file path.
+        force: Skip the update-check throttle.
+
+    Returns:
+        True only when something was downloaded; False on failure or when
+        already up to date.
+
+    Raises:
+        GitHubRateLimitError: GitHub refused the release lookup due to a rate limit.
+    """
     api_url = f"https://api.github.com/repos/{repo_path}/releases/latest"
     local_versions = load_local_versions()
     current_tag = local_versions.get(repo_path)
@@ -139,6 +197,9 @@ def check_and_download_release(repo_path, extensions_to_paths, force=False):
                         save_local_versions(local_versions)
                         return True
             return False
+        rate_limit = _rate_limit_from_response(response)
+        if rate_limit is not None:
+            raise rate_limit
         response.raise_for_status()
         release_data = response.json()
     except requests.exceptions.RequestException as e:
@@ -241,6 +302,20 @@ def check_dependencies(config):
 
 
 def update_tools(config, quiet=False, force=False):
+    """Syncs tool jars and active patch sources from GitHub.
+
+    Args:
+        config: Loaded app config; versions are written back into it.
+        quiet: Suppress progress output.
+        force: Skip the update-check throttle.
+
+    Returns:
+        True if any file was downloaded.
+
+    Raises:
+        GitHubRateLimitError: GitHub rate limited the sync. Repos checked before
+            the limit are still saved; the rest were skipped.
+    """
     if not quiet:
         print("--- Checking for Tool Updates ---")
     bin_dir = DATA_DIR / "bin"
@@ -250,28 +325,35 @@ def update_tools(config, quiet=False, force=False):
     tools = config["tools"]
     
     any_updated = False
+    rate_limit = None
 
-    if check_and_download_release(
-        repos["cli"], {".jar": DATA_DIR / tools["cli_jar"]}, force=force
-    ):
-        any_updated = True
-
-    # Download APKEditor
-    if "apkeditor" in repos and "apkeditor_jar" in tools:
+    try:
         if check_and_download_release(
-            repos["apkeditor"], {".jar": DATA_DIR / tools["apkeditor_jar"]}, force=force
+            repos["cli"], {".jar": DATA_DIR / tools["cli_jar"]}, force=force
         ):
             any_updated = True
 
-    # Update each source
-    for source in config.get("sources", []):
-        if source.get("active", True):
-            if not quiet:
-                print(f"Checking for updates for source: {source['name']} ({source['repo']})...")
+        # Download APKEditor
+        if "apkeditor" in repos and "apkeditor_jar" in tools:
             if check_and_download_release(
-                source["repo"], get_source_paths(source["repo"]), force=force
+                repos["apkeditor"],
+                {".jar": DATA_DIR / tools["apkeditor_jar"]},
+                force=force,
             ):
                 any_updated = True
+
+        # Update each source
+        for source in config.get("sources", []):
+            if source.get("active", True):
+                if not quiet:
+                    print(f"Checking for updates for source: {source['name']} ({source['repo']})...")
+                if check_and_download_release(
+                    source["repo"], get_source_paths(source["repo"]), force=force
+                ):
+                    any_updated = True
+    except GitHubRateLimitError as e:
+        # Every remaining repo would hit the same limit: stop and report below.
+        rate_limit = e
 
     # SYNC VERSIONS BACK TO CONFIG
     local_versions = load_local_versions()
@@ -295,6 +377,8 @@ def update_tools(config, quiet=False, force=False):
 
     if not quiet:
         print("---------------------------------\n")
+    if rate_limit is not None:
+        raise rate_limit
     return any_updated
 
 
@@ -809,7 +893,11 @@ def get_current_version(package_id):
 
 def run_pipeline(package_ids=None, quiet=False, scraper=None):
     config = load_config()
-    was_updated = update_tools(config, quiet=quiet)
+    try:
+        was_updated = update_tools(config, quiet=quiet)
+    except GitHubRateLimitError as e:
+        print(f"[x] {e} Continuing with the tools and patches already on disk.")
+        was_updated = False
     
     # Get current versions of all active patch sources
     current_patch_versions = get_patch_versions(config)
