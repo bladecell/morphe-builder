@@ -343,7 +343,7 @@ def build_combined_version(
     """Build the version string Obtainium sees for one patched APK.
 
     The string is `<app version>-<primary patch tag>-<hash>`. The primary tag is
-    the version of the morphe-patches source if it was used, else of the first
+    the version of the Morphe base source if it was used, else of the first
     used source. The hash covers every used source version and the patch
     selection, so it changes whenever one of them does and never otherwise.
 
@@ -361,9 +361,7 @@ def build_combined_version(
     """
     primary_tag = "v0.0.0"
     if patch_versions:
-        morphe_repo = next(
-            (r for r in patch_versions if "morphe-patches" in r.lower()), None
-        )
+        morphe_repo = next((r for r in patch_versions if _is_base_repo(r)), None)
         primary_tag = patch_versions[morphe_repo or next(iter(patch_versions))]
     digest_input = json.dumps(
         {"patch_versions": patch_versions, "patches": selection}, sort_keys=True
@@ -493,6 +491,25 @@ def update_tools(config, quiet=False, force=False):
     return any_updated
 
 
+BASE_PATCHES_REPO = "MorpheApp/morphe-patches"
+
+
+def _is_base_repo(repo: str) -> bool:
+    """Tells whether a source repo is the Morphe base patch bundle.
+
+    Compared by repo (case-insensitive, exact) rather than display name, so a
+    source added through the UI as "MorpheApp Patches" is recognised too. A fork
+    such as "someone/morphe-patches" is not the base source.
+
+    Args:
+        repo: GitHub 'owner/repo' of a patch source.
+
+    Returns:
+        True for the Morphe base repo.
+    """
+    return repo.lower() == BASE_PATCHES_REPO.lower()
+
+
 def get_supported_versions(package_name, config, scraper=None, force_refresh=False, quiet=False):
     """
     Fetches available versions for a package with prioritization:
@@ -512,12 +529,12 @@ def get_supported_versions(package_name, config, scraper=None, force_refresh=Fal
     # 1. Parse Recommended versions from active patch sources
     # POLICY: Only look at sources that are either "Morphe Patches" (base)
     # OR sources that actually provide one of the selected patches.
-    versions_by_source = {} # source_name -> set of versions
-    providing_sources = set()
+    versions_by_source = {} # repo -> set of versions
+    providing_sources = [] # repos in config order
 
     for source in config.get("sources", []):
         if not source.get("active", True): continue
-        s_name = source["name"]
+        repo = source["repo"]
         json_path = get_source_paths(source["repo"])[".json"]
         if not json_path.exists(): continue
         
@@ -555,30 +572,30 @@ def get_supported_versions(package_name, config, scraper=None, force_refresh=Fal
                         elif isinstance(v_list, str): s_versions.add(v_list.strip())
                 
                 if s_versions:
-                    versions_by_source[s_name] = s_versions
-                    if has_selected_patch or s_name == "Morphe Patches":
-                        providing_sources.add(s_name)
+                    versions_by_source[repo] = s_versions
+                    if has_selected_patch or _is_base_repo(repo):
+                        providing_sources.append(repo)
         except: pass
     
     # If patches are selected, only use versions supported by the providers
     recommended_set = set()
     if selected_patches and providing_sources:
         # Collect versions from providing sources
-        for s_name in providing_sources:
-            if s_name in versions_by_source:
+        for repo in providing_sources:
+            if repo in versions_by_source:
                 # If we haven't picked a version yet, take the first provider's
                 if not recommended_set:
-                    recommended_set = versions_by_source[s_name]
+                    recommended_set = versions_by_source[repo]
                 else:
                     # INTERSECT versions if multiple sources provide patches
                     # (Ensure we pick a version compatible with ALL selected sources)
-                    intersect = recommended_set.intersection(versions_by_source[s_name])
+                    intersect = recommended_set.intersection(versions_by_source[repo])
                     if intersect:
                         recommended_set = intersect
                     else:
                         # If no intersection, fallback to the provider that isn't Morphe
-                        if s_name != "Morphe Patches":
-                            recommended_set = versions_by_source[s_name]
+                        if not _is_base_repo(repo):
+                            recommended_set = versions_by_source[repo]
     else:
         # No patches selected yet (Discovery mode), merge all
         for s_versions in versions_by_source.values():
@@ -881,7 +898,7 @@ def patch_app(app_config, tools_config, input_apk, output_apk, config):
             pass
 
     if remaining_patches or not included_mpps:
-        default_repo = "MorpheApp/morphe-patches"
+        default_repo = BASE_PATCHES_REPO
         default_mpp = get_source_paths(default_repo)[".mpp"]
         if default_mpp.exists():
             included_mpps[str(default_mpp)] = default_repo

@@ -230,3 +230,12 @@ the same filesystem, and no `<pkg>-*.apk` glob over `patched` can see a partial 
 
 **Trade-off.** `apks/patched` must not be a separate mount from `apks`, or the move
 fails and the build is recorded as an error.
+
+## 2026-10-02: The base source is `MorpheApp/morphe-patches`, matched exactly
+
+Version selection, the primary tag of the version string and the fallback bundle in
+`patch_app` all recognise the base source through `_is_base_repo`: a case-insensitive
+exact match on the repo. Before, version selection used the display name
+"Morphe Patches" and the version string used a substring match, which also treated
+forks named `*/morphe-patches` as the base. The frontend still uses the display name
+(open item in plan step 4).

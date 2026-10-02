@@ -5,6 +5,7 @@ from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import json
+import re
 import sys
 import io
 import time
@@ -490,17 +491,27 @@ def delete_source(payload: AddSourcePayload):
     return {"status": "success"}
 
 
+# Android package id: two or more dot-separated Java identifiers.
+PACKAGE_ID_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+")
+# Version as it appears in a file name: no separators, at most 64 characters.
+VERSION_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+~-]{0,63}")
+
+
 @app.post("/api/ui/upload_apk")
 async def upload_apk(
-    package_id: str = Form(...),
-    version_str: str = Form(...),
+    package_id: str = Form(""),
+    version_str: str = Form(""),
     file: UploadFile = File(...)
 ):
+    # Sanitize version string
+    safe_version = version_str.strip().replace(" ", "_")
+    if not PACKAGE_ID_PATTERN.fullmatch(package_id):
+        raise HTTPException(status_code=400, detail="Invalid package id")
+    if not VERSION_PATTERN.fullmatch(safe_version) or ".." in safe_version:
+        raise HTTPException(status_code=400, detail="Invalid version string")
+
     raw_dir = DATA_DIR / "apks" / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Sanitize version string
-    safe_version = version_str.replace(" ", "_").strip()
     file_path = raw_dir / f"{package_id}-{safe_version}.apk"
     
     with open(file_path, "wb") as buffer:
@@ -635,6 +646,9 @@ def test_notification(payload: SaveSettingsPayload):
     return {"status": "success" if success else "error"}
 
 
+CRON_LOCK = threading.Lock()
+
+
 @app.post("/api/ui/save_settings")
 def save_settings(payload: SaveSettingsPayload):
     def apply(config: dict) -> None:
@@ -643,7 +657,11 @@ def save_settings(payload: SaveSettingsPayload):
         settings["cron_schedule"] = payload.cron_schedule
         settings["notification_urls"] = payload.notification_urls
 
-    setup_cron_job(update_config(apply))
+    update_config(apply)
+    # Schedule from the file as it is now, one caller at a time, so the last
+    # scheduling call always sees the last saved settings.
+    with CRON_LOCK:
+        setup_cron_job(load_config())
     return {"status": "success"}
 
 
@@ -782,19 +800,23 @@ def download_app_by_name(package_name: str):
     if "-" in base_name:
         base_name = base_name.split("-")[0]
 
-    # Priority 2: Search for any file starting with base_name (e.g., com.pkg.id-*.apk)
-    print(f"[Download] File not found. Searching for glob: {base_name}* in {DATA_DIR}/apks/patched")
-    try:
-        patched_dir = DATA_DIR / "apks" / "patched"
-        if patched_dir.exists():
-            matches = list(patched_dir.glob(f"{base_name}*"))
-            if matches:
-                # Sort by modification time to get the newest if multiple exist
-                matches.sort(key=lambda x: x.stat().st_mtime, reverse=True)
-                print(f"[Download] Found via glob: {matches[0]}")
-                return FileResponse(matches[0], media_type="application/vnd.android.package-archive")
-    except Exception as e:
-        print(f"[Download] Glob search failed: {e}")
+    # Priority 2: newest file of exactly this package. File names are
+    # <pkg>-<rest>.apk (or <pkg>.apk) and package ids never contain "-".
+    patched_dir = DATA_DIR / "apks" / "patched"
+    if patched_dir.is_dir():
+        matches = [
+            f
+            for f in patched_dir.iterdir()
+            if f.is_file()
+            and f.suffix == ".apk"
+            and (f.name == f"{base_name}.apk" or f.name.startswith(f"{base_name}-"))
+        ]
+        if matches:
+            newest = max(matches, key=lambda f: f.stat().st_mtime)
+            print(f"[Download] Found newest for {base_name}: {newest}")
+            return FileResponse(
+                newest, media_type="application/vnd.android.package-archive"
+            )
 
     raise HTTPException(
         status_code=404, detail=f"No patched APK matches {package_name}"
@@ -807,7 +829,7 @@ async def view_app(package_id: str, request: Request):
     # Try to find by package ID first, then fallback to obtainium_id
     app_info = next((a for a in config.get("apps", []) if a["id"] == package_id), None)
     if not app_info:
-        app_info = next((a for a in config.get("apps", []) if a["obtainium_id"] == package_id), None)
+        app_info = next((a for a in config.get("apps", []) if a.get("obtainium_id") == package_id), None)
         
     if not app_info:
         print(f"[View] App not found for ID: {package_id}")
@@ -860,10 +882,10 @@ def get_single_app(obtainium_id: str, request: Request):
     settings = config.get("settings", {})
     base_url = settings.get("server_url", str(request.base_url).rstrip("/"))
     
-    app_info = next((a for a in config.get("apps", []) if a["obtainium_id"] == obtainium_id), None)
+    app_info = next((a for a in config.get("apps", []) if a.get("obtainium_id") == obtainium_id), None)
     if not app_info:
         print(f"[Obtainium] App with ID {obtainium_id} not found in config.")
-        return {"error": "App not found"}
+        raise HTTPException(status_code=404, detail="App not found")
         
     last_build = app_info.get("last_successful_build", {})
     version = last_build.get("combined_version") or last_build.get("app_version", "Unknown")

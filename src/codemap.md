@@ -124,8 +124,9 @@ Returns `(versions, None, None)`. Priority:
 
 1. Pinned `version` on the app config. No network.
 2. Newest version recommended by patch sources. Only sources that provide a selected
-   patch, plus the source named `Morphe Patches`, are considered; their version sets are
-   intersected, falling back to the non-Morphe provider if the intersection is empty.
+   patch, plus the base source (`_is_base_repo`: `MorpheApp/morphe-patches`), are
+   considered, in config order; their version sets are intersected, falling back to
+   the non-base provider if the intersection is empty.
    With no patches selected, all sources are merged.
 3. `scraper.latest_version`, cached in `bin/version_cache.json` for 12 h unless
    `force_refresh`. On scraper failure the stale cached value is returned.
@@ -195,7 +196,7 @@ returns `(True, [repos used])`.
 | Status | `GET /api/ui/updates`, `build_status`, `tools_status`, `logs`, `metadata` | `updates` blocks on the worker for unpinned apps; returns the stale cache while a build or refresh is active |
 | Build | `POST /api/ui/trigger_build` | `package_ids` null or empty means all apps |
 | Settings | `POST /api/ui/save_settings`, `POST /api/ui/test_notification` | Saving reschedules cron |
-| Obtainium | `GET /view/{package_id}`, `GET /api/apps`, `GET /api/apps/{obtainium_id}`, `GET /download/{package_name}` | `/view` accepts package id or `obtainium_id`. `/download` takes an exact filename or a package id and serves the newest match, or 404 |
+| Obtainium | `GET /view/{package_id}`, `GET /api/apps`, `GET /api/apps/{obtainium_id}`, `GET /download/{package_name}` | `/view` accepts package id or `obtainium_id`. `/download` takes an exact filename or a package id and serves the newest APK of exactly that package, or 404. Unknown ids on `/api/apps/{id}` give 404 |
 | Static | `/icons` | `DATA_DIR/apks/icons` |
 
 No authentication on any route; CORS allows all origins.
