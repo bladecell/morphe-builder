@@ -198,7 +198,7 @@ def test_string_is_stable_across_processes():
     code = (
         "from src import patcher;"
         "print(patcher.build_combined_version("
-        "'1.0', {'b/x': 'v2', 'a/morphe-patches': 'v1'},"
+        "'1.0', {'b/x': 'v2', 'MorpheApp/morphe-patches': 'v1'},"
         "{'include': ['p'], 'exclude': []}))"
     )
     outputs = {
