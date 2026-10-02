@@ -4,7 +4,6 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import yaml
 import json
 import sys
 import io
@@ -34,6 +33,7 @@ import threading
 import asyncio
 import logging
 import queue
+from src.config_store import load_config, update_config
 
 # Silence verbose Uvicorn access logs
 logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
@@ -131,26 +131,6 @@ LOG_PATH = DATA_DIR / "bin" / "build.log"
 TOOLS_UPDATING = False
 SYNC_ERROR: str | None = None  # Last background sync failure shown in the UI, or None
 
-DEFAULT_CONFIG = {
-    "repositories": {
-        "cli": "MorpheApp/morphe-cli",
-        "apkeditor": "REAndroid/APKEditor"
-    },
-    "sources": [
-        {"name": "Morphe Patches", "repo": "MorpheApp/morphe-patches", "active": True}
-    ],
-    "tools": {
-        "cli_jar": "bin/morphe-cli.jar",
-        "apkeditor_jar": "bin/APKEditor.jar"
-    },
-    "apps": [],
-    "settings": {
-        "server_url": "http://localhost:8000",
-        "cron_schedule": "0 */4 * * *",
-        "notification_urls": []
-    }
-}
-
 
 def ensure_data_dirs():
     """Ensure all required subdirectories exist in the DATA_DIR."""
@@ -158,30 +138,6 @@ def ensure_data_dirs():
     (DATA_DIR / "apks" / "raw").mkdir(parents=True, exist_ok=True)
     (DATA_DIR / "apks" / "patched").mkdir(parents=True, exist_ok=True)
     (DATA_DIR / "apks" / "icons").mkdir(parents=True, exist_ok=True)
-
-
-def load_config():
-    config_path = DATA_DIR / "config.yaml"
-    if not config_path.exists():
-        ensure_data_dirs()
-        source_config = PROJECT_ROOT / "config.yaml"
-        if source_config.exists():
-            import shutil
-            shutil.copy(source_config, config_path)
-            print(f"[Init] Seeded {config_path} from {source_config}")
-        else:
-            save_config(DEFAULT_CONFIG)
-            print(f"[Init] Generated default {config_path}")
-    
-    with open(config_path, "r") as file:
-        return yaml.safe_load(file)
-
-
-def save_config(config_data):
-    ensure_data_dirs()
-    config_path = DATA_DIR / "config.yaml"
-    with open(config_path, "w") as file:
-        yaml.dump(config_data, file, sort_keys=False)
 
 
 # Cache for update status to prevent excessive polling load
@@ -377,27 +333,27 @@ class AddAppPayload(BaseModel):
 
 @app.post("/api/ui/add_app")
 def add_app_to_config(payload: AddAppPayload):
-    config = load_config()
-    existing = next(
-        (a for a in config.get("apps", []) if a["id"] == payload.package_id), None
-    )
+    def apply(config: dict) -> None:
+        existing = next(
+            (a for a in config.get("apps", []) if a["id"] == payload.package_id), None
+        )
+        new_app = {
+            "id": payload.package_id,
+            "name": payload.name,
+            "obtainium_id": f"morphe_{payload.package_id.split('.')[-1]}",
+            "include_patches": payload.include_patches,
+            "exclude_patches": [],
+        }
+        # Preserve state (pinned version, last build, status) when editing an app
+        if existing is not None:
+            new_app = {**existing, **new_app}
 
-    new_app = {
-        "id": payload.package_id,
-        "name": payload.name,
-        "obtainium_id": f"morphe_{payload.package_id.split('.')[-1]}",
-        "include_patches": payload.include_patches,
-        "exclude_patches": [],
-    }
-    # Preserve state (pinned version, last build, status) when editing an existing app
-    if existing is not None:
-        new_app = {**existing, **new_app}
+        config["apps"] = [
+            a for a in config.get("apps", []) if a["id"] != payload.package_id
+        ]
+        config.setdefault("apps", []).append(new_app)
 
-    config["apps"] = [
-        a for a in config.get("apps", []) if a["id"] != payload.package_id
-    ]
-    config.setdefault("apps", []).append(new_app)
-    save_config(config)
+    update_config(apply)
     return {"status": "success"}
 
 
@@ -407,11 +363,12 @@ class DeleteAppPayload(BaseModel):
 
 @app.post("/api/ui/delete_app")
 def delete_app_from_config(payload: DeleteAppPayload):
-    config = load_config()
-    config["apps"] = [
-        a for a in config.get("apps", []) if a["id"] != payload.package_id
-    ]
-    save_config(config)
+    def apply(config: dict) -> None:
+        config["apps"] = [
+            a for a in config.get("apps", []) if a["id"] != payload.package_id
+        ]
+
+    update_config(apply)
     return {"status": "success"}
 
 
@@ -487,33 +444,44 @@ def add_source(payload: AddSourcePayload):
         )
 
     name = f"{repo.split('/')[0]} Patches"
-    sources.append({
+    new_source = {
         "name": name,
         "repo": repo,
         "active": True,
         "version": load_local_versions().get(repo),
-    })
-    config["sources"] = sources
-    save_config(config)
+    }
+
+    def apply(current: dict) -> None:
+        # Re-check against the file as it is now: the sync above was unlocked.
+        current_sources = current.setdefault("sources", [])
+        if any(s["repo"].lower() == repo.lower() for s in current_sources):
+            raise HTTPException(400, f"Source {repo} already exists.")
+        current_sources.append(new_source)
+
+    update_config(apply)
     return {"status": "success", "name": name}
 
 
 @app.post("/api/ui/toggle_source")
 def toggle_source(payload: AddSourcePayload):
-    config = load_config()
-    for s in config.get("sources", []):
-        if s["repo"] == payload.repo:
-            s["active"] = not s.get("active", True)
-            break
-    save_config(config)
+    def apply(config: dict) -> None:
+        for s in config.get("sources", []):
+            if s["repo"] == payload.repo:
+                s["active"] = not s.get("active", True)
+                break
+
+    update_config(apply)
     return {"status": "success"}
 
 
 @app.post("/api/ui/delete_source")
 def delete_source(payload: AddSourcePayload):
-    config = load_config()
-    config["sources"] = [s for s in config.get("sources", []) if s["repo"] != payload.repo]
-    save_config(config)
+    def apply(config: dict) -> None:
+        config["sources"] = [
+            s for s in config.get("sources", []) if s["repo"] != payload.repo
+        ]
+
+    update_config(apply)
     return {"status": "success"}
 
 
@@ -555,7 +523,7 @@ def check_source_updates():
     config = load_config()
     results = {}
     config_changed = False
-    
+
     local_versions = {}
     versions_file = DATA_DIR / "bin" / "versions.json"
     if versions_file.exists():
@@ -571,7 +539,6 @@ def check_source_updates():
         
         # Sync current version to config if missing or different
         if current_tag and source.get("version") != current_tag:
-            source["version"] = current_tag
             config_changed = True
 
         try:
@@ -589,7 +556,14 @@ def check_source_updates():
             results[repo] = {"latest": current_tag, "current": current_tag, "has_update": False}
 
     if config_changed:
-        save_config(config)
+        def apply_versions(current: dict) -> None:
+            # Re-read: a sync may have installed a newer release during the loop.
+            installed = load_local_versions()
+            for source in current.get("sources", []):
+                if installed.get(source["repo"]):
+                    source["version"] = installed[source["repo"]]
+
+        update_config(apply_versions)
         
     SOURCE_UPDATE_CACHE = {"timestamp": now, "results": results}
     return results
@@ -658,12 +632,13 @@ def test_notification(payload: SaveSettingsPayload):
 
 @app.post("/api/ui/save_settings")
 def save_settings(payload: SaveSettingsPayload):
-    config = load_config()
-    config.setdefault("settings", {})["server_url"] = payload.server_url.rstrip("/")
-    config["settings"]["cron_schedule"] = payload.cron_schedule
-    config["settings"]["notification_urls"] = payload.notification_urls
-    save_config(config)
-    setup_cron_job(config)
+    def apply(config: dict) -> None:
+        settings = config.setdefault("settings", {})
+        settings["server_url"] = payload.server_url.rstrip("/")
+        settings["cron_schedule"] = payload.cron_schedule
+        settings["notification_urls"] = payload.notification_urls
+
+    setup_cron_job(update_config(apply))
     return {"status": "success"}
 
 

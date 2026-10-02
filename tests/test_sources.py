@@ -30,7 +30,7 @@ def test_normalize_repo_rejects(raw):
 def config_store(monkeypatch):
     store = {"sources": [{"name": "X", "repo": "Owner/Repo", "active": True}]}
     monkeypatch.setattr(main, "load_config", lambda: store)
-    monkeypatch.setattr(main, "save_config", lambda cfg: None)
+    monkeypatch.setattr(main, "update_config", lambda mutate: mutate(store))
     monkeypatch.setattr(main, "load_local_versions", lambda: {"new/repo": "v1"})
     return store
 
@@ -134,7 +134,7 @@ def test_update_tools_passes_force(monkeypatch, tmp_path):
         patcher, "check_and_download_release", lambda *a, **k: seen.append(k.get("force")) or False
     )
     monkeypatch.setattr(patcher, "load_local_versions", lambda: {})
-    monkeypatch.setattr(patcher, "save_config_safe", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(patcher, "update_config", lambda mutate: None)
     config = {
         "repositories": {"cli": "x/cli"},
         "tools": {"cli_jar": "cli.jar"},

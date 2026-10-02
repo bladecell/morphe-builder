@@ -2,9 +2,10 @@ import time
 
 import pytest
 import requests
+import yaml
 from fastapi import HTTPException
 
-from src import main, patcher
+from src import config_store, main, patcher
 
 RESET_EPOCH = 1_900_000_000
 RESET_TEXT = "2030-03-17 17:46 UTC"
@@ -90,8 +91,7 @@ def test_update_tools_stops_and_raises_on_rate_limit(tmp_path, monkeypatch):
 def test_update_tools_saves_progress_before_raising(tmp_path, monkeypatch):
     monkeypatch.setattr(patcher, "DATA_DIR", tmp_path)
     monkeypatch.setattr(patcher, "load_local_versions", lambda: {"x/cli": "v2"})
-    saved = []
-    monkeypatch.setattr(main, "save_config", lambda cfg: saved.append(cfg))
+    monkeypatch.setattr(config_store, "DATA_DIR", tmp_path)
 
     def fake_check(repo, paths, force=False):
         if repo == "x/cli":
@@ -104,9 +104,11 @@ def test_update_tools_saves_progress_before_raising(tmp_path, monkeypatch):
         "tools": {"cli_jar": "cli.jar"},
         "sources": [{"name": "s", "repo": "a/b", "active": True}],
     }
+    config_store.save_config(config)
     with pytest.raises(patcher.GitHubRateLimitError):
         patcher.update_tools(config, quiet=True)
-    assert saved == [config]
+    saved = yaml.safe_load((tmp_path / "config.yaml").read_text())
+    assert saved["tools"]["cli_version"] == "v2"
     assert config["tools"]["cli_version"] == "v2"
 
 
@@ -133,7 +135,7 @@ def add_source_env(tmp_path, monkeypatch):
     store = {"sources": []}
     paths = {".mpp": tmp_path / "p.mpp", ".json": tmp_path / "p.json"}
     monkeypatch.setattr(main, "load_config", lambda: store)
-    monkeypatch.setattr(main, "save_config", lambda cfg: None)
+    monkeypatch.setattr(main, "update_config", lambda mutate: mutate(store))
     monkeypatch.setattr(main, "get_source_paths", lambda repo: paths)
     return store
 

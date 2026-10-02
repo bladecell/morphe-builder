@@ -1,6 +1,5 @@
 import requests
 import re
-import yaml
 import subprocess
 import os
 import json
@@ -13,8 +12,7 @@ from pathlib import Path
 from packaging import version
 from src.apkmirror_downloader import ApkMirror_Downloader, Arch, Dpi, BundleType
 
-PROJECT_ROOT = Path(__file__).parent.parent
-DATA_DIR = Path(os.getenv("DATA_DIR", str(PROJECT_ROOT)))
+from src.config_store import DATA_DIR, load_config, update_config
 VERSIONS_FILE = DATA_DIR / "bin" / "versions.json"
 VERSION_CACHE_FILE = DATA_DIR / "bin" / "version_cache.json"
 
@@ -301,11 +299,53 @@ def check_dependencies(config):
     return results
 
 
+def _apply_versions(config: dict, local_versions: dict) -> None:
+    """Write installed source and tool versions into `config` in place.
+
+    Args:
+        config: Config dict to update.
+        local_versions: Installed version per repo, from `load_local_versions`.
+    """
+    for source in config.get("sources", []):
+        version_tag = local_versions.get(source["repo"])
+        if version_tag:
+            source["version"] = version_tag
+
+    tools = config.setdefault("tools", {})
+    repos = config.get("repositories", {})
+    if repos.get("cli") in local_versions:
+        tools["cli_version"] = local_versions[repos["cli"]]
+    if repos.get("apkeditor") in local_versions:
+        tools["apkeditor_version"] = local_versions[repos["apkeditor"]]
+
+
+def save_app_result(app_id: str, **fields: object) -> None:
+    """Merge pipeline-owned fields into one app of the current config.
+
+    Only `fields` are written, onto the file as it is now, so UI edits made during
+    a build survive. If the app was deleted meanwhile, nothing is written.
+
+    Args:
+        app_id: Package id of the app the result belongs to.
+        **fields: Result fields: status, error, last_successful_build.
+    """
+
+    def apply(config: dict) -> None:
+        for app in config.get("apps", []):
+            if app["id"] == app_id:
+                app.update(fields)
+                return
+
+    update_config(apply)
+
+
 def update_tools(config, quiet=False, force=False):
     """Syncs tool jars and active patch sources from GitHub.
 
     Args:
-        config: Loaded app config; versions are written back into it.
+        config: App config to read repos and sources from; versions are written
+            back into it and, if anything was downloaded, into the config file
+            (only the version fields, on top of the file's current contents).
         quiet: Suppress progress output.
         force: Skip the update-check throttle.
 
@@ -357,40 +397,16 @@ def update_tools(config, quiet=False, force=False):
 
     # SYNC VERSIONS BACK TO CONFIG
     local_versions = load_local_versions()
-    # Update source versions
-    for source in config.get("sources", []):
-        v = local_versions.get(source["repo"])
-        if v:
-            source["version"] = v
-            
-    # Update tool versions in config
-    if "tools" not in config: config["tools"] = {}
-    repos = config.get("repositories", {})
-    if repos.get("cli") in local_versions:
-        config["tools"]["cli_version"] = local_versions[repos["cli"]]
-    if repos.get("apkeditor") in local_versions:
-        config["tools"]["apkeditor_version"] = local_versions[repos["apkeditor"]]
-
+    _apply_versions(config, local_versions)
     if any_updated:
-        from src.main import save_config
-        save_config(config)
+        # Persist onto the file as it is now: `config` may be a stale snapshot.
+        update_config(lambda current: _apply_versions(current, local_versions))
 
     if not quiet:
         print("---------------------------------\n")
     if rate_limit is not None:
         raise rate_limit
     return any_updated
-
-
-def load_config():
-    config_path = DATA_DIR / "config.yaml"
-    # Fallback/Seed: if config doesn't exist in data_dir, copy from root
-    if not config_path.exists() and (PROJECT_ROOT / "config.yaml").exists():
-        import shutil
-        shutil.copy(PROJECT_ROOT / "config.yaml", config_path)
-    
-    with open(config_path, "r") as file:
-        return yaml.safe_load(file)
 
 
 def get_supported_versions(package_name, config, scraper=None, force_refresh=False, quiet=False):
@@ -938,10 +954,9 @@ def run_pipeline(package_ids=None, quiet=False, scraper=None):
 
                 if not supported:
                     print(f"[!] No supported versions found for {app['id']}")
-                    app["status"] = "Error"
-                    app["error"] = "No supported versions"
-                    from src.main import save_config
-                    save_config(config)
+                    save_app_result(
+                        app["id"], status="Error", error="No supported versions"
+                    )
                     continue
 
                 download_success = False
@@ -971,10 +986,7 @@ def run_pipeline(package_ids=None, quiet=False, scraper=None):
                 if not download_success:
                     # ...
                     print(f"[x] Could not download any supported version for {app['id']}")
-                    app["status"] = "Error"
-                    app["error"] = "Download failed"
-                    from src.main import save_config
-                    save_config(config)
+                    save_app_result(app["id"], status="Error", error="Download failed")
                     continue
 
                 # ... patching logic ...
@@ -1020,21 +1032,21 @@ def run_pipeline(package_ids=None, quiet=False, scraper=None):
                         "filename": patched_apk_path.name,
                         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
                     }
-                    app["status"] = "Success"
-                    app["error"] = None
-                    from src.main import save_config
-                    save_config(config)
+                    save_app_result(
+                        app["id"],
+                        status="Success",
+                        error=None,
+                        last_successful_build=app["last_successful_build"],
+                    )
                 else:
-                    app["status"] = "Failed"
-                    app["error"] = "Patching failed with SEVERE errors"
-                    from src.main import save_config
-                    save_config(config)
+                    save_app_result(
+                        app["id"],
+                        status="Failed",
+                        error="Patching failed with SEVERE errors",
+                    )
             except Exception as e:
                 print(f"Error processing {app['id']}: {e}")
-                app["status"] = "Error"
-                app["error"] = str(e)
-                from src.main import save_config
-                save_config(config)
+                save_app_result(app["id"], status="Error", error=str(e))
     finally:
         if close_scraper:
             scraper.close()
