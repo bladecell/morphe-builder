@@ -6,7 +6,8 @@ from dataclasses import dataclass, asdict
 from enum import Enum
 from urllib.parse import urlencode, urlunparse, urljoin
 from cloakbrowser import launch
-from selectolax.parser import HTMLParser
+from playwright.sync_api import Error as PlaywrightError
+from selectolax.parser import HTMLParser, Node
 
 logging.basicConfig(
     level=logging.INFO,
@@ -20,7 +21,8 @@ class _StdoutHandler(logging.Handler):
     """Prints to the current sys.stdout, so scraper logs show up in the
     build console (which swaps sys.stdout during a build)."""
 
-    def emit(self, record):
+    def emit(self, record: logging.LogRecord) -> None:
+        """Print the formatted record to the current sys.stdout."""
         print(self.format(record))
 
 
@@ -81,28 +83,33 @@ class ApkMirror_Downloader:
     BASE_URL = "https://www.apkmirror.com"
     BASE_NETLOC = "www.apkmirror.com"
 
-    def __init__(self):
+    def __init__(self) -> None:
+        """Launch the browser session used for all navigation."""
         self._launch()
 
-    def _launch(self):
+    def _launch(self) -> None:
+        """Start a fresh browser and open the page used for navigation."""
         logger.info("Initializing cloakbrowser context session...")
         self.browser = launch()
         self.page = self.browser.new_page()
 
-    def _goto(self, url):
-        """Navigates to url. If the page or the browser has died, relaunches
-        the browser and retries once."""
+    def _goto(self, url: str) -> None:
+        """Navigate to url, relaunching the browser once if it has died."""
         try:
             self.page.goto(url, wait_until="domcontentloaded")
-        except Exception as e:
+        except PlaywrightError as e:
+            # Timeouts are PlaywrightError too; only a dead browser is retried
             message = str(e).lower()
             if "crash" not in message and "closed" not in message:
                 raise
-            logger.warning(f"Browser died during navigation ({e}). Relaunching and retrying once...")
+            logger.warning(
+                f"Browser died during navigation ({e}). "
+                "Relaunching and retrying once..."
+            )
             try:
                 self.browser.close()
-            except Exception:
-                pass  # browser may already be dead
+            except PlaywrightError as close_error:
+                logger.debug(f"Closing the dead browser failed: {close_error}")
             self._launch()
             self.page.goto(url, wait_until="domcontentloaded")
 
@@ -180,7 +187,7 @@ class ApkMirror_Downloader:
 
             master_release_url = urljoin(
                 self.BASE_URL,
-                master_row.css_first("a.fontBlack").attributes.get("href", ""),
+                master_row.css("a.fontBlack")[0].attributes.get("href", ""),
             )
             logger.info(f"Navigating to release page: {master_release_url}")
             self._goto(master_release_url)
@@ -231,9 +238,31 @@ class ApkMirror_Downloader:
         )
         return self._extract_final_metadata(parser)
 
-    def latest_version(self, package_name, only_release=True) -> str | None:
-        """Returns the newest version listed on the search results page,
-        without visiting the release and variant pages."""
+    def latest_version(
+        self, package_name: str, only_release: bool = True
+    ) -> str | None:
+        """Return the newest version listed on the search results page.
+
+        Reads the search results only; the release and variant pages are
+        not visited.
+
+        Args:
+            package_name: Android package id to search for, e.g.
+                "com.instagram.android".
+            only_release: Skip alpha, beta, dev and canary rows.
+
+        Returns:
+            The version string of the first matching result row, or None
+            if no row matches or the row has no version details.
+
+        Raises:
+            playwright.sync_api.Error: If navigation fails, or no result
+                row shows up within 15 seconds (a TimeoutError).
+
+        Example:
+            >>> downloader.latest_version("com.instagram.android")
+            '449.0.0.52.84'
+        """
         logger.info(f"Looking up newest version for '{package_name}'...")
         self._goto(self._build_search_url(package_name))
         self.page.wait_for_selector(".appRow", timeout=15000)
@@ -252,11 +281,16 @@ class ApkMirror_Downloader:
         if info is None:
             return None
         for name in info.css(".infoSlide-name"):
-            if name.text(strip=True) == "Version:":
-                return name.parent.css_first(".infoSlide-value").text(strip=True)
+            if name.text(strip=True) != "Version:" or name.parent is None:
+                continue
+            value = name.parent.css_first(".infoSlide-value")
+            return value.text(strip=True) if value else None
         return None
 
-    def _extract_first_valid_row(self, parser, target_version, only_release):
+    def _extract_first_valid_row(
+        self, parser: HTMLParser, target_version: str | None, only_release: bool
+    ) -> Node | None:
+        """Return the first result row that passes the version filters."""
         app_rows = parser.css(".appRow")
         for row in app_rows:
             title_element = row.css_first("a.fontBlack")
@@ -265,9 +299,12 @@ class ApkMirror_Downloader:
 
             title_text = title_element.text(strip=True).lower()
 
-            if not target_version and only_release:
-                if any(x in title_text for x in ["alpha", "beta", "dev", "canary"]):
-                    continue
+            if (
+                not target_version
+                and only_release
+                and any(x in title_text for x in ["alpha", "beta", "dev", "canary"])
+            ):
+                continue
 
             if target_version and target_version.lower() not in title_text:
                 continue
