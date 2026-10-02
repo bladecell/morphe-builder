@@ -5,6 +5,7 @@ import os
 import json
 import time
 import tempfile
+import hashlib
 import shutil
 import sys
 from datetime import UTC, datetime
@@ -332,6 +333,74 @@ def selected_patches(app: dict) -> dict[str, list[str]]:
         "include": sorted(app.get("include_patches") or []),
         "exclude": sorted(app.get("exclude_patches") or []),
     }
+
+
+def build_combined_version(
+    app_version: str,
+    patch_versions: dict[str, str],
+    selection: dict[str, list[str]],
+) -> str:
+    """Build the version string Obtainium sees for one patched APK.
+
+    The string is `<app version>-<primary patch tag>-<hash>`. The primary tag is
+    the version of the morphe-patches source if it was used, else of the first
+    used source. The hash covers every used source version and the patch
+    selection, so it changes whenever one of them does and never otherwise.
+
+    Args:
+        app_version: Version of the unpatched app.
+        patch_versions: Version per source repo, for the repos actually used.
+        selection: Patch selection as returned by `selected_patches`.
+
+    Returns:
+        The combined version string, stable across runs and processes.
+
+    Example:
+        build_combined_version("1.0", {"own/src": "v2"}, selected_patches(app))
+        -> "1.0-v2-3fa9c1d2"
+    """
+    primary_tag = "v0.0.0"
+    if patch_versions:
+        morphe_repo = next(
+            (r for r in patch_versions if "morphe-patches" in r.lower()), None
+        )
+        primary_tag = patch_versions[morphe_repo or next(iter(patch_versions))]
+    digest_input = json.dumps(
+        {"patch_versions": patch_versions, "patches": selection}, sort_keys=True
+    )
+    digest = hashlib.sha256(digest_input.encode()).hexdigest()[:8]
+    return f"{app_version}-{primary_tag}-{digest}"
+
+
+def is_build_current(
+    last_build: dict,
+    app_version: str,
+    app: dict,
+    patch_versions: dict[str, str],
+    patched_dir: Path,
+) -> bool:
+    """Decide from the recorded inputs whether an app's APK needs no rebuild.
+
+    Args:
+        last_build: The app's `last_successful_build`, possibly empty.
+        app_version: Version of the unpatched app about to be built.
+        app: App entry from the config.
+        patch_versions: Current version per active source repo.
+        patched_dir: Directory holding the served APKs.
+
+    Returns:
+        True when the recorded build used the same app version, selection and
+        source versions, and its APK is still on disk.
+    """
+    filename = last_build.get("filename")
+    recorded_sources = last_build.get("patch_versions")
+    if not filename or not recorded_sources or not (patched_dir / filename).is_file():
+        return False
+    return (
+        last_build.get("app_version") == app_version
+        and last_build.get("patches") == selected_patches(app)
+        and all(patch_versions.get(r) == v for r, v in recorded_sources.items())
+    )
 
 
 def save_app_result(app_id: str, **fields: object) -> None:
@@ -937,6 +1006,11 @@ def run_pipeline(package_ids=None, quiet=False, scraper=None):
     patched_dir = DATA_DIR / "apks" / "patched"
     raw_dir.mkdir(parents=True, exist_ok=True)
     patched_dir.mkdir(parents=True, exist_ok=True)
+    # Same filesystem as patched_dir so the final move is an atomic rename.
+    # Anything left here was abandoned by a killed build (builds are serialised).
+    scratch_dir = DATA_DIR / "apks" / ".building"
+    shutil.rmtree(scratch_dir, ignore_errors=True)
+    scratch_dir.mkdir(parents=True)
 
     apps_to_build = config["apps"]
     if package_ids:
@@ -1007,41 +1081,46 @@ def run_pipeline(package_ids=None, quiet=False, scraper=None):
                 # ... patching logic ...
                 last_build = app.get("last_successful_build", {})
                 
-                # Helper for combined version string
-                # Simple combined version: app_version-patch_version (using first available patch tag)
-                patch_tag = "v0.0.0"
-                if current_patch_versions:
-                    # Prefer Morphe patches if available
-                    morphe_v = next((v for r, v in current_patch_versions.items() if "morphe-patches" in r.lower()), None)
-                    patch_tag = morphe_v if morphe_v else list(current_patch_versions.values())[0]
-                
-                combined_version = f"{target_version}-{patch_tag}"
-                patched_apk_path = patched_dir / f"{app['id']}-{combined_version}.apk"
-
-                if (not was_updated and
-                    patched_apk_path.exists() and 
-                    last_build.get("combined_version") == combined_version and
-                    last_build.get("patches") == selected_patches(app)):
-                    
-                    print(f"[\u2713] {app['name']} is already up to date (Version: {combined_version}), skipping patch.")
+                if not was_updated and is_build_current(
+                    last_build, target_version, app, current_patch_versions, patched_dir
+                ):
+                    recorded = last_build.get("combined_version")
+                    print(
+                        f"[\u2713] {app['name']} is already up to date "
+                        f"(Version: {recorded}), skipping patch."
+                    )
                     continue
 
-                # Clean up old patched versions for this app before building new one
-                for old_file in patched_dir.glob(f"{app['id']}-*.apk"):
-                    try:
-                        old_file.unlink()
-                    except:
-                        pass
+                # Patch into scratch space so the served APK stays untouched
+                # until the new one is complete.
+                with tempfile.TemporaryDirectory(dir=scratch_dir) as scratch:
+                    scratch_apk = Path(scratch) / f"{app['id']}.apk"
+                    success, used_repos = patch_app(
+                        app, config["tools"], raw_apk_path, scratch_apk, config
+                    )
+                    if success and not scratch_apk.is_file():
+                        print(f"[!] Patcher wrote no APK for {app['id']}")
+                        success = False
+                    if success:
+                        # Only save versions for the repos actually used for this app
+                        relevant_patch_versions = {
+                            repo: current_patch_versions.get(repo, "Unknown")
+                            for repo in used_repos
+                        }
+                        combined_version = build_combined_version(
+                            target_version,
+                            relevant_patch_versions,
+                            selected_patches(app),
+                        )
+                        patched_apk_path = (
+                            patched_dir / f"{app['id']}-{combined_version}.apk"
+                        )
+                        os.replace(scratch_apk, patched_apk_path)
 
-                success, used_repos = patch_app(app, config["tools"], raw_apk_path, patched_apk_path, config)
                 if success:
                     patched_apps.append(app["id"])
-                    
-                    # Only save versions for the repos actually used for this app
-                    relevant_patch_versions = {repo: current_patch_versions.get(repo, "Unknown") for repo in used_repos}
-                    
-                    # Update the app entry in our local config object
-                    app["last_successful_build"] = {
+
+                    build_record = {
                         "app_version": target_version,
                         "patch_versions": relevant_patch_versions,
                         "combined_version": combined_version,
@@ -1053,8 +1132,16 @@ def run_pipeline(package_ids=None, quiet=False, scraper=None):
                         app["id"],
                         status="Success",
                         error=None,
-                        last_successful_build=app["last_successful_build"],
+                        last_successful_build=build_record,
                     )
+                    # The new APK is in place and recorded; drop the older ones.
+                    for old_file in patched_dir.glob(f"{app['id']}-*.apk"):
+                        if old_file == patched_apk_path:
+                            continue
+                        try:
+                            old_file.unlink(missing_ok=True)
+                        except OSError as e:
+                            print(f"    [!] Could not remove {old_file.name}: {e}")
                 else:
                     save_app_result(
                         app["id"],

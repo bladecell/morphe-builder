@@ -796,6 +796,10 @@ def download_app_by_name(package_name: str):
     except Exception as e:
         print(f"[Download] Glob search failed: {e}")
 
+    raise HTTPException(
+        status_code=404, detail=f"No patched APK matches {package_name}"
+    )
+
 @app.get("/view/{package_id}", response_class=HTMLResponse)
 async def view_app(package_id: str, request: Request):
     """Serves a minimal HTML page for Obtainium to parse."""
