@@ -104,11 +104,13 @@ tasks, to get a thread without an event loop.
    2. Reuse `apks/raw/<pkg>-<v>.apk` if present, else `download_apk`.
    3. Compute `combined_version = <app version>-<patch tag>`, preferring the tag of a
       `morphe-patches` repo. Skip if tools were not updated, the output file exists and
-      `last_successful_build.combined_version` matches.
+      `last_successful_build.combined_version` matches and
+      `last_successful_build.patches` equals `selected_patches(app)`.
    4. Delete older patched APKs for the package, then `patch_app`.
    5. Write `last_successful_build`, `status` and `error` with `save_app_result`. The
       pipeline keeps working from the snapshot it loaded at the start, so an app edited
-      mid-build is built with its old patch selection.
+      mid-build is built with its old patch selection; the recorded selection then
+      differs from the config and the next build rebuilds it.
 4. Back in `_do_build`: send an Apprise notification, restore stdout, zero
    `UPDATE_CACHE["timestamp"]`.
 

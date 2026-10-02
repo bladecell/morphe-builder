@@ -379,3 +379,88 @@ def test_source_updates_writes_the_currently_installed_version(data_dir, monkeyp
     main.check_source_updates()
 
     assert read_config(data_dir)["sources"][0]["version"] == "v2"
+
+
+# --- patch selection triggers a rebuild ---------------------------------------
+
+
+@pytest.fixture
+def patch_calls(pipeline, monkeypatch):
+    """Like `pipeline`, but the fake patcher writes its output and counts calls."""
+    calls: list[str] = []
+
+    def fake_patch(app, tools, raw, out, config):
+        calls.append(app["id"])
+        Path(out).write_text("apk")
+        return True, ["own/src"]
+
+    monkeypatch.setattr(patcher, "patch_app", fake_patch)
+    return calls
+
+
+def edit_app(app_id: str, **fields: object) -> None:
+    def apply(config: dict) -> None:
+        next(a for a in config["apps"] if a["id"] == app_id).update(fields)
+
+    config_store.update_config(apply)
+
+
+def test_unchanged_selection_is_not_rebuilt(data_dir, patch_calls):
+    run_build(["com.a"])
+    run_build(["com.a"])
+
+    assert patch_calls == ["com.a"]
+
+
+def test_changed_selection_is_rebuilt(data_dir, patch_calls):
+    run_build(["com.a"])
+    edit_app("com.a", include_patches=["two", "one"])
+
+    run_build(["com.a"])
+
+    assert patch_calls == ["com.a", "com.a"]
+    app = {a["id"]: a for a in read_config(data_dir)["apps"]}["com.a"]
+    assert app["last_successful_build"]["patches"] == {
+        "include": ["one", "two"],
+        "exclude": [],
+    }
+
+
+def test_reordered_selection_is_not_rebuilt(data_dir, patch_calls):
+    edit_app("com.a", include_patches=["one", "two"])
+    run_build(["com.a"])
+    edit_app("com.a", include_patches=["two", "one"])
+
+    run_build(["com.a"])
+
+    assert patch_calls == ["com.a"]
+
+
+def test_build_without_recorded_selection_is_rebuilt(data_dir, patch_calls):
+    run_build(["com.a"])
+
+    def forget_selection(config: dict) -> None:
+        del config["apps"][0]["last_successful_build"]["patches"]
+
+    config_store.update_config(forget_selection)
+
+    run_build(["com.a"])
+
+    assert patch_calls == ["com.a", "com.a"]
+
+
+def test_updates_endpoint_flags_changed_selection(data_dir, patch_calls, monkeypatch):
+    def keep_only_pinned_a(config: dict) -> None:
+        config["apps"] = [a for a in config["apps"] if a["id"] == "com.a"]
+        config["apps"][0]["version"] = "1.0"
+
+    config_store.update_config(keep_only_pinned_a)
+    run_build(["com.a"])
+    fresh_cache = {"timestamp": 0, "results": None}
+    monkeypatch.setattr(main, "UPDATE_CACHE", dict(fresh_cache))
+    assert main.check_updates()["com.a"]["has_update"] is False
+
+    edit_app("com.a", include_patches=["two"])
+    monkeypatch.setattr(main, "UPDATE_CACHE", dict(fresh_cache))
+
+    assert main.check_updates()["com.a"]["has_update"] is True

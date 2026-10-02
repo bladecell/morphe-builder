@@ -173,3 +173,24 @@ where merging snapshots would only paper over them. It also ended the duplicate
   is built with its old patch selection, and the result is recorded on the edited
   entry.
 - An update that changes nothing no longer rewrites the file.
+
+## 2026-10-02: A build records the patch selection it used
+
+**Context.** The pipeline skipped an app whenever the app version and patch tag were
+unchanged and the APK existed, so editing an app's patches never produced a new APK.
+
+**Decision.** `last_successful_build.patches` stores the sorted include and exclude
+lists the build used. The pipeline skips only when they equal the current selection,
+and `/api/ui/updates` reports an update when they differ.
+
+**Why.** Comparing recorded state with wanted state also covers hand edits of
+`config.yaml` and edits made while a build is running, which a "dirty" flag set by
+the edit endpoint would miss.
+
+**Consequences.**
+
+- Builds made before this change have no recorded selection, so every app is rebuilt
+  once on the next build.
+- The version string served to Obtainium does not change when only the selection
+  changes, so Obtainium does not offer the rebuilt APK as an update. That belongs to
+  the open "Obtainium misses patch updates" item in plan step 4.

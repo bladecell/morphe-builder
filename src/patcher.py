@@ -319,6 +319,21 @@ def _apply_versions(config: dict, local_versions: dict) -> None:
         tools["apkeditor_version"] = local_versions[repos["apkeditor"]]
 
 
+def selected_patches(app: dict) -> dict[str, list[str]]:
+    """Return an app's patch selection in a form that compares regardless of order.
+
+    Args:
+        app: App entry from the config.
+
+    Returns:
+        Sorted included and excluded patch names under "include" and "exclude".
+    """
+    return {
+        "include": sorted(app.get("include_patches") or []),
+        "exclude": sorted(app.get("exclude_patches") or []),
+    }
+
+
 def save_app_result(app_id: str, **fields: object) -> None:
     """Merge pipeline-owned fields into one app of the current config.
 
@@ -1005,7 +1020,8 @@ def run_pipeline(package_ids=None, quiet=False, scraper=None):
 
                 if (not was_updated and
                     patched_apk_path.exists() and 
-                    last_build.get("combined_version") == combined_version):
+                    last_build.get("combined_version") == combined_version and
+                    last_build.get("patches") == selected_patches(app)):
                     
                     print(f"[\u2713] {app['name']} is already up to date (Version: {combined_version}), skipping patch.")
                     continue
@@ -1030,6 +1046,7 @@ def run_pipeline(package_ids=None, quiet=False, scraper=None):
                         "patch_versions": relevant_patch_versions,
                         "combined_version": combined_version,
                         "filename": patched_apk_path.name,
+                        "patches": selected_patches(app),
                         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
                     }
                     save_app_result(

@@ -21,6 +21,7 @@ from src.patcher import (
     check_dependencies,
     check_and_download_release,
     load_local_versions,
+    selected_patches,
     DATA_DIR,
     GitHubRateLimitError,
 )
@@ -204,6 +205,7 @@ def check_updates():
         # 1. Remote app version > current patched app version
         # 2. Remote patch versions != our last used patch versions for this app
         # 3. File doesn't exist
+        # 4. Patch selection differs from the one the last build used
         
         if latest_remote_app_str != "Unknown" and current_patched_app_str != "None":
             try:
@@ -227,7 +229,10 @@ def check_updates():
             
         if not file_exists:
             has_update = True
-            
+
+        if last_build and last_build.get("patches") != selected_patches(app_info):
+            has_update = True
+
         update_status[package_id] = {
             "has_update": has_update,
             "latest": latest_remote_app_str,
