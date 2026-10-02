@@ -18,35 +18,51 @@ Master plan for stabilising Morphe Builder. Comes out of the code review done on
 
 Decided 2026-10-01: retrofit first, then continue with step 2 under the same rules.
 
-- [ ] Add pytest, ruff and mypy as dev dependencies in `pyproject.toml`
-- [ ] Add a test output folder to `.gitignore` if tests write files
-- [ ] pytest tests for `_goto` recovery (page crash, browser closed, unrelated error
+Done 2026-10-02 by a subagent, reviewed and verified.
+
+- [x] Add pytest, ruff and mypy as dev dependencies in `pyproject.toml`
+- [x] Add a test output folder to `.gitignore` if tests write files (not needed:
+      tests use `tmp_path`)
+- [x] pytest tests for `_goto` recovery (page crash, browser closed, unrelated error
       re-raised), with the browser mocked
-- [ ] pytest tests for `latest_version` and `_extract_first_valid_row` against saved
+- [x] pytest tests for `latest_version` and `_extract_first_valid_row` against saved
       search-page HTML
-- [ ] pytest test that scraper logs follow a swapped `sys.stdout`
-- [ ] pytest test for the APKMirror fallback in `get_supported_versions`, scraper mocked
-- [ ] Type hints and docstrings (args, returns, raises) on the new and changed functions
-- [ ] Catch specific exceptions in the recovery path instead of `except Exception`
-- [ ] Lines within 88 characters; ruff and mypy clean on the changed code
+- [x] pytest test that scraper logs follow a swapped `sys.stdout`
+- [x] pytest test for the APKMirror fallback in `get_supported_versions`, scraper mocked
+- [x] Type hints and docstrings (args, returns, raises) on the new and changed functions
+- [x] Catch specific exceptions in the recovery path instead of `except Exception`
+- [x] Lines within 88 characters; ruff and mypy clean on the changed code
+
+Left for later, outside the retrofit scope (see step 6):
+
+- The rest of `src/apkmirror_downloader.py` still has 9 ruff findings (blind
+  `except Exception`, unsorted imports), 10 lines over 88 characters, and no type
+  hints or docstrings on `search`, `download_file` and the other older methods.
+- mypy reports 6 findings in total: missing stubs for `yaml`, `cloakbrowser` and
+  `apscheduler`, and one untyped variable in `src/main.py`.
 
 ## 2. Add-source flow
 
 All work from here on follows the project Python rules, with pytest tests.
 
-- [ ] Keep the inline sync so the patch list exists before the page re-renders
+- [x] Keep the inline sync so the patch list exists before the page re-renders
 - [x] Normalise and validate the repo input (`github.com/...`, `.git`, casing, extra path)
 - [x] Show add-source errors in the UI instead of ignoring the response
 - [x] Stay on the Discovery tab after adding a source
 - [x] Show real app names in Discovery instead of package IDs (`src/patcher.py:952`)
 - [x] Make "Sync Sources" bypass the 6-hour throttle
-- [ ] Remove or fix the "no releases" fallback that downloads only the JSON
-- [ ] Surface GitHub rate-limit failures
+- [x] Remove or fix the "no releases" fallback that downloads only the JSON (kept;
+      `add_source` reports the missing `.mpp`)
+- [x] Surface GitHub rate-limit failures (in add-source, the build log and after
+      "Sync Sources"; UI notice not yet checked in a browser)
 
 ## 3. Config safety
 
-- [ ] One locked, atomic load-modify-save for `config.yaml`
-- [ ] Stop `run_pipeline` overwriting UI changes made during a build (`src/patcher.py:789`)
+- [x] One locked, atomic load-modify-save for `config.yaml` (`src/config_store.py`)
+- [x] Stop `run_pipeline` overwriting UI changes made during a build
+
+Done 2026-10-02 by a subagent, independently reviewed. Not yet run
+against a live server or inside Docker.
 
 ## 4. Other bugs from the review
 
@@ -59,9 +75,33 @@ All work from here on follows the project Python rules, with pytest tests.
 - [ ] Version choice varies between runs: source special-cased by display name,
       set-order intersection (`src/patcher.py:359`)
 - [ ] App names with an apostrophe break the pipeline card (`index.html:756`)
+- [ ] Changing an app's patch selection does not trigger a rebuild: `run_pipeline`
+      skips when app version and patch tag are unchanged and the APK exists
+- [ ] Two `save_settings` calls at once can leave the scheduler on the older cron
+      schedule (`setup_cron_job` runs outside the config lock)
 
-## 5. Cleanup (only if asked)
+## 5. GitHub API token
+
+Added 2026-10-02 on request. Unauthenticated calls are limited to 60 per hour per IP;
+with a token the limit is 5,000 per hour.
+
+- [ ] Decide where the token comes from (to be settled when this step starts). The
+      project rules keep secrets in `.env` / environment variables only, which rules
+      out `config.yaml` and a plain Settings field. Options: `GITHUB_TOKEN` env var
+      only, or a Settings field that writes to `.env`.
+- [ ] Send the token as `Authorization: Bearer ...` on every `api.github.com` call
+      (`check_and_download_release`, `check_source_updates`)
+- [ ] Never log, print or return the token; show only "token set / not set" in the UI
+- [ ] Report a rejected token (401) clearly instead of as a generic sync failure
+- [ ] Document the variable in `README.md` and pass it through in the Docker setup
+- [ ] pytest tests: header sent when set, absent when unset, 401 reported
+
+## 6. Cleanup (only if asked)
 
 - [ ] `test.py` is the old scraper and imports an uninstalled package
 - [ ] `/api/ui/source_updates` is never called by the frontend
 - [ ] Dockerfile installs a second Chromium that is not used
+- [ ] Bring the older code in `src/` up to the Python rules (ruff, mypy stubs or
+      overrides, type hints, docstrings, bare `except:` sites)
+- [ ] `latest_version` takes the first non-alpha/beta row as-is; for YouTube that is
+      currently `21.39.522-SECONDARY`. Decide whether such variants should be skipped.

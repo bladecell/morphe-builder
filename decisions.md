@@ -90,3 +90,86 @@ the rest because builds overwriting UI changes can undo any other fix.
 A source is only written to `config.yaml` after its first sync succeeds. A bad repo returns
 HTTP 400/502 and leaves no half-added entry. Repo input is reduced to `owner/repo` by
 `normalize_repo`, and duplicates compare case-insensitively.
+
+## 2026-10-02: Manager and subagent working mode
+
+Claude plans, writes the brief, reviews the diff, re-runs the checks and keeps the
+plan files current. A subagent writes the code. One plan step per round, then stop
+and report. Changes stay uncommitted unless the user says otherwise.
+
+## 2026-10-02: Recovery catches Playwright's error class, plus a message check
+
+**Decision.** `_goto` catches `playwright.sync_api.Error` instead of `Exception`, and
+still checks the message for "crash" or "closed" before relaunching.
+
+**Why.** The project rules require specific exceptions. The message check has to stay
+because Playwright's `TimeoutError` is a subclass of the same class and must not
+trigger a relaunch. Re-verified live: killing the renderer and killing the browser
+process both recover.
+
+**Consequences.**
+
+- `playwright` is now a direct dependency in `pyproject.toml` (it was only pulled in
+  by cloakbrowser), kept at the locked 1.60.0.
+- Recovery would not fire if cloakbrowser were switched to its `patchright` backend,
+  whose errors are a different class. The project does not use that backend.
+
+## 2026-10-02: Rules applied to changed code only
+
+The retrofit covered the functions touched by the resilience work, not the whole
+file. Older code keeps its ruff and mypy findings until a dedicated cleanup (plan
+step 6), so diffs stay small and reviewable.
+
+`[tool.mypy]` sets `explicit_package_bases = true` because `src/` has no
+`__init__.py`; without it mypy refuses to run.
+
+## 2026-10-02: A GitHub rate limit is an exception, not a `False`
+
+**Context.** `check_and_download_release` returned `False` for both "up to date" and
+"failed", so a rate limit showed up as "missing the patches JSON" in add-source and
+not at all after "Sync Sources".
+
+**Decision.** It raises `GitHubRateLimitError` (403 or 429 with `retry-after` or
+`x-ratelimit-remaining: 0`). `update_tools` stops at the first one, saves what it
+already synced and re-raises. `add_source` answers HTTP 429, the build prints the
+message and carries on with the files on disk, and the background sync stores it in
+`SYNC_ERROR` for `/api/ui/tools_status`.
+
+**Why.** Only the rate limit needed telling apart, so the return value stays as it
+was for every other case. Stopping at the first hit avoids spending more requests
+that would fail the same way.
+
+**Trade-offs.**
+
+- A 403 or 429 without those headers is still reported as a generic failure.
+- If a tool jar was downloaded just before the limit hit, that build does not treat
+  the tools as updated, so apps already at the current version are not re-patched.
+- The reset time is shown in UTC.
+
+## 2026-10-02: One module owns `config.yaml`, with an in-process lock
+
+**Context.** Request handlers, scheduler jobs and the pipeline each loaded the config,
+changed it and wrote the whole thing back, unlocked and non-atomically. A build held
+its snapshot for minutes and overwrote anything the user changed meanwhile.
+
+**Decision.** `src/config_store.py` owns all config I/O. Changes go through
+`update_config(mutate)`: load the current file, apply a small in-memory change, replace
+the file atomically, all under one `threading.RLock`. The pipeline writes only the
+fields it owns (per-app `status`, `error`, `last_successful_build`; source and tool
+versions) and skips an app that no longer exists. Slow work (network, scraper, `java`)
+always happens outside the lock.
+
+**Why.** The app is one process, so a thread lock is enough and needs no dependency.
+Applying small changes to the current file removes the lost updates at the root,
+where merging snapshots would only paper over them. It also ended the duplicate
+`load_config` and the `patcher -> main` back-import.
+
+**Trade-offs.**
+
+- Safe only with a single uvicorn worker. More workers would need a file lock.
+- The atomic replace needs `/data` mounted as a directory. Mounting `config.yaml` as a
+  single file would make every save fail.
+- A build still works from the snapshot it loaded at the start: an app edited mid-build
+  is built with its old patch selection, and the result is recorded on the edited
+  entry.
+- An update that changes nothing no longer rewrites the file.

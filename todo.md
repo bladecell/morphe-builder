@@ -4,20 +4,48 @@ Current working checklist. The full list lives in `plan.md`.
 
 ## State
 
-- Scraper resilience changes are done and tested against live APKMirror.
-- Add-source flow items are done and covered by `tests/test_sources.py` (uncommitted UI
-  behaviour not yet checked in a browser).
-- Not yet tested: a full build (download + patch) and anything inside Docker.
+- Steps 1a, 2 and 3 are done and committed on branch `scraper-sources-config-safety`
+  (four commits on top of `main`, not merged, not pushed). 67 tests pass.
+- Scraper resilience changes were tested against live APKMirror.
+- Not yet checked in a browser: the add-source UI behaviour and the red "Sync failed"
+  notice.
+- Not yet tested: a full build (download + patch), config safety against a live
+  server, and anything inside Docker.
+- The venv was recreated on 2026-10-02; `uv run pytest` works again.
 
-## Next up: retrofit scraper changes to the Python rules (plan step 1a)
+## Next up: waiting for go-ahead
 
-- [ ] Dev dependencies: pytest, ruff, mypy
-- [ ] pytest tests for the scraper changes (recovery, version lookup, log routing,
-      patcher fallback)
-- [ ] Type hints, docstrings, specific exceptions, 88-char lines
-- [ ] ruff and mypy clean on the changed code
+- [ ] Step 4: other bugs from the review
+- [ ] Step 5: GitHub API token (where the token is stored gets decided when this
+      step starts)
 
-## Then: add-source flow
+## Done: config safety (plan step 3)
+
+- [x] Atomic writes of `config.yaml`
+- [x] Every read-modify-write serialised and applied to the current file contents
+- [x] `run_pipeline` writes only the fields it owns; UI changes made during a build
+      survive, and a deleted app is not brought back
+- [x] No lock held across network calls or patching
+- [x] Independent review; one stale-write path in `check_source_updates` fixed
+- [x] 19 tests in `tests/test_config_safety.py`; 67 pass in total
+
+## Done: GitHub rate-limit failures (rest of plan step 2)
+
+- [x] `add_source` returns HTTP 429 naming the rate limit and reset time
+- [x] Build log shows a rate-limit line; the build carries on with local files
+- [x] "Sync Sources" failure shown on the Discovery tab via `tools_status.sync_error`
+- [x] 12 tests in `tests/test_rate_limit.py`; 48 pass in total; ruff and mypy unchanged
+      from baseline
+
+## Done: retrofit scraper changes to the Python rules (plan step 1a)
+
+- [x] Dev dependencies: pytest, ruff, mypy; `playwright` as a direct dependency
+- [x] pytest tests for the scraper changes (recovery, version lookup, log routing,
+      patcher fallback): 15 tests in `tests/test_scraper.py`
+- [x] Type hints, docstrings, specific exceptions, 88-char lines
+- [x] ruff and mypy clean on the changed code
+
+## Done: add-source flow
 
 - [x] Normalise and validate the repo input in `add_source` (`src/main.py:454`)
 - [x] Return a clear error and show it in the UI (`index.html:289`)

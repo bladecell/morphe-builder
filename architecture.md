@@ -12,6 +12,7 @@ Morphe patch bundles, and serves the result to Obtainium.
 | Part | File | Role |
 |---|---|---|
 | Web app and API | `src/main.py` | FastAPI app, UI routes, Obtainium routes, scheduling, build orchestration |
+| Config store | `src/config_store.py` | All `config.yaml` I/O: lock, atomic write, `update_config` |
 | Pipeline | `src/patcher.py` | Tool and source sync, version selection, APK download, patching |
 | Scraper | `src/apkmirror_downloader.py` | Drives a stealth Chromium (cloakbrowser) through APKMirror |
 | UI | `src/templates/index.html` | Single page, Alpine.js + Tailwind from CDN, three tabs |
@@ -60,8 +61,12 @@ active sources and saves the selected patch names into `config.yaml`.
   manually triggered builds.
 - **Build log.** During a build `sys.stdout` is swapped for a tee that also writes
   `bin/build.log`; the UI polls that file.
-- **Config.** `config.yaml` is read and rewritten from request handlers, the scheduler
-  and the pipeline without locking. This is a known weakness (see `plan.md`, step 3).
+- **Config.** Every change to `config.yaml` goes through
+  `config_store.update_config`, which loads the current file, applies a small change
+  and replaces the file atomically under one in-process lock. The pipeline writes only
+  the fields it owns (per-app status and last build, source and tool versions), so UI
+  changes made during a build survive. The lock is per process: one uvicorn worker
+  only.
 
 ## Scraper
 
