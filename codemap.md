@@ -30,7 +30,8 @@ For design rationale see [architecture.md](architecture.md) and
 
 Not mapped:
 
-- `tests/`: pytest suite (`test_sources.py`, `test_scraper.py`, `fixtures/`).
+- `tests/`: pytest suite. `conftest.py` points `DATA_DIR` at a temp directory for
+  every test.
 - `test.py` (root): not a test. A standalone `rnet`-based APKMirror scraper that
   predates `src/apkmirror_downloader.py`. Nothing imports it and `rnet` is not a
   declared dependency.
@@ -74,5 +75,6 @@ gitignored.
 | `config.yaml` | Sources, apps, settings, last successful build per app |
 | `bin/` | Tool jars, per-source `.mpp` and `.json`, `versions.json`, `version_cache.json`, `metadata.json`, `build.log` |
 | `apks/raw/`, `apks/patched/`, `apks/icons/` | Downloaded APKs, patched APKs, app icons |
+| `apks/.building/` | Scratch output of the patch in progress |
 
 File-level ownership of each of these is in [src/codemap.md](src/codemap.md).

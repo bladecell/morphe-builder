@@ -30,7 +30,8 @@ Everything persistent lives under `DATA_DIR` (`/data` in Docker, project root ot
 | `config.yaml` | Sources, apps, settings, last successful build per app |
 | `bin/` | Tool jars, per-source `.mpp` and `.json`, `versions.json`, `version_cache.json`, `metadata.json`, `build.log` |
 | `apks/raw/` | Downloaded original APKs, `<package>-<version>.apk` |
-| `apks/patched/` | Patched APKs, `<package>-<version>-<patch tag>.apk` |
+| `apks/patched/` | Patched APKs, `<package>-<version>-<patch tag>-<hash>.apk` |
+| `apks/.building/` | Scratch output of the patch in progress; never served |
 | `apks/icons/` | App icons |
 
 ## Main flows
@@ -47,8 +48,14 @@ active sources and saves the selected patch names into `config.yaml`.
 1. Pick a version: pinned in config, else newest recommended by the patch sources,
    else newest release on APKMirror.
 2. Download the APK via the scraper, merging split bundles with APKEditor.
-3. Run morphe-cli with the selected patches and the `.mpp` bundles that provide them.
-4. Record the result in `config.yaml`.
+3. Skip the app if its recorded build used the same app version, patch selection and
+   source versions and the APK still exists.
+4. Run morphe-cli with the selected patches and the `.mpp` bundles that provide them,
+   writing to `apks/.building/`. Only a successful result is moved into
+   `apks/patched/`; a failed build leaves the previous APK served.
+5. Record the result in `config.yaml`. The version string Obtainium sees is
+   `<app version>-<patch tag>-<hash>`; the hash changes with the used source
+   versions and the patch selection.
 
 **Serve.** `/view/<id>` and `/api/apps/<id>` give Obtainium the version and a
 `/download/<file>` link.

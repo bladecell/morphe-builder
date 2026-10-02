@@ -67,18 +67,28 @@ against a live server or inside Docker.
 ## 4. Other bugs from the review
 
 - [ ] Patches hidden across sources: dedup is by name only (`src/main.py:355`)
-- [ ] Obtainium misses patch updates: version string always uses the Morphe tag
-      (`src/patcher.py:878`)
-- [ ] A failed patch leaves no APK: old file is deleted first (`src/patcher.py:892`)
-- [ ] `/download/...` returns `null` with 200 instead of 404 (`src/main.py:810`)
+- [x] Obtainium misses patch updates: version string always uses the Morphe tag
+      (now `<app version>-<patch tag>-<hash>` over the sources used and the selection)
+- [x] A failed patch leaves no APK: old file is deleted first (now patched in
+      `apks/.building/` and moved into place only on success)
+- [x] `/download/...` returns `null` with 200 instead of 404
 - [ ] Unsafe upload path, no auth, CORS `*` (`src/main.py:525`)
 - [ ] Version choice varies between runs: source special-cased by display name,
       set-order intersection (`src/patcher.py:359`)
 - [ ] App names with an apostrophe break the pipeline card (`index.html:756`)
-- [ ] Changing an app's patch selection does not trigger a rebuild: `run_pipeline`
+- [x] Changing an app's patch selection does not trigger a rebuild: `run_pipeline`
       skips when app version and patch tag are unchanged and the APK exists
+      (fixed 2026-10-02: the selection is recorded in `last_successful_build.patches`
+      and compared)
 - [ ] Two `save_settings` calls at once can leave the scheduler on the older cron
       schedule (`setup_cron_job` runs outside the config lock)
+- [ ] `/download/<package id>` matches by prefix, so `com.foo` can serve an APK of
+      `com.foobar`; ids containing `-` are cut at the first dash
+- [ ] `/api/apps/{id}` answers 200 with an error body for an unknown app, and apps
+      without `obtainium_id` raise `KeyError`
+
+None of the step 4 fixes has been run against real `morphe-cli`, a live server or
+Docker yet.
 
 ## 5. GitHub API token
 

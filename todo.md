@@ -4,20 +4,31 @@ Current working checklist. The full list lives in `plan.md`.
 
 ## State
 
-- Steps 1a, 2 and 3 are done and committed on branch `scraper-sources-config-safety`
-  (four commits on top of `main`, not merged, not pushed). 67 tests pass.
+- Steps 1a, 2 and 3 and four step 4 bugs are done, committed and merged into `main`
+  (not pushed). 100 tests pass.
 - Scraper resilience changes were tested against live APKMirror.
 - Not yet checked in a browser: the add-source UI behaviour and the red "Sync failed"
   notice.
-- Not yet tested: a full build (download + patch), config safety against a live
-  server, and anything inside Docker.
-- The venv was recreated on 2026-10-02; `uv run pytest` works again.
+- Not yet tested: a full build with real `morphe-cli`, the new build output handling
+  and config safety against a live server, and anything inside Docker.
+- First build after deploying: every app is rebuilt once and gets a new version string,
+  so Obtainium offers one update per app.
 
 ## Next up: waiting for go-ahead
 
-- [ ] Step 4: other bugs from the review
+- [ ] Rest of step 4: patch dedup by name, unsafe upload path / no auth / CORS,
+      version choice varying between runs, apostrophe in app names, cron race,
+      `/download` prefix matching, `/api/apps/{id}` error handling
 - [ ] Step 5: GitHub API token (where the token is stored gets decided when this
       step starts)
+
+## Done: step 4, Obtainium-facing build fixes
+
+- [x] Changing an app's patch selection triggers a rebuild
+- [x] Version string and filename change with the used sources and the selection
+- [x] A failed patch leaves the previous APK served
+- [x] `/download` answers 404 when nothing matches
+- [x] Tests can no longer touch the real data directory (`tests/conftest.py`)
 
 ## Done: config safety (plan step 3)
 

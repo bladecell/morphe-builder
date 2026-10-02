@@ -57,7 +57,8 @@ no locks. Only `config.yaml` is protected.
 | `bin/patches-<owner>-<repo>.{mpp,json}` | `patcher.check_and_download_release` | Patch bundle and patch list per source; paths from `get_source_paths` |
 | `bin/build.log` | `main.build_task` | Captured stdout of the current or last build |
 | `apks/raw/<pkg>-<version>.apk` | `download_apk`, `/api/ui/upload_apk` | Unpatched APKs |
-| `apks/patched/<pkg>-<version>-<patch tag>.apk` | `patch_app` | Output served to Obtainium |
+| `apks/patched/<pkg>-<version>-<patch tag>-<hash>.apk` | `run_pipeline` | Output served to Obtainium; moved in atomically from `apks/.building/` |
+| `apks/.building/` | `run_pipeline` | Scratch output of the patch in progress; wiped at the start of every build |
 | `apks/icons/<pkg>.png` | scraper `download_file` | Mounted at `/icons` |
 
 **Patch list schema tolerance.** Four functions parse the per-source patch JSON and all
@@ -102,11 +103,14 @@ tasks, to get a thread without an event loop.
    app (5 s pause between apps):
    1. `get_supported_versions(force_refresh=True)`.
    2. Reuse `apks/raw/<pkg>-<v>.apk` if present, else `download_apk`.
-   3. Compute `combined_version = <app version>-<patch tag>`, preferring the tag of a
-      `morphe-patches` repo. Skip if tools were not updated, the output file exists and
-      `last_successful_build.combined_version` matches and
-      `last_successful_build.patches` equals `selected_patches(app)`.
-   4. Delete older patched APKs for the package, then `patch_app`.
+   3. Skip if `is_build_current`: tools were not updated, the recorded APK exists, and
+      the recorded app version, `patches` (see `selected_patches`) and versions of the
+      sources used last time all still match.
+   4. `patch_app` into `apks/.building/<tmp>/<pkg>.apk`. On success name the result
+      with `build_combined_version` (`<app version>-<primary tag>-<8 hex>`, the hash
+      covering the used source versions and the selection), `os.replace` it into
+      `apks/patched/`, record it, then delete the app's older APKs. On failure
+      `apks/patched/` is untouched and the previous APK stays served.
    5. Write `last_successful_build`, `status` and `error` with `save_app_result`. The
       pipeline keeps working from the snapshot it loaded at the start, so an app edited
       mid-build is built with its old patch selection; the recorded selection then
@@ -191,7 +195,7 @@ returns `(True, [repos used])`.
 | Status | `GET /api/ui/updates`, `build_status`, `tools_status`, `logs`, `metadata` | `updates` blocks on the worker for unpinned apps; returns the stale cache while a build or refresh is active |
 | Build | `POST /api/ui/trigger_build` | `package_ids` null or empty means all apps |
 | Settings | `POST /api/ui/save_settings`, `POST /api/ui/test_notification` | Saving reschedules cron |
-| Obtainium | `GET /view/{package_id}`, `GET /api/apps`, `GET /api/apps/{obtainium_id}`, `GET /download/{package_name}` | `/view` accepts package id or `obtainium_id`. `/download` takes an exact filename or a package id and serves the newest match |
+| Obtainium | `GET /view/{package_id}`, `GET /api/apps`, `GET /api/apps/{obtainium_id}`, `GET /download/{package_name}` | `/view` accepts package id or `obtainium_id`. `/download` takes an exact filename or a package id and serves the newest match, or 404 |
 | Static | `/icons` | `DATA_DIR/apks/icons` |
 
 No authentication on any route; CORS allows all origins.
