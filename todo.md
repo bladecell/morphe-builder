@@ -4,23 +4,36 @@ Current working checklist. The full list lives in `plan.md`.
 
 ## State
 
-- Steps 1a, 2 and 3 and four step 4 bugs are done, committed and merged into `main`
-  (not pushed). 100 tests pass.
-- Scraper resilience changes were tested against live APKMirror.
-- Not yet checked in a browser: the add-source UI behaviour and the red "Sync failed"
-  notice.
-- Not yet tested: a full build with real `morphe-cli`, the new build output handling
-  and config safety against a live server, and anything inside Docker.
+- `main` holds steps 1a, 2 and 3 and ten step 4 fixes, all committed (not pushed).
+  129 tests pass.
+- Not yet checked in a browser: the add-source UI behaviour, the red "Sync failed"
+  notice and the pipeline card after the apostrophe fix.
+- Not yet tested: a full build with real `morphe-cli`, a live server, Docker (step 7).
 - First build after deploying: every app is rebuilt once and gets a new version string,
   so Obtainium offers one update per app.
 
-## Next up: waiting for go-ahead
+## Waiting on a decision
 
-- [ ] Rest of step 4: patch dedup by name, unsafe upload path / no auth / CORS,
-      version choice varying between runs, apostrophe in app names, cron race,
-      `/download` prefix matching, `/api/apps/{id}` error handling
+- [ ] Authentication and CORS: which mechanism, and do the Obtainium endpoints stay
+      open?
+- [ ] Same-named patches in two sources: store the source with each selected patch?
+
+## Next up
+
+- [ ] Step 4 leftovers: base source by display name in the frontend, package id
+      validation in `add_app`, silent drop of a corrupt patch JSON
+- [ ] Step 7: Docker end-to-end test (blocked: no container runtime on this machine)
 - [ ] Step 5: GitHub API token (where the token is stored gets decided when this
       step starts)
+
+## Done: rest of step 4
+
+- [x] Upload path validated
+- [x] Version choice is the same on every run; base source recognised by repo
+- [x] App names with an apostrophe no longer break the pipeline card
+- [x] Cron schedule follows the saved settings under concurrent saves
+- [x] `/download/<package id>` matches that package only
+- [x] `/api/apps/{id}` answers 404 for an unknown app; missing `obtainium_id` handled
 
 ## Done: step 4, Obtainium-facing build fixes
 
