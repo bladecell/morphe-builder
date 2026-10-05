@@ -116,6 +116,17 @@ against a live server or inside Docker.
       name with different case falls to the base bundle and is lost
 - [x] The CLI exits 0 and writes an APK when no patch was applied or a selected
       name is unknown; `patch_app` reports that as a successful build
+- [x] The first release asset ending in `.json` is taken as the patch list. A
+      source that ships other JSON files (found 2026-10-05 with
+      `SysAdminDoc/Hushfacebook`: an SBOM, a tooling file and a receipt) gets the
+      wrong file, counts as unreadable and is "repaired" with the same file. The
+      real list is `patches-list.json` in the repo at the release tag. Fix: accept
+      only an asset that is a patch list, otherwise use the repo fallback
+      (fixed 2026-10-05; the repair path was run against the real source in a
+      scratch folder: 60 patches loaded)
+- [ ] The download progress bar shows more than 100% for compressed responses
+- [ ] After that fix: check that the Hushfacebook patches build against Facebook
+      with real `morphe-cli`
 - [ ] A source without releases reports "updated" on every sync, so its apps are
       rebuilt on every build (older than this work; found in review 2026-10-05,
       read from the code, not run)
@@ -150,12 +161,17 @@ with a token the limit is 5,000 per hour.
 
 - [x] Decide where the token comes from (decided 2026-10-05: a Settings field that
       writes to `.env`; never `config.yaml`)
-- [ ] Send the token as `Authorization: Bearer ...` on every `api.github.com` call
-      (`check_and_download_release`, `check_source_updates`)
-- [ ] Never log, print or return the token; show only "token set / not set" in the UI
-- [ ] Report a rejected token (401) clearly instead of as a generic sync failure
+- [x] Send the token as `Authorization: Bearer ...` on the `api.github.com` call
+      (`check_and_download_release`, the only one left; done 2026-10-05, not
+      reviewed, no real token used)
+- [x] Never log, print or return the token (global redaction, 2026-10-05)
+- [x] Report a rejected token (401) clearly instead of as a generic sync failure
+- [x] pytest tests: header sent when set, absent when unset, 401 reported
+- [ ] Independent code and security review of the token step
+- [ ] Show only "token set / not set" in the UI (secrets step 4, section 8)
+- [ ] Show the token-permissions warning in the UI
 - [ ] Document the variable in `README.md` and pass it through in the Docker setup
-- [ ] pytest tests: header sent when set, absent when unset, 401 reported
+- [ ] Try a real token end to end
 
 ## 6. Cleanup (only if asked)
 
@@ -188,3 +204,53 @@ changes of steps 3 and 4 are so far covered only by tests with the patcher faked
 - [ ] A failing patch leaves the previous APK served
 - [ ] Add the result to Obtainium and confirm it offers the rebuilt APK as an update
 - [ ] Watch `docker stats` during the build to pin down the page crash (step 1)
+
+## 8. Secrets, request guards, cloakbrowser key
+
+Approved 2026-10-05. Decisions and reasons are in `decisions.md`. Work is on
+branch `secrets-guards-worker`.
+
+- [x] Step 0: cloakbrowser 0.5.12, keyless
+- [x] Step 1: secret store (`DATA_DIR/.env`) and `/api/ui/secrets` routes; CORS
+      removed
+- [x] Step 1b to 1e: Host allow-list, Origin check, no framing, sync as POST, one
+      updates refresh at a time, `/api/ui/source_updates` deleted
+- [x] Step 2: scraper worker recovery, shutdown, degraded updates, browser state
+- [x] Before step 3: repo name rule, environment secrets validated and removed
+      from the process environment, global redaction, Java without the secrets
+- [x] Step 3: GitHub token (section 5)
+- [ ] Review everything listed as not reviewed in `todo.md`
+- [ ] Pin or vendor Tailwind and Alpine before a secret can be typed into the page
+- [ ] Step 4: Settings UI for both secrets, with the `environment_invalid` state
+      and the token-permissions warning
+- [ ] Step 5: licence key passed to the browser explicitly; keyless fallback when
+      rejected; relaunch on a key change; security review afterwards
+- [ ] Step 6: docs (README: `ALLOWED_HOSTS`, proxy must pass `Host`, both
+      variables, zero-permission token; codemaps; `architecture.md`)
+- [ ] Step 7: upload keeps the metadata when the icon is missing
+
+## 9. Per-source patch selection
+
+Approved 2026-10-05; design in `decisions.md`.
+
+- [x] Step 1: each bundle followed by its own selectors; forced rebuild; empty
+      builds fail; names match ignoring case
+- [ ] Step 2: backend reads both selection shapes; bare names resolved at build
+      time; a source is a provider only when its own patches are selected; narrow
+      "one unreadable list blocks every app"
+- [ ] Step 3: API and dialog per source, tabs keyed by repo, mapping saved and
+      validated
+
+## 10. Verify with real tools
+
+Nothing on the branch has been run against a real browser, real `morphe-cli`, a
+live server, a reverse proxy or Docker. Exceptions: a first sync and a repair of
+the real `SysAdminDoc/Hushfacebook` and `MorpheApp/morphe-patches` sources, run
+without a token in a scratch folder.
+
+- [ ] Server starts from the branch; browser launches on cloakbrowser 0.5.12
+- [ ] Build Facebook with the Hushfacebook patches
+- [ ] A multi-source build applies the selection of every bundle
+- [ ] Browser check of the UI changes
+- [ ] Reverse proxy with the full origin in `ALLOWED_HOSTS`
+- [ ] Docker end-to-end test (section 7)

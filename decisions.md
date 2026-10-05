@@ -434,3 +434,24 @@ Decided by the user. These replace two points of the section above.
   through, and the docs will say so.
 - `GET /api/ui/source_updates` is deleted. The page never called it, and it made
   GitHub calls any site could trigger.
+
+## 2026-10-05: Before the GitHub token is sent
+
+Decided by the user after the security review of the hardening step.
+
+- Both secret variables are read into memory at startup and removed from the
+  process environment. Reason: cloakbrowser reads the licence key from the
+  environment by itself, without validation, and the browser and its child
+  processes inherited both secrets. The key is passed to the browser explicitly
+  in the licence key step; until then a key from the environment does not
+  reach the browser.
+- An environment value that is invalid is never used and does not fall back to
+  the value saved in Settings. The status says so by name.
+- A token that has permissions is used, with a warning in the status. Reason: a
+  patch bundle can read the token from disk, so its scope is the only control.
+- An invalid source already in `config.yaml` is shown as a sync error, not only
+  logged.
+- A source whose local files would collide with another source is refused.
+  Files are not renamed.
+- Redaction is global: one hook on all log records and one `print` replacement
+  in `patcher.py`. It matches exact values only.

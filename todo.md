@@ -2,112 +2,112 @@
 
 Current working checklist. The full list lives in `plan.md`.
 
-## State
+## State (end of session 2026-10-05)
 
-- `main` holds steps 1a, 2 and 3 and ten step 4 fixes, all committed (not pushed).
-  Everything since (step 4 leftovers, build fixes, cloakbrowser bump, secret
-  store, request guards) is in the working tree, uncommitted. 709 tests pass.
-- Not yet checked in a browser: the add-source UI behaviour, the red "Sync failed"
-  notice and the pipeline card after the apostrophe fix.
-- Not yet tested: a full build with real `morphe-cli`, a live server, Docker (step 7).
-- First build after deploying: every app is rebuilt once and gets a new version string,
-  so Obtainium offers one update per app.
+- Branch `secrets-guards-worker`, not merged into `main`, not pushed. `main` is
+  at `482a3c9`.
+- Gates on the branch: 1006 tests pass plus one expected failure (about 7 s);
+  `ruff check src tests` 65; `mypy src tests` 10.
+- Nothing on the branch has been run against a real browser, real `morphe-cli`,
+  a live server, a reverse proxy or Docker. One exception: the patch-list repair
+  was run against the real `SysAdminDoc/Hushfacebook` source in a scratch folder.
+- Run the server: `uv run uvicorn src.main:app --host 0.0.0.0 --port 8000`.
+  Set `DATA_DIR` to keep data out of the repo. A hostname other than `localhost`
+  or an IP needs `ALLOWED_HOSTS`.
+- First build after deploying: every app is rebuilt once and gets a new version
+  string, so Obtainium offers one update per app.
 
-## Decided 2026-10-05
+## Next session, in this order
 
-- [x] Authentication: none, the whole app stays open
-- [x] Same-named patches in two sources: store the source with each selected patch
-- [x] GitHub token: a Settings field that writes to `.env`
-- [x] Bump cloakbrowser to 0.5.x
-- [x] Docker end-to-end test: later
+- [ ] Merge `secrets-guards-worker` into `main`? (owner's call)
+- [ ] Review the work that has had no independent review, before anything else:
+      - GitHub token step (code review and security review): `github_api_get`,
+        401 handling, redirect and `.netrc` rules, URL rules for tags and assets
+      - Fix round on the redaction (log hook, remembered values, environment
+        secrets removed at startup, bad and colliding sources)
+      - Patch-list selection from release assets
+      - Review fixes to the scraper worker and to the request guards (step 1e)
+- [ ] Decide: show "permissions cannot be verified" for a fine-grained token?
+      (only classic tokens expose their scopes; fine-grained tokens get no
+      warning today)
+- [ ] Decide: release tags containing `/` are refused as a ref for the raw
+      patch-list URL; keep or allow?
+- [ ] The token-permissions warning is in `tools_status` only
+      (`github_token_warning`); the UI does not show it yet (do with step 4)
+- [ ] Try a real token: authenticated sync, the rate limit rising to 5,000, a
+      wrong token giving the fixed 401 text on the Discovery tab
+- [ ] Before the Settings UI: pin Tailwind and Alpine with integrity hashes or
+      vendor them. They load from a CDN with a floating version and would see a
+      secret as it is typed
+- [ ] Secrets step 4: Settings UI for both secrets. Must show the
+      `environment_invalid` state and the token-permissions warning
+- [ ] Secrets step 5: licence key passed to the browser explicitly
+      (`launch(license_key=...)` only when set); keyless fallback when the key is
+      rejected; relaunch at a task boundary on a key change. Until this lands a
+      key from the environment does not reach the browser. Then a security review
+- [ ] Secrets step 6: docs. README: `ALLOWED_HOSTS` (bare name = Host only, full
+      origin = Origin too), the proxy must pass `Host` through, both secret
+      variables, a token with no permissions. `src/codemap.md` and
+      `src/templates/codemap.md` still name the deleted `source_updates` route.
+      `architecture.md`: secret store, request guards, worker states
+- [ ] Secrets step 7: upload keeps the metadata when the icon is missing
+- [ ] Per-source patch selection step 2: backend reads both selection shapes;
+      bare names resolved at build time; a source is a provider only when its own
+      patches are selected. Narrow "one unreadable list blocks every app" here
+- [ ] Per-source patch selection step 3: API and dialog show same-named patches
+      per source, tabs keyed by repo, the mapping is saved and validated
 
-## Done 2026-10-05: step 4 leftovers (uncommitted)
+## To verify with real tools (nothing here is done)
 
-- [x] `is_base` flag from the backend; the dialog no longer compares the name
-- [x] `add_app` answers 400 for an invalid package id; the UI shows the error
-- [x] Unreadable patch list: error on the app's card, 502 in the dialog, atomic
-      downloads
-- [x] Independent review, one blocking bug fixed (non-text patch name), re-reviewed
-- [x] 190 tests pass; ruff 84 (was 88) and mypy 10 (unchanged) on `src tests`
-- [ ] Browser check: base-source defaults with a renamed Morphe source, the alert on
-      an invalid id, both dialogs on an error, the error line on the card
+- [ ] Start the server from the branch; Java and Scraper pills; browser launches
+      on cloakbrowser 0.5.12
+- [ ] Sync Sources repairs the Hushfacebook list in the real data folder
+- [ ] Build Facebook with the Hushfacebook patches and real `morphe-cli`
+- [ ] A multi-source build applies the selection of every bundle
+- [ ] Browser check of the UI: add-source errors, "Sync failed" notice, card
+      error line, Save Settings error, the Scraper pill states, both dialogs
+- [ ] Behind a reverse proxy: writes work with the full origin in `ALLOWED_HOSTS`
+- [ ] Docker end-to-end test (plan step 7; no container runtime on this machine)
 
-## Approved 2026-10-05: per-source patch selection (after the leftovers)
+## Open, not scheduled
 
-- [x] Checked with the released jar (v1.18.1, real runs): `-e` and `-d` apply to
-      the bundle they follow. Today's command binds them all to the last bundle,
-      so multi-source builds miss the patches of earlier bundles, exit 0
-- [x] Step 1: build the command with each bundle followed by its own selectors
-      (uncommitted; reviewed, verdict fit; 205 tests pass; not run with the real
-      CLI). Affected apps are not rebuilt automatically
-- [x] Step 1b (decided 2026-10-05): forced one-off rebuild through the version
-      hash; fail a build with no applied patch or an unknown name; match names
-      ignoring case (uncommitted; reviewed, review fixes applied and checked by
-      breaking the code in a scratch copy, not re-reviewed; not run with the
-      real CLI)
-- [ ] Step 2: backend reads both selection shapes; bare names resolved at build
-      time; a source is a provider only when its own patches are selected
-- [ ] Step 3: API and dialog show same-named patches per source, tabs keyed by
-      repo, the mapping is saved and validated
+- [ ] A browser task that hangs forever blocks the worker (no watchdog)
+- [ ] A failed in-task browser relaunch does not trigger worker recovery
+- [ ] Buttons other than Save Settings ignore a refused write
+- [ ] A scrape that fails is retried on every updates refresh
+- [ ] A source without releases reports "updated" on every sync
+- [ ] Download progress bar shows more than 100% for compressed responses
+- [ ] Redaction matches exact values only (encoded, truncated or split forms
+      pass); prints outside `patcher.py` and outside a build are not redacted
+- [ ] A patch bundle can read `DATA_DIR/.env` as the same user (accepted)
+- [ ] A valid patch list over 256 KiB under an unusual asset name, with no list
+      in the repo, is not found
+- [ ] cloakbrowser licence key format is unknown; the store's value pattern may
+      refuse it
+- [ ] Container page crash: cause not found (memory limit, `docker stats`)
 
-## Approved 2026-10-05: secrets, GitHub token, cloakbrowser (one step per round)
+## Done 2026-10-05 (details in `plan.md` and `decisions.md`)
 
-- [x] Step 0: bump cloakbrowser to 0.5.12, keyless; auto-update off in Docker
-      (uncommitted; 200 tests pass; no browser launched, no Docker build)
-- [x] Step 1: secret store and routes; `.env` ignored; CORS same-origin
-      (uncommitted; security review found no leak path)
-- [x] Step 1b (decided 2026-10-05): refuse state-changing requests from another
-      origin; discovery sync as POST; Host allow-list with `ALLOWED_HOSTS`
-      (uncommitted; 593 tests pass; security review: fit after three fixes)
-- [x] Step 1c (decided 2026-10-05): `ALLOWED_HOSTS` names accepted as Origin;
-      no framing; loopback server URL trusted only for a loopback Host; Save
-      Settings shows errors (uncommitted; 644 tests pass; not yet re-reviewed;
-      not run with a browser or a proxy)
-- [x] Step 1d: one refresh at a time on `/api/ui/updates` and
-      `/api/ui/source_updates`; no config write in `source_updates`
-      (uncommitted; 654 tests pass; security review: fit after two decisions)
-- [x] Step 1e (decided 2026-10-05): full origins in `ALLOWED_HOSTS`; delete
-      `/api/ui/source_updates`; cache stamp at completion; framing headers on
-      500s; proxy rule pinned by a test (uncommitted; 677 tests pass; not
-      re-reviewed; not run with a browser or a proxy)
-- [ ] Step 6 also: `src/codemap.md` and `src/templates/codemap.md` still name
-      the deleted `source_updates` route
-- [ ] Later: buttons other than Save Settings ignore a refused write; a failed
-      scrape is retried on every refresh
-- [ ] Before step 3: `REPO_PATTERN`, validate secrets from the environment,
-      redact exception text, Java process without the secrets in its environment
-- [ ] Before step 4: pin Tailwind and Alpine with integrity hashes or vendor them
-- [x] Step 2: scraper worker recovers from a failed launch; browser closed on
-      shutdown; updates route degrades; browser state in tools status
-      (uncommitted; code review fixes applied, not re-reviewed; 709 tests pass;
-      tests can no longer launch a browser or open a network connection; not
-      run with a real browser or server)
-- [ ] Open: a browser task that hangs forever blocks the worker (watchdog not
-      built); a failed in-task relaunch does not trigger worker recovery
-- [ ] Step 3: GitHub token on `api.github.com` calls; 401 reported
-- [ ] Step 4: Settings UI for both secrets
-- [ ] Step 5: licence key passed to the browser; keyless fallback; relaunch on
-      a key change
-- [ ] Step 6: docs
-- [ ] Step 7: upload keeps the metadata when the icon is missing
-
-## Waiting on a decision
-
-- [x] cloakbrowser (decided 2026-10-05): bump to 0.5.x, keyless by default; use a
-      free licence key when one is set in Settings. Design under investigation
-      together with the GitHub token, since both are secrets set in the UI
-- [x] A sync re-downloads a patch list that fails to load (done 2026-10-05,
-      uncommitted; reviewed twice, verdict fit; 198 tests pass)
-- [x] The pipeline card shows the error text of any app in "Error" status (decided
-      2026-10-05: keep)
-- [ ] Keep one unreadable list blocking every unpinned app until the selection
-      names its source? (current behaviour, pinned by a test)
-- [ ] Commit the step 4 leftovers?
-
-## Next up
-
-- [ ] Step 5: GitHub API token
-- [ ] Step 7: Docker end-to-end test (deferred; no container runtime on this machine)
+- [x] Step 4 leftovers: `is_base` flag, `add_app` validation, unreadable patch
+      list handling, atomic downloads
+- [x] Build fixes: selectors follow their bundle, one forced rebuild, empty
+      builds fail, names match ignoring case
+- [x] cloakbrowser 0.5.12, keyless; auto-update off in Docker
+- [x] Secret store and routes; CORS removed
+- [x] Request guards: Host allow-list, Origin check, no framing, sync as POST,
+      `/api/ui/source_updates` deleted, one updates refresh at a time
+- [x] Scraper worker recovery, browser closed on shutdown, updates route
+      degrades, browser state in tools status
+- [x] Tests cannot write to the real data folder, launch a browser or open a
+      network connection
+- [x] Before the token: repo name rule, environment secrets validated and
+      removed from the process environment, global redaction, Java processes
+      without the secrets, bad and colliding sources reported
+- [x] Wrong `.json` release asset taken as the patch list (Hushfacebook)
+- [x] Secrets step 3: GitHub token sent to `api.github.com` only, header only;
+      401 reported, no retry; rate-limit hint; scope warning for classic tokens;
+      tag and asset URLs validated (not reviewed; no real token used; a first
+      sync of both real sources without a token was run in a scratch folder)
 
 ## Done: rest of step 4
 
@@ -160,12 +160,6 @@ Current working checklist. The full list lives in `plan.md`.
 - [x] Use the `name` field from the patch JSON for app names (`src/patcher.py:952`)
 - [x] Make "Sync Sources" force a check despite the 6-hour throttle
 - [x] "No releases" fallback: kept; add_source now reports the missing .mpp or JSON
-
-## Waiting on a decision
-
-- [ ] Bump cloakbrowser to 0.5.x?
-- [ ] Fix the scraper worker staying dead after a failed launch at startup?
-- [ ] Container memory limit and `docker stats` output, to pin down the crash cause
 
 ## Done
 
