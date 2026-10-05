@@ -29,7 +29,6 @@
                 metadata: {{ metadata | tojson | safe }},
                 settings: {{ (config.settings if config.settings else {"server_url": "", "cron_schedule": "0 0 * * *", "notification_urls": []}) | tojson | safe }},
                 updates: {},
-                sourceUpdates: {},
                 lastRun: '{{ metadata.last_run if metadata and metadata.last_run else "Never" }}',
                 selectedApps: [],
                 showModal: false,
@@ -52,18 +51,18 @@
                 activePatchTab: '',
 
                 togglePatch(patch) {
-                    // Only one source other than 'Morphe Patches' can be selected at a time
-                    if (patch.selected && patch.source !== 'Morphe Patches') {
+                    // Only one source other than the base source can be selected at a time
+                    if (patch.selected && !patch.is_base) {
                         const hasConflictingSource = this.availablePatches.some(p => 
                             p.selected && 
-                            p.source !== 'Morphe Patches' && 
+                            !p.is_base &&
                             p.source !== patch.source
                         );
                         
                         if (hasConflictingSource) {
                             // Deselect all patches from other non-Morphe sources
                             this.availablePatches.forEach(p => {
-                                if (p.source !== 'Morphe Patches' && p.source !== patch.source) {
+                                if (!p.is_base && p.source !== patch.source) {
                                     p.selected = false;
                                 }
                             });
@@ -72,6 +71,7 @@
                 },
 
                 diagnostics: {java: true, scraper: true},
+                browser: {state: 'starting', error: null, retry_in: null},
 
                 init() {
                     try {
@@ -123,6 +123,7 @@
                         const wasUpdating = this.toolsUpdating;
                         this.toolsUpdating = data.updating;
                         this.syncError = data.sync_error;
+                        if (data.browser) this.browser = data.browser;
                         if (data.diagnostics) {
                             this.diagnostics = data.diagnostics;
                         }
@@ -200,17 +201,24 @@
                     
                     try {
                         const response = await fetch(`/api/ui/patches/${app.pkg}`);
+                        if (!response.ok) {
+                            const error = await response.json().catch(() => ({}));
+                            this.showModal = false;
+                            alert(error.detail || 'Failed to load the patches.');
+                            return;
+                        }
                         const data = await response.json();
                         
                         // Initialize tabs first to know what we have
                         this.patchTabs = [...new Set(data.map(p => p.source))].sort();
-                        const thirdPartySources = this.patchTabs.filter(s => s !== 'Morphe Patches');
+                        const baseSources = new Set(data.filter(p => p.is_base).map(p => p.source));
+                        const thirdPartySources = this.patchTabs.filter(s => !baseSources.has(s));
                         const leadSource = thirdPartySources.length > 0 ? thirdPartySources[0] : null;
 
                         this.availablePatches = data.map(p => {
                             let selected = p.enabled_by_default;
                             // POLICY: On first load, only allow defaults from Morphe AND the first third-party source
-                            if (selected && p.source !== 'Morphe Patches' && p.source !== leadSource) {
+                            if (selected && !p.is_base && p.source !== leadSource) {
                                 selected = false;
                             }
                             return {...p, selected: selected};
@@ -235,6 +243,12 @@
 
                     try {
                         const response = await fetch(`/api/ui/patches/${app.id}`);
+                        if (!response.ok) {
+                            const error = await response.json().catch(() => ({}));
+                            this.showModal = false;
+                            alert(error.detail || 'Failed to load the patches.');
+                            return;
+                        }
                         const data = await response.json();
                         const currentPatches = app.include_patches || [];
                         
@@ -257,15 +271,25 @@
 
                 async saveApp() {
                     const include_patches = this.availablePatches.filter(p => p.selected).map(p => p.name);
-                    await fetch('/api/ui/add_app', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({
-                            package_id: this.selectedPkg,
-                            name: this.selectedAppName,
-                            include_patches: include_patches
-                        })
-                    });
+                    try {
+                        const response = await fetch('/api/ui/add_app', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({
+                                package_id: this.selectedPkg,
+                                name: this.selectedAppName,
+                                include_patches: include_patches
+                            })
+                        });
+                        if (!response.ok) {
+                            const error = await response.json().catch(() => ({}));
+                            alert(error.detail || 'Saving the app failed.');
+                            return;
+                        }
+                    } catch (e) {
+                        alert('Saving the app failed: ' + e);
+                        return;
+                    }
                     location.reload();
                 },
 
@@ -346,7 +370,9 @@
                 async refreshDiscovery(sync = false) {
                     this.refreshing = true;
                     try {
-                        const response = await fetch(`/api/ui/discovery${sync ? '?sync=true' : ''}`);
+                        const response = await (sync
+                            ? fetch('/api/ui/discovery/sync', {method: 'POST'})
+                            : fetch('/api/ui/discovery'));
                         const data = await response.json();
                         this.discoveryApps = data.apps;
                         if (sync) {
@@ -363,12 +389,22 @@
                     // Ensure notification_urls exists
                     if (!this.settings.notification_urls) this.settings.notification_urls = [];
                     
-                    await fetch('/api/ui/save_settings', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify(this.settings)
-                    });
-                    alert('Settings saved!');
+                    try {
+                        const response = await fetch('/api/ui/save_settings', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify(this.settings)
+                        });
+                        if (!response.ok) {
+                            let detail = 'HTTP ' + response.status;
+                            try { detail = (await response.json()).detail || detail; } catch (e) {}
+                            alert('Settings not saved: ' + detail);
+                            return;
+                        }
+                        alert('Settings saved!');
+                    } catch (e) {
+                        alert('Settings not saved: ' + e);
+                    }
                 },
 
                 async testNotifications() {
@@ -580,9 +616,9 @@
                     <span class="text-[9px] font-black uppercase tracking-widest" :class="diagnostics.java ? 'text-emerald-500' : 'text-red-500'">Java</span>
                     <div class="w-1.5 h-1.5 rounded-full" :class="diagnostics.java ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.4)]' : 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.4)]'"></div>
                 </div>
-                <div class="flex items-center gap-2 px-3 py-1 bg-slate-900 rounded-full border border-slate-800">
-                    <span class="text-[9px] font-black uppercase tracking-widest" :class="diagnostics.scraper ? 'text-emerald-500' : 'text-red-500'">Scraper</span>
-                    <div class="w-1.5 h-1.5 rounded-full" :class="diagnostics.scraper ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.4)]' : 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.4)]'"></div>
+                <div :title="browser.error ? `Browser ${browser.state}: ${browser.error}` : `Browser ${browser.state}`" class="flex items-center gap-2 px-3 py-1 bg-slate-900 rounded-full border border-slate-800">
+                    <span class="text-[9px] font-black uppercase tracking-widest" :class="(diagnostics.scraper && browser.state === 'available') ? 'text-emerald-500' : 'text-red-500'">Scraper</span>
+                    <div class="w-1.5 h-1.5 rounded-full" :class="(diagnostics.scraper && browser.state === 'available') ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.4)]' : 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.4)]'"></div>
                 </div>
             </div>
         </div>
@@ -614,12 +650,9 @@
                                 <div class="flex flex-col">
                                     <div class="flex items-center gap-2">
                                         <span class="text-xs font-bold text-white" x-text="source.name"></span>
-                                        <template x-if="sourceUpdates[source.repo] && sourceUpdates[source.repo].has_update">
-                                            <span class="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" title="Update Available"></span>
-                                        </template>
                                     </div>
                                     <div class="flex items-center gap-2 mt-0.5">
-                                        <span class="text-[9px] font-mono text-slate-500" x-text="sourceUpdates[source.repo]?.current || source.version || 'Unknown'"></span>
+                                        <span class="text-[9px] font-mono text-slate-500" x-text="source.version || 'Unknown'"></span>
                                         <span class="text-[9px] text-slate-700">•</span>
                                         <span class="text-[9px] text-slate-600 truncate max-w-[100px]" x-text="source.repo"></span>
                                     </div>
@@ -817,6 +850,9 @@
                                         </div>
                                         <span class="text-[10px] font-bold text-emerald-500 uppercase tracking-tighter">Up to date</span>
                                     </div>
+                                </template>
+                                <template x-if="updates['{{ app.id }}'] && updates['{{ app.id }}'].status === 'Error' && updates['{{ app.id }}'].error">
+                                    <p class="mt-2 text-[10px] text-red-400 break-words" x-text="updates['{{ app.id }}'].error"></p>
                                 </template>
                             </div>
                         </div>

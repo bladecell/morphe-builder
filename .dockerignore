@@ -5,3 +5,7 @@ apks/
 __pycache__/
 *.log
 .python-version
+.env*
+..env-*
+**/.env*
+**/..env-*

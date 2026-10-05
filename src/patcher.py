@@ -8,12 +8,16 @@ import tempfile
 import hashlib
 import shutil
 import sys
+import logging
+from collections import deque
 from datetime import UTC, datetime
 from pathlib import Path
 from packaging import version
 from src.apkmirror_downloader import ApkMirror_Downloader, Arch, Dpi, BundleType
 
 from src.config_store import DATA_DIR, load_config, update_config
+
+logger = logging.getLogger(__name__)
 VERSIONS_FILE = DATA_DIR / "bin" / "versions.json"
 VERSION_CACHE_FILE = DATA_DIR / "bin" / "version_cache.json"
 
@@ -55,8 +59,40 @@ def _safe_version_sort_key(v):
         return (0, version.parse("0"), str(v))
 
 
-def download_with_progress(url, path):
-    """Downloads a file with a text-based progress bar printed to stdout."""
+def download_with_progress(url: str, path: Path) -> None:
+    """Download a file with a progress bar, replacing `path` only when complete.
+
+    The data goes to `<path>.part` first, so an interrupted download never leaves
+    a truncated file at `path` and an existing file there stays intact.
+
+    Args:
+        url: URL to fetch.
+        path: Final location of the file.
+
+    Raises:
+        requests.exceptions.RequestException: The request or the transfer failed.
+        OSError: The file could not be written or moved into place.
+    """
+    partial_path = Path(f"{path}.part")
+    try:
+        _stream_to_file(url, partial_path)
+        os.replace(partial_path, path)
+    finally:
+        partial_path.unlink(missing_ok=True)
+
+
+def _stream_to_file(url: str, path: Path) -> None:
+    """Download a file to `path` with a text progress bar printed to stdout.
+
+    Args:
+        url: URL to fetch.
+        path: File to write. It is overwritten, and left partial if the transfer
+            fails; `download_with_progress` handles that.
+
+    Raises:
+        requests.exceptions.RequestException: The request or the transfer failed.
+        OSError: The file could not be written.
+    """
     response = requests.get(url, stream=True, timeout=30)
     response.raise_for_status()
     total_size = int(response.headers.get("content-length", 0))
@@ -148,8 +184,44 @@ def _try_download_json_candidates(repo_path, ref, output_path):
     return False
 
 
+STILL_UNREADABLE = (
+    "    [!] The patch list of {repo} is still unreadable after downloading it "
+    "again. Not retrying until the next sync."
+)
+
+
+def _patch_list_is_unreadable(repo_path: str, extensions_to_paths: dict) -> bool:
+    """Tell whether a source's patch list is on disk but fails to load.
+
+    Args:
+        repo_path: GitHub 'owner/repo'.
+        extensions_to_paths: Map of wanted asset extension to local file path.
+
+    Returns:
+        True when the `.json` entry is the source's own patch list file, the file
+        is present and `load_patch_list` rejects it. A missing file, a sync
+        without a `.json` entry or a `.json` at another path is not "unreadable".
+    """
+    json_path = extensions_to_paths.get(".json")
+    if json_path is None or json_path != get_source_paths(repo_path)[".json"]:
+        return False
+    if not json_path.exists():
+        return False
+    try:
+        load_patch_list(repo_path)
+    except PatchListError:
+        return True
+    return False
+
+
 def check_and_download_release(repo_path, extensions_to_paths, force=False):
     """Syncs a repo's latest release assets into the given local paths.
+
+    A patch list that is on disk but fails to load is downloaded again, even at
+    an unchanged tag and inside the update-check throttle, and only that file is
+    fetched. One attempt is made per call; a list that is still unreadable
+    afterwards is reported on stdout, nothing is recorded, and the next sync
+    tries again.
 
     Args:
         repo_path: GitHub 'owner/repo'.
@@ -157,8 +229,9 @@ def check_and_download_release(repo_path, extensions_to_paths, force=False):
         force: Skip the update-check throttle.
 
     Returns:
-        True only when something was downloaded; False on failure or when
-        already up to date.
+        True when files were downloaded and the tag was recorded; False on
+        failure, when already up to date, or when a repair fetched a list that
+        is still unreadable.
 
     Raises:
         GitHubRateLimitError: GitHub refused the release lookup due to a rate limit.
@@ -169,12 +242,14 @@ def check_and_download_release(repo_path, extensions_to_paths, force=False):
 
     # Safeguard: Check if any required files are missing locally
     missing_files = [path for path in extensions_to_paths.values() if not path.exists()]
+    list_unreadable = _patch_list_is_unreadable(repo_path, extensions_to_paths)
 
     # Throttle: skip the API call entirely if we checked recently and have files
     last_check = local_versions.get(f"{repo_path}#last_check")
     if (
         not force
         and not missing_files
+        and not list_unreadable
         and last_check
         and (time.time() - last_check) < UPDATE_CHECK_INTERVAL
     ):
@@ -191,6 +266,11 @@ def check_and_download_release(repo_path, extensions_to_paths, force=False):
                     if _try_download_json_candidates(
                         repo_path, branch, extensions_to_paths[".json"]
                     ):
+                        if list_unreadable and _patch_list_is_unreadable(
+                            repo_path, extensions_to_paths
+                        ):
+                            print(STILL_UNREADABLE.format(repo=repo_path))
+                            return False
                         local_versions[repo_path] = "default-branch"
                         local_versions[f"{repo_path}#last_check"] = time.time()
                         save_local_versions(local_versions)
@@ -207,16 +287,21 @@ def check_and_download_release(repo_path, extensions_to_paths, force=False):
 
     latest_tag = release_data.get("tag_name")
 
-    if current_tag == latest_tag and not missing_files:
+    if current_tag == latest_tag and not missing_files and not list_unreadable:
         print(f"[\u2713] {repo_path} is up to date ({current_tag}).")
         local_versions[f"{repo_path}#last_check"] = time.time()
         save_local_versions(local_versions)
         return False
 
+    repair_only = False
     if current_tag != latest_tag:
         print(f"[!] Update found for {repo_path}: {current_tag} -> {latest_tag}")
-    else:
+    elif missing_files:
         print(f"[!] Missing local files for {repo_path}. Re-downloading...")
+    else:
+        print(f"[!] The patch list of {repo_path} is unreadable. Re-downloading it...")
+        extensions_to_paths = {".json": extensions_to_paths[".json"]}
+        repair_only = True
 
     all_found = True
     for ext, output_path in extensions_to_paths.items():
@@ -245,13 +330,20 @@ def check_and_download_release(repo_path, extensions_to_paths, force=False):
             print(f"    [!] Could not obtain {ext} for {repo_path}. Not marking as synced.")
             all_found = False
 
-    if all_found:
-        local_versions[repo_path] = latest_tag
-        local_versions[f"{repo_path}#last_check"] = time.time()
-        save_local_versions(local_versions)
-        return True
+    if not all_found:
+        return False
 
-    return False
+    still_unreadable = _patch_list_is_unreadable(repo_path, extensions_to_paths)
+    if still_unreadable:
+        print(STILL_UNREADABLE.format(repo=repo_path))
+        if repair_only:
+            # Nothing usable arrived: callers must not treat this as an update.
+            return False
+
+    local_versions[repo_path] = latest_tag
+    local_versions[f"{repo_path}#last_check"] = time.time()
+    save_local_versions(local_versions)
+    return True
 
 
 REPO_PATTERN = re.compile(r"^[\w.-]+/[\w.-]+$")
@@ -335,6 +427,14 @@ def selected_patches(app: dict) -> dict[str, list[str]]:
     }
 
 
+# Version of how patched APKs are put together. It is part of the version hash
+# and of every build record. Bump it whenever a change to `patch_app` means
+# APKs built before it are wrong or incomplete (for example selectors that
+# were grouped under the wrong bundle): every app is then rebuilt once and
+# gets a new version string. Do not bump it for ordinary changes.
+BUILD_LAYOUT = 2
+
+
 def build_combined_version(
     app_version: str,
     patch_versions: dict[str, str],
@@ -361,10 +461,15 @@ def build_combined_version(
     """
     primary_tag = "v0.0.0"
     if patch_versions:
-        morphe_repo = next((r for r in patch_versions if _is_base_repo(r)), None)
+        morphe_repo = next((r for r in patch_versions if is_base_repo(r)), None)
         primary_tag = patch_versions[morphe_repo or next(iter(patch_versions))]
     digest_input = json.dumps(
-        {"patch_versions": patch_versions, "patches": selection}, sort_keys=True
+        {
+            "layout": BUILD_LAYOUT,
+            "patch_versions": patch_versions,
+            "patches": selection,
+        },
+        sort_keys=True,
     )
     digest = hashlib.sha256(digest_input.encode()).hexdigest()[:8]
     return f"{app_version}-{primary_tag}-{digest}"
@@ -387,15 +492,17 @@ def is_build_current(
         patched_dir: Directory holding the served APKs.
 
     Returns:
-        True when the recorded build used the same app version, selection and
-        source versions, and its APK is still on disk.
+        True when the recorded build used the current build layout, the same app
+        version, selection and source versions, and its APK is still on disk.
+        Records written before `BUILD_LAYOUT` existed never match.
     """
     filename = last_build.get("filename")
     recorded_sources = last_build.get("patch_versions")
     if not filename or not recorded_sources or not (patched_dir / filename).is_file():
         return False
     return (
-        last_build.get("app_version") == app_version
+        last_build.get("build_layout") == BUILD_LAYOUT
+        and last_build.get("app_version") == app_version
         and last_build.get("patches") == selected_patches(app)
         and all(patch_versions.get(r) == v for r, v in recorded_sources.items())
     )
@@ -494,7 +601,7 @@ def update_tools(config, quiet=False, force=False):
 BASE_PATCHES_REPO = "MorpheApp/morphe-patches"
 
 
-def _is_base_repo(repo: str) -> bool:
+def is_base_repo(repo: str) -> bool:
     """Tells whether a source repo is the Morphe base patch bundle.
 
     Compared by repo (case-insensitive, exact) rather than display name, so a
@@ -510,13 +617,93 @@ def _is_base_repo(repo: str) -> bool:
     return repo.lower() == BASE_PATCHES_REPO.lower()
 
 
-def get_supported_versions(package_name, config, scraper=None, force_refresh=False, quiet=False):
+class VersionLookupError(Exception):
+    """The APKMirror lookup of the newest version failed (not "found nothing")."""
+
+
+class PatchListError(Exception):
+    """A source's patch list file exists but cannot be used.
+
+    Attributes:
+        repo: The source repo whose patch list is unreadable.
+    """
+
+    def __init__(self, repo: str, reason: str) -> None:
+        self.repo = repo
+        file_name = get_source_paths(repo)[".json"].name
+        super().__init__(
+            f"The patch list of {repo} is unreadable ({reason}). Sync the sources "
+            "to download it again. If this message stays, the list the source "
+            f"publishes is broken, or the app cannot read or replace {file_name} in "
+            "its bin folder (check the file's permissions and owner)."
+        )
+
+
+def load_patch_list(repo: str) -> list[dict[str, object]]:
+    """Read and validate the downloaded patch list of one source.
+
+    Accepts a top-level list of patches or an object with a `patches` list. Callers
+    check that the file exists first; a missing file means "not synced yet".
+
+    Args:
+        repo: Source repo, `owner/repo`.
+
+    Returns:
+        The patches, every one a JSON object.
+
+    Raises:
+        PatchListError: The file cannot be read, is not valid JSON, or does not
+            have the shape of a patch list.
+    """
+    json_path = get_source_paths(repo)[".json"]
+    try:
+        with open(json_path, "r", encoding="utf-8") as file:
+            data = json.load(file)
+    except json.JSONDecodeError as error:
+        raise PatchListError(repo, f"invalid JSON: {error}") from error
+    except UnicodeDecodeError as error:
+        raise PatchListError(repo, "not valid UTF-8 text") from error
+    except OSError as error:
+        raise PatchListError(repo, error.strerror or type(error).__name__) from error
+    patches = data.get("patches") if isinstance(data, dict) else data
+    if not isinstance(patches, list):
+        raise PatchListError(repo, "no list of patches")
+    if not all(isinstance(patch, dict) for patch in patches):
+        raise PatchListError(repo, "an entry is not a JSON object")
+    if not all(isinstance(p.get("name"), str | None) for p in patches):
+        raise PatchListError(repo, "a patch name is not text")
+    return patches
+
+
+def get_supported_versions(
+    package_name,
+    config,
+    scraper=None,
+    force_refresh=False,
+    quiet=False,
+    raise_lookup_errors=False,
+):
     """
     Fetches available versions for a package with prioritization:
     1. Pinned version in config (Return immediately)
     2. Newest Recommended version from patch sources (Filtered by selected patches)
     3. Newest version from APKMirror search (Fallback)
-    Returns: (final_list, None, None)
+
+    Args:
+        package_name: Android package id.
+        config: The loaded config (apps and sources).
+        scraper: Optional injected scraper; one is created and closed if None.
+        force_refresh: Ignore the cached APKMirror version.
+        quiet: Suppress progress output.
+        raise_lookup_errors: Raise `VersionLookupError` when the APKMirror lookup
+            fails instead of falling back to the cached versions.
+
+    Returns:
+        (final_list, None, None)
+
+    Raises:
+        PatchListError: An active source's patch list exists but cannot be read.
+        VersionLookupError: The lookup failed and `raise_lookup_errors` is set.
     """
     app_config = next((a for a in config.get("apps", []) if a["id"] == package_name), {})
     pinned_v = app_config.get("version")
@@ -538,44 +725,46 @@ def get_supported_versions(package_name, config, scraper=None, force_refresh=Fal
         json_path = get_source_paths(source["repo"])[".json"]
         if not json_path.exists(): continue
         
-        try:
-            with open(json_path, "r") as f:
-                data = json.load(f)
-                patches = data.get("patches", []) if isinstance(data, dict) else data
-                
-                s_versions = set()
-                has_selected_patch = False
-                
-                for p in patches:
-                    p_name = p.get("name")
-                    if p_name in selected_patches:
-                        has_selected_patch = True
-                    
-                    compat = p.get("compatiblePackages")
-                    if not compat: continue
-                    
-                    v_list = []
-                    if isinstance(compat, dict) and package_name in compat:
-                        v_list = compat[package_name]
-                    elif isinstance(compat, list):
-                        for pkg in compat:
-                            if not isinstance(pkg, dict): continue
-                            pkg_id = pkg.get("packageName") or pkg.get("name")
-                            if pkg_id != package_name: continue
-                            v_list = pkg.get("versions") or []
-                            targets = pkg.get("targets")
-                            if targets and isinstance(targets, list):
-                                v_list = [t.get("version") for t in targets if t.get("version") and not t.get("isExperimental", False)]
-                    
-                    if v_list:
-                        if isinstance(v_list, list): s_versions.update([str(v).strip() for v in v_list if v])
-                        elif isinstance(v_list, str): s_versions.add(v_list.strip())
-                
-                if s_versions:
-                    versions_by_source[repo] = s_versions
-                    if has_selected_patch or _is_base_repo(repo):
-                        providing_sources.append(repo)
-        except: pass
+        patches = load_patch_list(repo)
+
+        s_versions = set()
+        has_selected_patch = False
+        
+        for p in patches:
+            p_name = p.get("name")
+            if p_name in selected_patches:
+                has_selected_patch = True
+            
+            compat = p.get("compatiblePackages")
+            if not compat: continue
+            
+            v_list = []
+            if isinstance(compat, dict) and package_name in compat:
+                v_list = compat[package_name]
+            elif isinstance(compat, list):
+                for pkg in compat:
+                    if not isinstance(pkg, dict): continue
+                    pkg_id = pkg.get("packageName") or pkg.get("name")
+                    if pkg_id != package_name: continue
+                    v_list = pkg.get("versions") or []
+                    targets = pkg.get("targets")
+                    if targets and isinstance(targets, list):
+                        v_list = [
+                            t.get("version")
+                            for t in targets
+                            if isinstance(t, dict)
+                            and t.get("version")
+                            and not t.get("isExperimental", False)
+                        ]
+            
+            if v_list:
+                if isinstance(v_list, list): s_versions.update([str(v).strip() for v in v_list if v])
+                elif isinstance(v_list, str): s_versions.add(v_list.strip())
+        
+        if s_versions:
+            versions_by_source[repo] = s_versions
+            if has_selected_patch or is_base_repo(repo):
+                providing_sources.append(repo)
     
     # If patches are selected, only use versions supported by the providers
     recommended_set = set()
@@ -594,7 +783,7 @@ def get_supported_versions(package_name, config, scraper=None, force_refresh=Fal
                         recommended_set = intersect
                     else:
                         # If no intersection, fallback to the provider that isn't Morphe
-                        if not _is_base_repo(repo):
+                        if not is_base_repo(repo):
                             recommended_set = versions_by_source[repo]
     else:
         # No patches selected yet (Discovery mode), merge all
@@ -633,6 +822,8 @@ def get_supported_versions(package_name, config, scraper=None, force_refresh=Fal
             return versions, None, None
         return cached_remote, None, None
     except Exception as e:
+        if raise_lookup_errors:
+            raise VersionLookupError(f"{type(e).__name__}: {e}") from e
         if not quiet: print(f"    [!] Scraper failed for {package_name}: {e}")
         return cached_remote, None, None
     finally:
@@ -831,77 +1022,170 @@ def download_apk(package_name, target_version, final_path, tools_config, config,
             scraper.close()
 
 
-def patch_app(app_config, tools_config, input_apk, output_apk, config):
-    cli = DATA_DIR / tools_config["cli_jar"]
-    java_bin = config.get("settings", {}).get("java_path", "java")
-    
-    # Get the real package ID from the input APK to verify compatibility
-    input_package_id = app_config["id"]
+# One line of morphe-cli output that reports an applied patch, as printed by
+# v1.18.1: "Applied: <name>", optionally after a log level prefix.
+APPLIED_LINE = re.compile(r"^\s*(?:(?:INFO|FINE)\s*:\s*)?Applied:\s+\S")
+
+# How many trailing CLI output lines a zero-applied error quotes.
+CLI_TAIL_LINES = 5
+
+
+class PatchSelectionError(Exception):
+    """Raised when a build cannot apply the patches the user selected.
+
+    Covers a selected name that no bundle in the command carries and a CLI run
+    that applied nothing. The CLI exits 0 in both cases, so the app checks.
+    """
+
+
+def _read_package_id(java_bin: str, input_apk: Path | str, fallback: str) -> str:
+    """Read the real package id of an APK with APKEditor.
+
+    Args:
+        java_bin: Java binary to run.
+        input_apk: Path of the APK to inspect.
+        fallback: Id returned when the APK cannot be inspected.
+
+    Returns:
+        The package id from `APKEditor.jar info`, or `fallback`.
+    """
+    apkeditor_path = DATA_DIR / "bin" / "APKEditor.jar"
     try:
-        apkeditor_path = DATA_DIR / "bin" / "APKEditor.jar"
         info_result = subprocess.run(
             [java_bin, "-jar", str(apkeditor_path), "info", "-i", str(input_apk)],
-            capture_output=True, text=True
+            capture_output=True,
+            text=True,
+            check=False,
         )
-        for line in info_result.stdout.splitlines():
-            if "package=" in line:
-                input_package_id = line.split("=", 1)[1].strip().strip('"')
-                break
-    except:
-        pass
+    except (OSError, subprocess.SubprocessError) as e:
+        logger.error("Could not read package id of %s: %s", input_apk, e)
+        return fallback
+    for line in info_result.stdout.splitlines():
+        if "package=" in line:
+            return line.split("=", 1)[1].strip().strip('"')
+    return fallback
 
-    # Map each selected patch name to a SINGLE source
-    included_mpps = {} # path -> repo
-    selected_patches = set(app_config.get("include_patches", []))
-    remaining_patches = selected_patches.copy()
+
+def _compatible_patch_names(repo: str, package_id: str) -> set[str]:
+    """List the patch names of one source that apply to a package.
+
+    Args:
+        repo: Source repo, `owner/repo`; its patch list must be on disk.
+        package_id: Package the APK really has.
+
+    Returns:
+        Casefolded names of the patches compatible with the package.
+
+    Raises:
+        PatchListError: The patch list is missing, unreadable or malformed.
+    """
+    if not get_source_paths(repo)[".json"].exists():
+        raise PatchListError(repo, "the file is missing")
+    names: set[str] = set()
+    for patch in load_patch_list(repo):
+        comp = patch.get("compatiblePackages")
+        if isinstance(comp, dict):
+            is_compat = package_id in comp
+        elif isinstance(comp, list):
+            is_compat = any(
+                isinstance(cp, dict)
+                and package_id in (cp.get("packageName"), cp.get("name"))
+                for cp in comp
+            )
+        else:
+            is_compat = not comp
+        name = patch.get("name")
+        if is_compat and isinstance(name, str) and name:
+            names.add(name.casefold())
+    return names
+
+
+def patch_app(
+    app_config: dict,
+    tools_config: dict,
+    input_apk: Path | str,
+    output_apk: Path | str,
+    config: dict,
+) -> tuple[bool, list[str]]:
+    """Run morphe-cli on an APK with each selector grouped under its bundle.
+
+    Names are matched to bundles ignoring case; the command carries the
+    spelling from the saved selection. Before the CLI runs, every selected
+    name must be carried by a bundle that fits the APK. The CLI exits 0 even
+    when it applies nothing, so its output is read afterwards: with a
+    selection, at least one line of the form "Applied: <name>" (optionally
+    after an INFO or FINE level prefix) is required.
+
+    Args:
+        app_config: App entry with id, name, include_patches, exclude_patches.
+        tools_config: Tool paths; must hold cli_jar.
+        input_apk: Path of the APK to patch.
+        output_apk: Path of the patched APK to write.
+        config: Full config with sources and settings.
+
+    Returns:
+        Tuple of success flag and the repos of the bundles that were used.
+
+    Raises:
+        PatchSelectionError: If a selected name is unknown to every bundle, or
+            patches were selected and the CLI applied none. The output APK is
+            removed in the second case. The message then quotes the last CLI
+            output lines.
+        PatchListError: If the patch list of a source that is needed, or of the
+            base bundle used as fallback, is missing or unreadable.
+    """
+    cli = DATA_DIR / tools_config["cli_jar"]
+    java_bin = config.get("settings", {}).get("java_path", "java")
+    app_name = app_config["name"]
+    input_package_id = _read_package_id(java_bin, input_apk, app_config["id"])
+
+    included_mpps: dict[str, str] = {}  # path -> repo
+    bundle_includes: dict[str, list[str]] = {}  # path -> names enabled via -e
+    bundle_carries: dict[str, set[str]] = {}  # path -> casefolded names it carries
+    include_order = list(dict.fromkeys(app_config.get("include_patches") or []))
+    remaining = {name.casefold() for name in include_order}
 
     for source in config.get("sources", []):
-        if not source.get("active", True) or not remaining_patches:
+        if not source.get("active", True) or not remaining:
             continue
-        
-        mpp_path = get_source_paths(source["repo"])[".mpp"]
-        json_path = get_source_paths(source["repo"])[".json"]
-        
-        if not mpp_path.exists() or not json_path.exists():
+        paths = get_source_paths(source["repo"])
+        if not paths[".mpp"].exists():
             continue
+        carries = _compatible_patch_names(source["repo"], input_package_id)
+        found = remaining & carries
+        if not found:
+            continue
+        key = str(paths[".mpp"])
+        included_mpps[key] = source["repo"]
+        bundle_includes.setdefault(key, []).extend(
+            n for n in include_order if n.casefold() in found
+        )
+        bundle_carries[key] = carries
+        remaining -= found
 
-        try:
-            with open(json_path, "r") as f:
-                source_data = json.load(f)
-                patches_list = source_data.get("patches", []) if isinstance(source_data, dict) else source_data
-                
-                compatible_source_patches = set()
-                for p in patches_list:
-                    p_name = p.get("name")
-                    comp = p.get("compatiblePackages")
-                    is_compat = False
-                    if isinstance(comp, dict) and input_package_id in comp: 
-                        is_compat = True
-                    elif isinstance(comp, list):
-                        for cp in comp:
-                            if not isinstance(cp, dict): continue
-                            if cp.get("packageName") == input_package_id or cp.get("name") == input_package_id:
-                                is_compat = True
-                                break
-                    elif not comp: 
-                        is_compat = True
-                        
-                    if is_compat: 
-                        compatible_source_patches.add(p_name)
-                
-                found_in_this_source = remaining_patches.intersection(compatible_source_patches)
-                if found_in_this_source:
-                    included_mpps[str(mpp_path)] = source["repo"]
-                    remaining_patches -= found_in_this_source
-        except Exception as e:
-            print(f"    [!] Error analyzing source {source['name']}: {e}")
-            pass
-
-    if remaining_patches or not included_mpps:
-        default_repo = BASE_PATCHES_REPO
-        default_mpp = get_source_paths(default_repo)[".mpp"]
+    if remaining or not included_mpps:
+        default_mpp = get_source_paths(BASE_PATCHES_REPO)[".mpp"]
         if default_mpp.exists():
-            included_mpps[str(default_mpp)] = default_repo
+            default_carries = (
+                _compatible_patch_names(BASE_PATCHES_REPO, input_package_id)
+                if remaining
+                else set()
+            )
+            found = remaining & default_carries
+            key = str(default_mpp)
+            included_mpps[key] = BASE_PATCHES_REPO
+            bundle_includes.setdefault(key, []).extend(
+                n for n in include_order if n.casefold() in found
+            )
+            bundle_carries.setdefault(key, set()).update(default_carries)
+            remaining -= found
+
+    if remaining:
+        missing = [n for n in include_order if n.casefold() in remaining]
+        raise PatchSelectionError(
+            f"{app_name}: no patch bundle carries {', '.join(missing)} "
+            f"for {input_package_id}"
+        )
 
     command = [
         java_bin,
@@ -915,45 +1199,85 @@ def patch_app(app_config, tools_config, input_apk, output_apk, config):
         str(output_apk),
     ]
 
-    for mpp_path in included_mpps.keys():
+    # morphe-cli binds -e/-d to the --patches bundle they follow, so each
+    # bundle is emitted with only the selectors for names that live in it.
+    bundle_excludes: dict[str, list[str]] = {path: [] for path in included_mpps}
+    for name in app_config.get("exclude_patches") or []:
+        folded = name.casefold()
+        for path in included_mpps:
+            if folded in bundle_carries[path]:
+                bundle_excludes[path].append(name)
+                break
+
+    for mpp_path in included_mpps:
         command.extend(["--patches", mpp_path])
+        for name in bundle_includes.get(mpp_path, []):
+            command.extend(["-e", name])
+        for name in bundle_excludes[mpp_path]:
+            command.extend(["-d", name])
 
-    for p in app_config.get("include_patches", []):
-        command.extend(["-e", p])
-    for p in app_config.get("exclude_patches", []):
-        command.extend(["-d", p])
-
-    print(f"Running patcher for {app_config['name']}...")
+    print(f"Running patcher for {app_name}...")
     has_severe_error = False
+    applied_count = 0
+    recent_lines: deque[str] = deque(maxlen=CLI_TAIL_LINES)
+    output_path = Path(output_apk)
     try:
         process = subprocess.Popen(
-            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
         )
-        while True:
-            line = process.stdout.readline()
-            if not line and process.poll() is not None:
-                break
-            if line:
+        assert process.stdout is not None
+        try:
+            while True:
+                line = process.stdout.readline()
+                if not line and process.poll() is not None:
+                    break
+                if not line:
+                    continue
                 if "SEVERE:" in line:
                     has_severe_error = True
+                if APPLIED_LINE.match(line):
+                    applied_count += 1
+                if line.strip():
+                    recent_lines.append(line.strip())
                 sys.stdout.write(line)
                 sys.stdout.flush()
+        except BaseException:
+            # A failed read must not leave the child running or a partial APK.
+            process.kill()
+            process.wait()
+            output_path.unlink(missing_ok=True)
+            raise
 
         if process.returncode != 0:
             raise subprocess.CalledProcessError(process.returncode, command)
 
         if has_severe_error:
-            print(f"\n[!] {app_config['name']} patched with some SEVERE errors. Deleting failed APK.")
-            if Path(output_apk).exists():
-                Path(output_apk).unlink(missing_ok=True)
+            print(
+                f"\n[!] {app_name} patched with some SEVERE errors. "
+                "Deleting failed APK."
+            )
+            output_path.unlink(missing_ok=True)
             return False, []
 
-        print(f"Successfully patched {app_config['name']} to {output_apk}")
+        if include_order and applied_count == 0:
+            output_path.unlink(missing_ok=True)
+            raise PatchSelectionError(
+                f"{app_name}: no patch was applied although "
+                f"{len(include_order)} were selected. Last CLI output: "
+                f"{' | '.join(recent_lines) or '(none)'}"
+            )
+
+        print(f"Successfully patched {app_name} to {output_apk}")
         return True, list(included_mpps.values())
-    except Exception as e:
-        print(f"Patching failed for {app_config['name']}: {e}")
-        if Path(output_apk).exists():
-            Path(output_apk).unlink(missing_ok=True)
+    except PatchSelectionError:
+        raise
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"Patching failed for {app_name}: {e}")
+        output_path.unlink(missing_ok=True)
         return False, []
 
 
@@ -1112,9 +1436,14 @@ def run_pipeline(package_ids=None, quiet=False, scraper=None):
                 # until the new one is complete.
                 with tempfile.TemporaryDirectory(dir=scratch_dir) as scratch:
                     scratch_apk = Path(scratch) / f"{app['id']}.apk"
-                    success, used_repos = patch_app(
-                        app, config["tools"], raw_apk_path, scratch_apk, config
-                    )
+                    try:
+                        success, used_repos = patch_app(
+                            app, config["tools"], raw_apk_path, scratch_apk, config
+                        )
+                    except PatchSelectionError as e:
+                        print(f"[x] {e}")
+                        save_app_result(app["id"], status="Failed", error=str(e))
+                        continue
                     if success and not scratch_apk.is_file():
                         print(f"[!] Patcher wrote no APK for {app['id']}")
                         success = False
@@ -1143,6 +1472,7 @@ def run_pipeline(package_ids=None, quiet=False, scraper=None):
                         "combined_version": combined_version,
                         "filename": patched_apk_path.name,
                         "patches": selected_patches(app),
+                        "build_layout": BUILD_LAYOUT,
                         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
                     }
                     save_app_result(

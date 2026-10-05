@@ -2,18 +2,24 @@ from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 import json
+import math
 import re
 import sys
 import io
 import time
 import apprise
-from typing import List
+from playwright.sync_api import Error as PlaywrightError
+from dataclasses import dataclass
+from typing import Any, Callable, List, Protocol, TypeVar, cast
 from pathlib import Path
 from src.patcher import (
     get_supported_versions,
+    load_patch_list,
+    PatchListError,
+    VersionLookupError,
     get_all_available_apps,
     get_source_paths,
     normalize_repo,
@@ -23,6 +29,7 @@ from src.patcher import (
     check_and_download_release,
     load_local_versions,
     selected_patches,
+    is_base_repo,
     DATA_DIR,
     GitHubRateLimitError,
 )
@@ -30,12 +37,16 @@ from packaging import version
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-import requests
 import threading
 import asyncio
 import logging
 import queue
+from src import secrets_store
+from src.request_guards import RequestGuardMiddleware
 from src.config_store import load_config, update_config
+
+logger = logging.getLogger(__name__)
+T = TypeVar("T")
 
 # Silence verbose Uvicorn access logs
 logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
@@ -44,80 +55,250 @@ PROJECT_ROOT = Path(__file__).parent.parent
 app = FastAPI()
 scheduler = BackgroundScheduler()
 
+
+class ScraperUnavailableError(RuntimeError):
+    """The scraper browser cannot serve a task (launch failed or shutting down)."""
+
+
+LAUNCH_COOLDOWN_SECONDS = 60.0
+INITIAL_LAUNCH_WAIT_SECONDS = 30
+SHUTDOWN_JOIN_SECONDS = 15
+LIVENESS_POLL_SECONDS = 0.5
+
+
+class Downloader(Protocol):
+    """What the worker needs from the browser wrapper."""
+
+    def close(self) -> None:
+        """Close the browser."""
+
+
+@dataclass
+class _Task:
+    """One unit of work for the worker thread and the queue its answer goes to."""
+
+    func: Callable[..., object]
+    args: tuple[object, ...]
+    kwargs: dict[str, object]
+    result: "queue.Queue[tuple[object, Exception | None]]"
+
+
+def _launch_downloader() -> Downloader:
+    """Start the persistent APKMirror downloader (launches the browser).
+
+    Returns:
+        A new `ApkMirror_Downloader`.
+    """
+    from src.patcher import ApkMirror_Downloader
+
+    return ApkMirror_Downloader()
+
+
 # Global worker to manage a persistent downloader instance
 class ScraperWorker(threading.Thread):
-    def __init__(self):
+    """Owns the one browser; every scrape and build runs in this thread.
+
+    A failed launch does not end the thread: the next task after a cooldown gets
+    another attempt. Until then tasks fail fast with `ScraperUnavailableError`.
+    No caller is ever left waiting on a dead worker: whatever ends the thread,
+    queued and later tasks are answered with `ScraperUnavailableError`.
+    """
+
+    def __init__(
+        self,
+        launch: Callable[[], Downloader] = _launch_downloader,
+        clock: Callable[[], float] = time.monotonic,
+        cooldown: float = LAUNCH_COOLDOWN_SECONDS,
+    ) -> None:
+        """Create the worker; call `start()` to launch the browser.
+
+        Args:
+            launch: Factory returning a downloader (with `close()`).
+            clock: Monotonic seconds source; the cooldown is measured with it.
+            cooldown: Seconds to wait after a failed launch before retrying.
+        """
         super().__init__(daemon=True, name="ScraperWorker")
-        self.task_queue = queue.Queue()
-        self.downloader = None
-        self.error = None
+        self.task_queue: queue.Queue[_Task | None] = queue.Queue()  # None = STOP
+        self.downloader: Downloader | None = None
+        self.error: str | None = None  # redacted text of the last launch failure
         self.initialized = threading.Event()
+        self._launch = launch
+        self._clock = clock
+        self._cooldown = cooldown
+        self._next_attempt_at = 0.0
+        # Guards `_stopping` together with the queue put, so that no task can be
+        # queued after the STOP/drain: execute and shutdown cannot interleave.
+        self._lock = threading.Lock()
+        self._stopping = False
 
-    def run(self):
+    def run(self) -> None:
+        """Thread body: launch once, serve tasks until STOP, then clean up."""
         # Playwright Sync API requires NO event loop in the thread
+        asyncio.set_event_loop(None)
         try:
-            import asyncio
-            asyncio.set_event_loop(None)
-        except:
-            pass
-        
+            self._try_launch()
+            self.initialized.set()
+            while (task := self.task_queue.get()) is not None:
+                self._run_task(task)
+        finally:
+            self._finish()
+
+    def _run_task(self, task: _Task) -> None:
+        """Run one task and hand its result or error to the waiting caller."""
         try:
-            from src.patcher import ApkMirror_Downloader
-            print("[Worker] Initializing persistent ApkMirror_Downloader...")
-            self.downloader = ApkMirror_Downloader()
-            self.initialized.set()
-        except Exception as e:
-            print(f"[Worker] Failed to initialize downloader: {e}")
-            self.error = e
-            self.initialized.set()
+            if self.downloader is None and self._clock() >= self._next_attempt_at:
+                self._try_launch()
+            if self.downloader is None:
+                raise ScraperUnavailableError(self._unavailable_message())
+            # Pass downloader as a keyword argument to keep positional args clean
+            result = task.func(*task.args, scraper=self.downloader, **task.kwargs)
+            task.result.put((result, None))
+        except Exception as error:  # noqa: BLE001 - handed to the caller
+            task.result.put((None, error))
+        except BaseException as error:  # noqa: BLE001 - SystemExit and the like
+            # Must not end the thread or leave the caller waiting.
+            wrapped = RuntimeError(f"Scraper task ended with {type(error).__name__}")
+            wrapped.__cause__ = error
+            task.result.put((None, wrapped))
+
+    def _try_launch(self) -> None:
+        """Launch the browser; on failure record the redacted error and cooldown."""
+        logger.info("Initializing persistent ApkMirror_Downloader...")
+        try:
+            self.downloader = self._launch()
+        except Exception as error:  # noqa: BLE001 - any launch failure is recoverable
+            # No exc_info: the traceback would repeat the unredacted message.
+            self.error = secrets_store.redact(f"{type(error).__name__}: {error}")
+            self._next_attempt_at = self._clock() + self._cooldown
+            logger.error("Browser launch failed: %s", self.error)
             return
+        self.error = None
 
+    def _finish(self) -> None:
+        """Close the browser and answer every task still queued."""
+        with self._lock:
+            self._stopping = True  # no task can be queued after this
+        self.initialized.set()
+        self._close_downloader()
         while True:
-            task = self.task_queue.get()
-            func, args, kwargs, result_queue = task
-            if func == "STOP":
-                if self.downloader:
-                    self.downloader.close()
-                break
-
             try:
-                # Pass downloader as a keyword argument to keep positional args clean
-                res = func(*args, scraper=self.downloader, **kwargs)
-                if result_queue: result_queue.put((res, None))
-            except Exception as e:
-                if result_queue: result_queue.put((None, e))
-            finally:
-                self.task_queue.task_done()
+                task = self.task_queue.get_nowait()
+            except queue.Empty:
+                return
+            if task is not None:
+                task.result.put((None, ScraperUnavailableError("Scraper stopped")))
 
+    def _close_downloader(self) -> None:
+        """Close the browser if there is one; a failing close is logged."""
+        if self.downloader is None:
+            return
+        try:
+            self.downloader.close()
+        except (PlaywrightError, OSError) as error:
+            logger.error(
+                "Closing the browser failed: %s", secrets_store.redact(str(error))
+            )
+        self.downloader = None
 
-    def execute(self, func, *args, **kwargs):
-        """Dispatches a function to be run in the worker thread."""
+    def _retry_in(self) -> int | None:
+        """Whole seconds until the next launch attempt, or None when not waiting."""
+        if self.downloader is not None or self._stopping:
+            return None
+        return max(0, math.ceil(self._next_attempt_at - self._clock()))
+
+    def _unavailable_message(self) -> str:
+        """Text for a task refused because the browser is down."""
+        return f"Browser unavailable ({self.error}); it is retried after a cooldown"
+
+    def status(self) -> dict[str, str | int | None]:
+        """Report the browser state for the UI.
+
+        Returns:
+            `state` ("starting", "available", "unavailable", "stopping" while
+            work still runs after a stop request, or "stopped" once the thread
+            has ended), the redacted last launch `error` (or None) and `retry_in`
+            seconds until the next launch attempt (or None).
+        """
+        if self._stopping:
+            state = "stopping" if self.is_alive() else "stopped"
+        elif self.downloader is not None:
+            state = "available"
+        elif not self.initialized.is_set():
+            state = "starting"
+        else:
+            state = "unavailable"
+        return {"state": state, "error": self.error, "retry_in": self._retry_in()}
+
+    def execute(
+        self, func: Callable[..., T], *args: object, **kwargs: object
+    ) -> T:
+        """Run a function in the worker thread and return its result.
+
+        Waits for the result with no timeout while the worker is alive: a timeout
+        would free the caller (and the update lock) while the worker is still
+        busy and let more work queue behind it.
+
+        Args:
+            func: Callable taking the downloader as the `scraper` keyword.
+            *args: Positional arguments for `func`.
+            **kwargs: Keyword arguments for `func`.
+
+        Returns:
+            Whatever `func` returns.
+
+        Raises:
+            ScraperUnavailableError: The browser is down (launch failed, cooling
+                down), the worker is stopped or its thread has died.
+            Exception: Whatever `func` raised.
+        """
         if not self.initialized.is_set():
-            self.initialized.wait(timeout=30)
-        
-        if self.error:
-            raise self.error
-            
-        res_q = queue.Queue()
-        self.task_queue.put((func, args, kwargs, res_q))
-        res, err = res_q.get()
-        if err:
-            raise err
-        return res
+            self.initialized.wait(timeout=INITIAL_LAUNCH_WAIT_SECONDS)
 
-    def shutdown(self):
-        self.task_queue.put(("STOP", (), {}, None))
+        result: queue.Queue[tuple[object, Exception | None]] = queue.Queue()
+        with self._lock:
+            if self._stopping:
+                raise ScraperUnavailableError("Scraper stopped")
+            self.task_queue.put(_Task(func, args, kwargs, result))
+        value, error = self._wait_for(result)
+        if error is not None:
+            raise error
+        return cast(T, value)
+
+    def _wait_for(
+        self, result: "queue.Queue[tuple[object, Exception | None]]"
+    ) -> tuple[object, Exception | None]:
+        """Wait for a task's answer; give up only when the thread is gone."""
+        while True:
+            try:
+                return result.get(timeout=LIVENESS_POLL_SECONDS)
+            except queue.Empty:
+                if self.is_alive():
+                    continue
+            try:
+                return result.get_nowait()  # answered just before the thread ended
+            except queue.Empty:
+                raise ScraperUnavailableError("Scraper thread is not running") from None
+
+    def shutdown(self) -> None:
+        """Ask the thread to stop after the task it is running, and close the browser.
+
+        A task already running (for example a build) is not cancelled: the stop
+        request queues behind it, the task finishes, then the browser is closed.
+        Tasks queued behind the stop are answered with `ScraperUnavailableError`.
+        """
+        with self._lock:
+            self._stopping = True
+            self.task_queue.put(None)
+
 
 SCRAPER_WORKER = ScraperWorker()
 SCRAPER_ACTIVE = False
 
-# Enable CORS for local development
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(RequestGuardMiddleware)
+
+# No CORS middleware on purpose: the UI is served by this app (same origin) and
+# Obtainium is not a browser, so neither needs CORS headers. Without them a
+# browser blocks other sites from reading responses or sending JSON PUT/DELETE.
 
 # Setup templates directory
 templates = Jinja2Templates(directory=str(PROJECT_ROOT / "src" / "templates"))
@@ -143,7 +324,8 @@ def ensure_data_dirs():
 
 
 # Cache for update status to prevent excessive polling load
-UPDATE_CACHE = {"timestamp": 0, "results": None}
+UPDATE_CACHE: dict[str, Any] = {"timestamp": 0, "results": None}
+UPDATE_LOCK = threading.Lock()
 
 @app.get("/api/ui/updates")
 def check_updates():
@@ -158,10 +340,91 @@ def check_updates():
     # Avoid enqueueing behind a long-running build: return stale cached
     # results immediately (the next poll after the build finishes will refresh).
     if BUILD_STATUS.get("in_progress") or SCRAPER_ACTIVE:
-        if UPDATE_CACHE["results"] is not None:
-            return UPDATE_CACHE["results"]
-        return {}
+        return _stale_updates()
 
+    # One refresh at a time: a request that arrives during one gets the stale
+    # result (or {}) at once instead of queueing more scraper work behind it.
+    if not UPDATE_LOCK.acquire(blocking=False):
+        return _stale_updates()
+    try:
+        # A refresh may have finished between the freshness check and the lock.
+        if UPDATE_CACHE["results"] and (time.time() - UPDATE_CACHE["timestamp"] < 60):
+            return UPDATE_CACHE["results"]
+        return _refresh_updates()
+    finally:
+        UPDATE_LOCK.release()
+
+
+def _stale_updates() -> dict:
+    """Return the last computed update status, or {} when there is none yet."""
+    results = UPDATE_CACHE["results"]
+    return results if results is not None else {}
+
+
+class _OfflineScraper:
+    """Stand-in used while the browser is down: every lookup fails, so
+    `get_supported_versions` falls back to its cached versions."""
+
+    def latest_version(self, package_name: str) -> str:
+        """Always fail, as the browser is unavailable."""
+        raise ScraperUnavailableError("Browser unavailable")
+
+
+def _cached_versions(package_id: str, config: dict) -> list[str]:
+    """Versions known without the browser: patch-derived or cached ones.
+
+    Args:
+        package_id: Android package id.
+        config: The loaded config.
+
+    Returns:
+        The versions, or [] when only the browser could tell.
+    """
+    versions, _, _ = get_supported_versions(
+        package_id, config, scraper=_OfflineScraper(), quiet=True
+    )
+    return list(versions)
+
+
+def _degraded_versions(
+    package_id: str, config: dict, error: Exception
+) -> tuple[list[str], str | None]:
+    """Answer for an app whose live lookup failed.
+
+    Args:
+        package_id: Android package id.
+        config: The loaded config.
+        error: Why the live lookup failed.
+
+    Returns:
+        (cached versions, None) when there are some, else ([], message for the UI).
+        An unreadable patch list is reported instead, as `PatchListError` is
+        elsewhere.
+    """
+    try:
+        cached = _cached_versions(package_id, config)
+    except PatchListError as patch_list_error:
+        return [], str(patch_list_error)
+    if cached:
+        return cached, None
+    message = secrets_store.redact(str(error))
+    if isinstance(error, VersionLookupError):
+        logger.error("Version lookup for %s failed: %s", package_id, message)
+        message = f"Version lookup failed: {message}"
+    return [], message
+
+
+def _redacted(error: BaseException) -> str:
+    """Error text safe to log and show: secret values replaced."""
+    return secrets_store.redact(f"{type(error).__name__}: {error}")
+
+
+def _refresh_updates() -> dict:
+    """Compute the update status of every pipeline app and cache it.
+
+    Called with `UPDATE_LOCK` held.
+    """
+    global UPDATE_CACHE
     config = load_config()
     update_status = {}
     
@@ -178,14 +441,37 @@ def check_updates():
         
         # Pinned version check
         pinned_version = app_info.get("version")
-        if pinned_version:
-            # Skip APKMirror completely if pinned. 
-            # get_supported_versions will return the pinned version via JSON check
-            remote_versions, _, _ = get_supported_versions(package_id, config, quiet=True)
-        else:
-            # For unpinned apps, use the worker to find the newest from APKMirror
-            # We use quiet=True here to avoid log spam from polling
-            remote_versions, _, _ = SCRAPER_WORKER.execute(get_supported_versions, package_id, config, quiet=True)
+        patch_list_error = None
+        try:
+            if pinned_version:
+                # Skip APKMirror completely if pinned. 
+                # get_supported_versions will return the pinned version via JSON check
+                remote_versions, _, _ = get_supported_versions(package_id, config, quiet=True)
+            else:
+                # For unpinned apps, use the worker to find the newest from APKMirror
+                # We use quiet=True here to avoid log spam from polling
+                remote_versions, _, _ = SCRAPER_WORKER.execute(
+                    get_supported_versions,
+                    package_id,
+                    config,
+                    quiet=True,
+                    raise_lookup_errors=True,
+                )
+        except PatchListError as error:
+            # Not logged: this runs on every poll. The builds and the hourly
+            # refresh log it, and the result below carries it to the UI.
+            remote_versions = []
+            patch_list_error = str(error)
+        except (ScraperUnavailableError, VersionLookupError) as error:
+            # The browser is down or the lookup failed. Serve what needs no
+            # browser (cached versions); an app with no answer carries the error.
+            remote_versions, patch_list_error = _degraded_versions(
+                package_id, config, error
+            )
+        except Exception as error:  # noqa: BLE001 - one app must not fail the poll
+            remote_versions = []
+            patch_list_error = f"Version lookup failed: {_redacted(error)}"
+            logger.error("Update check for %s: %s", package_id, patch_list_error)
         
         # Check if file exists (glob for versioned name or legacy)
         file_exists = False
@@ -212,7 +498,7 @@ def check_updates():
             try:
                 if version.parse(latest_remote_app_str) > version.parse(current_patched_app_str):
                     has_update = True
-            except:
+            except version.InvalidVersion:
                 if latest_remote_app_str != current_patched_app_str:
                     has_update = True
         elif current_patched_app_str == "None" and latest_remote_app_str != "Unknown":
@@ -240,11 +526,14 @@ def check_updates():
             "current": current_patched_app_str,
             "file_exists": file_exists,
             "icon_exists": icon_exists,
-            "status": app_info.get("status", "Unknown"),
-            "error": app_info.get("error")
+            "status": (
+                "Error" if patch_list_error else app_info.get("status", "Unknown")
+            ),
+            "error": patch_list_error or app_info.get("error"),
         }
 
-    UPDATE_CACHE = {"timestamp": now, "results": update_status}
+    # Stamped when the refresh ends: a slow one must not store an expired result.
+    UPDATE_CACHE = {"timestamp": time.time(), "results": update_status}
     return update_status
 
 # --- WEB UI ROUTES ---
@@ -279,6 +568,20 @@ async def web_ui(request: Request):
 
 @app.get("/api/ui/patches/{package_id}")
 def get_patches_for_app(package_id: str):
+    """List the patches of all active sources that apply to one package.
+
+    Args:
+        package_id: Android package id.
+
+    Returns:
+        One dict per patch with name, description, enabled_by_default, the display
+        name of its source under `source` and `is_base` (the source is the base
+        source, decided by repo).
+
+    Raises:
+        HTTPException: 502, with the repo in the detail, when an active source's
+            patch list is unreadable.
+    """
     config = load_config()
     compatible_patches = []
 
@@ -290,13 +593,11 @@ def get_patches_for_app(package_id: str):
         if not json_path.exists():
             continue
 
-        with open(json_path, "r") as f:
-            try:
-                data = json.load(f)
-            except:
-                continue
-
-        patches_list = data.get("patches", []) if isinstance(data, dict) else data
+        try:
+            patches_list = load_patch_list(source["repo"])
+        except PatchListError as error:
+            logger.error("Patch dialog for %s: %s", package_id, error)
+            raise HTTPException(status_code=502, detail=str(error)) from error
         for patch in patches_list:
             compat_pkgs = patch.get("compatiblePackages")
             use = False
@@ -325,7 +626,8 @@ def get_patches_for_app(package_id: str):
                                 "description", "No description available."
                             ),
                             "enabled_by_default": is_default,
-                            "source": source["name"]
+                            "source": source["name"],
+                            "is_base": is_base_repo(source["repo"]),
                         }
                     )
     return compatible_patches
@@ -338,7 +640,21 @@ class AddAppPayload(BaseModel):
 
 
 @app.post("/api/ui/add_app")
-def add_app_to_config(payload: AddAppPayload):
+def add_app_to_config(payload: AddAppPayload) -> dict[str, str]:
+    """Add an app to the pipeline, or edit it when its package id exists.
+
+    Args:
+        payload: Package id, display name and selected patch names.
+
+    Returns:
+        `{"status": "success"}`.
+
+    Raises:
+        HTTPException: 400 when the package id is not a valid Android package id.
+    """
+    if not PACKAGE_ID_PATTERN.fullmatch(payload.package_id):
+        raise HTTPException(status_code=400, detail="Invalid package id")
+
     def apply(config: dict) -> None:
         existing = next(
             (a for a in config.get("apps", []) if a["id"] == payload.package_id), None
@@ -408,13 +724,18 @@ def refresh_versions_task():
             # Only refresh unpinned apps from APKMirror
             if not app.get("version"):
                 time.sleep(2)
-                get_supported_versions(app["id"], config, scraper=scraper, force_refresh=True)
+                try:
+                    get_supported_versions(
+                        app["id"], config, scraper=scraper, force_refresh=True
+                    )
+                except PatchListError as error:
+                    logger.error("Version refresh for %s: %s", app["id"], error)
 
     try:
         SCRAPER_ACTIVE = True
         SCRAPER_WORKER.execute(_do_refresh)
     except Exception as e:
-        print(f"[Cron] Version refresh failed: {e}")
+        logger.error("Version refresh failed: %s", _redacted(e))
     finally:
         SCRAPER_ACTIVE = False
 
@@ -524,67 +845,6 @@ async def upload_apk(
     return {"status": "success", "message": f"Uploaded {file.filename} as {file_path.name}"}
 
 
-SOURCE_UPDATE_CACHE = {"timestamp": 0, "results": {}}
-
-@app.get("/api/ui/source_updates")
-def check_source_updates():
-    """Checks for updates for all active patch sources with a 10-minute cache."""
-    global SOURCE_UPDATE_CACHE
-    now = time.time()
-    
-    # Return cached results if fresh (600 seconds = 10 mins)
-    if now - SOURCE_UPDATE_CACHE["timestamp"] < 600:
-        return SOURCE_UPDATE_CACHE["results"]
-
-    config = load_config()
-    results = {}
-    config_changed = False
-
-    local_versions = {}
-    versions_file = DATA_DIR / "bin" / "versions.json"
-    if versions_file.exists():
-        with open(versions_file, "r") as f:
-            try:
-                local_versions = json.load(f)
-            except:
-                pass
-
-    for source in config.get("sources", []):
-        repo = source["repo"]
-        current_tag = local_versions.get(repo)
-        
-        # Sync current version to config if missing or different
-        if current_tag and source.get("version") != current_tag:
-            config_changed = True
-
-        try:
-            api_url = f"https://api.github.com/repos/{repo}/releases/latest"
-            resp = requests.get(api_url, timeout=5)
-            if resp.status_code == 200:
-                latest_tag = resp.json().get("tag_name")
-                results[repo] = {
-                    "latest": latest_tag,
-                    "current": current_tag,
-                    "has_update": latest_tag != current_tag
-                }
-        except:
-            # Fallback to current only if request fails
-            results[repo] = {"latest": current_tag, "current": current_tag, "has_update": False}
-
-    if config_changed:
-        def apply_versions(current: dict) -> None:
-            # Re-read: a sync may have installed a newer release during the loop.
-            installed = load_local_versions()
-            for source in current.get("sources", []):
-                if installed.get(source["repo"]):
-                    source["version"] = installed[source["repo"]]
-
-        update_config(apply_versions)
-        
-    SOURCE_UPDATE_CACHE = {"timestamp": now, "results": results}
-    return results
-
-
 @app.get("/api/ui/metadata")
 def get_ui_metadata():
     """Returns the latest application metadata (names, versions, icons)."""
@@ -599,10 +859,16 @@ def get_ui_metadata():
 
 
 @app.get("/api/ui/discovery")
-def refresh_discovery(background_tasks: BackgroundTasks, sync: bool = False):
+def refresh_discovery():
+    """List the apps the patch sources support. Read only."""
+    return {"apps": get_all_available_apps(load_config())}
+
+
+@app.post("/api/ui/discovery/sync")
+def sync_discovery(background_tasks: BackgroundTasks):
+    """Queue a forced tool and source sync and return the current app list."""
     config = load_config()
-    if sync:
-        background_tasks.add_task(update_tools_task, config, True)
+    background_tasks.add_task(update_tools_task, config, True)
     return {"apps": get_all_available_apps(config)}
 
 
@@ -663,6 +929,103 @@ def save_settings(payload: SaveSettingsPayload):
     with CRON_LOCK:
         setup_cron_job(load_config())
     return {"status": "success"}
+
+
+SECRET_SLUGS = {
+    "github-token": secrets_store.GITHUB_TOKEN,
+    "cloakbrowser-license-key": secrets_store.CLOAKBROWSER_LICENSE_KEY,
+}
+MAX_SECRET_BODY_BYTES = 4096
+
+
+def _secret_status() -> dict[str, dict[str, object]]:
+    """Return `{slug: {"set": bool, "source": str | None}}`, never a value."""
+    try:
+        sources = secrets_store.get_status()
+    except OSError:
+        logger.error("Could not read the secrets file")
+        raise HTTPException(
+            status_code=500, detail="Could not read the secrets file"
+        ) from None
+    return {
+        slug: {"set": sources[name] is not None, "source": sources[name]}
+        for slug, name in SECRET_SLUGS.items()
+    }
+
+
+def _secret_name(slug: str) -> str:
+    """Map a route slug to a secret name, or raise a 404."""
+    name = SECRET_SLUGS.get(slug)
+    if name is None:
+        raise HTTPException(status_code=404, detail="Unknown secret")
+    return name
+
+
+async def _read_secret_value(request: Request) -> str:
+    """Read `{"value": "..."}` by hand so no error body can echo the input.
+
+    Raises:
+        HTTPException: 400 with a fixed message for any malformed or invalid body.
+    """
+    invalid = HTTPException(status_code=400, detail="Invalid secret value")
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > MAX_SECRET_BODY_BYTES:
+        raise invalid
+    chunks: list[bytes] = []
+    received = 0
+    async for chunk in request.stream():
+        received += len(chunk)
+        if received > MAX_SECRET_BODY_BYTES:
+            raise invalid
+        chunks.append(chunk)
+    try:
+        body = json.loads(b"".join(chunks))
+    except (ValueError, RecursionError):
+        raise invalid from None
+    value = body.get("value") if isinstance(body, dict) else None
+    try:
+        return secrets_store.validate_secret(value)
+    except secrets_store.InvalidSecretError:
+        raise invalid from None
+
+
+def _change_secret(name: str, value: str | None) -> dict[str, dict[str, object]]:
+    """Set (value given) or clear a secret and return the new status."""
+    try:
+        if value is None:
+            secrets_store.clear_secret(name)
+        else:
+            secrets_store.set_secret(name, value)
+    except secrets_store.SecretFromEnvironmentError:
+        raise HTTPException(
+            status_code=409, detail="Secret is set by the environment"
+        ) from None
+    except OSError:
+        logger.error("Could not write the secrets file for %s", name)
+        raise HTTPException(
+            status_code=500, detail="Could not write the secrets file"
+        ) from None
+    return _secret_status()
+
+
+@app.get("/api/ui/secrets")
+def get_secrets():
+    """Report whether each secret is set and where it comes from."""
+    return _secret_status()
+
+
+@app.put("/api/ui/secrets/{slug}")
+async def put_secret(slug: str, request: Request):
+    """Store a secret from `{"value": "..."}`; 409 if the environment sets it."""
+    name = _secret_name(slug)
+    value = await _read_secret_value(request)
+    return await run_in_threadpool(_change_secret, name, value)
+
+
+@app.delete("/api/ui/secrets/{slug}")
+def delete_secret(slug: str):
+    """Remove a stored secret; 409 if the environment sets it."""
+    return _change_secret(_secret_name(slug), None)
 
 
 class Tee(io.TextIOBase):
@@ -731,7 +1094,10 @@ def build_task(package_ids=None, is_cron=False):
         SCRAPER_ACTIVE = True
         SCRAPER_WORKER.execute(_do_build)
     except Exception as e:
-        print(f"[Cron] Build task wrapper failed: {e}")
+        # Raised outside the build body (browser down): nothing else reports it.
+        message = _redacted(e)
+        logger.error("Build task failed: %s", message)
+        BUILD_STATUS["message"] = f"Failed: {message}"
     finally:
         BUILD_STATUS["in_progress"] = False
         SCRAPER_ACTIVE = False
@@ -767,6 +1133,7 @@ def get_tools_status():
         "updating": TOOLS_UPDATING, 
         "sync_error": SYNC_ERROR,
         "diagnostics": DIAGNOSTICS,
+        "browser": SCRAPER_WORKER.status(),
         "data_dir": str(DATA_DIR)
     }
 
@@ -989,5 +1356,19 @@ async def startup_event():
 
 @app.on_event("shutdown")
 def shutdown_event():
+    """Stop the worker and the scheduler; never raises.
+
+    The worker is told first, so a scheduler problem cannot skip it. A running
+    build is not cancelled: the scheduler is not waited for, and the worker
+    finishes the build before it closes the browser. If the build outlives
+    `SHUTDOWN_JOIN_SECONDS` the daemon thread ends with the process.
+    """
     print("[Shutdown] Stopping scheduler...")
-    scheduler.shutdown()
+    SCRAPER_WORKER.shutdown()
+    try:
+        if scheduler.running:
+            scheduler.shutdown(wait=False)
+    except Exception as error:  # noqa: BLE001 - shutdown must still stop the worker
+        logger.error("Scheduler shutdown failed: %s", error)
+    if SCRAPER_WORKER.is_alive():
+        SCRAPER_WORKER.join(timeout=SHUTDOWN_JOIN_SECONDS)

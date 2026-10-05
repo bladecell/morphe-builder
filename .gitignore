@@ -13,3 +13,5 @@ test_downloads/
 bin/
 apks/
 config.yaml
+.env*
+..env-*
