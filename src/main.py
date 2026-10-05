@@ -1,9 +1,11 @@
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, UploadFile, File, Form
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.exception_handlers import http_exception_handler
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
+from starlette.exceptions import HTTPException as StarletteHTTPException
 import json
 import math
 import re
@@ -21,8 +23,10 @@ from src.patcher import (
     PatchListError,
     VersionLookupError,
     get_all_available_apps,
+    find_file_collision,
     get_source_paths,
     normalize_repo,
+    plan_source_sync,
     update_tools,
     get_current_version,
     check_dependencies,
@@ -32,6 +36,8 @@ from src.patcher import (
     is_base_repo,
     DATA_DIR,
     GitHubRateLimitError,
+    GitHubTokenRejectedError,
+    github_token_warning,
 )
 from packaging import version
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -46,6 +52,7 @@ from src.request_guards import RequestGuardMiddleware
 from src.config_store import load_config, update_config
 
 logger = logging.getLogger(__name__)
+secrets_store.install_log_redaction()
 T = TypeVar("T")
 
 # Silence verbose Uvicorn access logs
@@ -296,6 +303,30 @@ SCRAPER_ACTIVE = False
 
 app.add_middleware(RequestGuardMiddleware)
 
+
+@app.exception_handler(StarletteHTTPException)
+async def redacted_http_exception_handler(
+    request: Request, exc: StarletteHTTPException
+) -> Response:
+    """Answer an HTTP error like the default handler, with secrets removed.
+
+    Error details are often built from exception text (429, 502), so this is
+    the one place that keeps a secret value out of every one of them.
+
+    Args:
+        request: The request that failed.
+        exc: The error to answer.
+
+    Returns:
+        The default JSON error response, with a text `detail` redacted.
+    """
+    if isinstance(exc.detail, str):
+        exc = StarletteHTTPException(
+            exc.status_code, secrets_store.redact(exc.detail), exc.headers
+        )
+    return await http_exception_handler(request, exc)
+
+
 # No CORS middleware on purpose: the UI is served by this app (same origin) and
 # Obtainium is not a browser, so neither needs CORS headers. Without them a
 # browser blocks other sites from reading responses or sending JSON PUT/DELETE.
@@ -414,6 +445,11 @@ def _degraded_versions(
     return [], message
 
 
+def _redacted_text(text: str | None) -> str | None:
+    """Return `text` with secret values replaced, or None for None."""
+    return None if text is None else secrets_store.redact(text)
+
+
 def _redacted(error: BaseException) -> str:
     """Error text safe to log and show: secret values replaced."""
     return secrets_store.redact(f"{type(error).__name__}: {error}")
@@ -529,7 +565,7 @@ def _refresh_updates() -> dict:
             "status": (
                 "Error" if patch_list_error else app_info.get("status", "Unknown")
             ),
-            "error": patch_list_error or app_info.get("error"),
+            "error": _redacted_text(patch_list_error or app_info.get("error")),
         }
 
     # Stamped when the refresh ends: a slow one must not store an expired result.
@@ -702,11 +738,15 @@ def update_tools_task(config, force=False):
     global TOOLS_UPDATING, SYNC_ERROR
     TOOLS_UPDATING = True
     SYNC_ERROR = None
+    problems: list[str] = []
     try:
+        # Sources that cannot be synced are skipped; say which, on the Discovery tab.
+        problems.extend(plan_source_sync(config)[1])
         update_tools(config, quiet=True, force=force)
-    except GitHubRateLimitError as e:
-        SYNC_ERROR = str(e)
+    except (GitHubRateLimitError, GitHubTokenRejectedError) as e:
+        problems.append(str(e))
     finally:
+        SYNC_ERROR = secrets_store.redact("; ".join(problems)) or None
         TOOLS_UPDATING = False
 
 
@@ -740,6 +780,14 @@ def refresh_versions_task():
         SCRAPER_ACTIVE = False
 
 
+def _collision_detail(repo: str, other: str) -> str:
+    """Error text for a new source whose local files an existing one already uses."""
+    return (
+        f"Source {repo} would use the same local files as the existing source "
+        f"{other}. Remove {other} first."
+    )
+
+
 @app.post("/api/ui/add_source")
 def add_source(payload: AddSourcePayload):
     repo = normalize_repo(payload.repo)
@@ -748,8 +796,11 @@ def add_source(payload: AddSourcePayload):
 
     config = load_config()
     sources = config.get("sources", [])
-    if any(s["repo"].lower() == repo.lower() for s in sources):
+    if any(str(s.get("repo")).lower() == repo.lower() for s in sources):
         raise HTTPException(400, f"Source {repo} already exists.")
+    collides_with = find_file_collision(repo, sources)
+    if collides_with is not None:
+        raise HTTPException(400, _collision_detail(repo, collides_with))
 
     # Sync before saving so a broken repo never ends up half-added, and the
     # patches .json exists before the frontend re-renders the app list.
@@ -760,6 +811,9 @@ def add_source(payload: AddSourcePayload):
         check_and_download_release(repo, paths, force=True)
     except GitHubRateLimitError as e:
         raise HTTPException(429, str(e)) from e
+    except GitHubTokenRejectedError as e:
+        # 502, not 401: the browser's own request was fine, GitHub refused ours.
+        raise HTTPException(502, str(e)) from e
     if not paths[".json"].exists():
         raise HTTPException(
             502,
@@ -781,8 +835,11 @@ def add_source(payload: AddSourcePayload):
     def apply(current: dict) -> None:
         # Re-check against the file as it is now: the sync above was unlocked.
         current_sources = current.setdefault("sources", [])
-        if any(s["repo"].lower() == repo.lower() for s in current_sources):
+        if any(str(s.get("repo")).lower() == repo.lower() for s in current_sources):
             raise HTTPException(400, f"Source {repo} already exists.")
+        other = find_file_collision(repo, current_sources)
+        if other is not None:
+            raise HTTPException(400, _collision_detail(repo, other))
         current_sources.append(new_source)
 
     update_config(apply)
@@ -879,6 +936,7 @@ class SaveSettingsPayload(BaseModel):
 
 
 def send_notification(title: str, message: str, config=None):
+    """Send a notification to the configured URLs; secret values are removed."""
     if not config:
         config = load_config()
     
@@ -891,8 +949,8 @@ def send_notification(title: str, message: str, config=None):
         apobj.add(url)
         
     apobj.notify(
-        body=message,
-        title=title,
+        body=secrets_store.redact(message),
+        title=secrets_store.redact(title),
     )
 
 
@@ -939,7 +997,11 @@ MAX_SECRET_BODY_BYTES = 4096
 
 
 def _secret_status() -> dict[str, dict[str, object]]:
-    """Return `{slug: {"set": bool, "source": str | None}}`, never a value."""
+    """Return `{slug: {"set": bool, "source": str | None}}`, never a value.
+
+    `source` is "environment_invalid" (and `set` False) for a variable that is
+    set but not a valid secret, so the operator can tell it is being ignored.
+    """
     try:
         sources = secrets_store.get_status()
     except OSError:
@@ -948,7 +1010,10 @@ def _secret_status() -> dict[str, dict[str, object]]:
             status_code=500, detail="Could not read the secrets file"
         ) from None
     return {
-        slug: {"set": sources[name] is not None, "source": sources[name]}
+        slug: {
+            "set": sources[name] in ("environment", "file"),
+            "source": sources[name],
+        }
         for slug, name in SECRET_SLUGS.items()
     }
 
@@ -996,10 +1061,11 @@ def _change_secret(name: str, value: str | None) -> dict[str, dict[str, object]]
             secrets_store.clear_secret(name)
         else:
             secrets_store.set_secret(name, value)
-    except secrets_store.SecretFromEnvironmentError:
-        raise HTTPException(
-            status_code=409, detail="Secret is set by the environment"
-        ) from None
+    except secrets_store.SecretFromEnvironmentError as error:
+        detail = "Secret is set by the environment"
+        if error.invalid:
+            detail += " but its value is invalid"
+        raise HTTPException(status_code=409, detail=detail) from None
     except OSError:
         logger.error("Could not write the secrets file for %s", name)
         raise HTTPException(
@@ -1033,8 +1099,9 @@ class Tee(io.TextIOBase):
         self.files = files
 
     def write(self, obj):
+        text = secrets_store.redact(obj)
         for f in self.files:
-            f.write(obj)
+            f.write(text)
             f.flush()
         return len(obj)
 
@@ -1081,9 +1148,11 @@ def build_task(package_ids=None, is_cron=False):
                 elif not is_cron:
                     send_notification("Build Finished", "No updates or build failed.")
             except Exception as e:
-                print(f"\n[FATAL ERROR] {e}")
-                BUILD_STATUS["message"] = f"Failed: {e}"
-                send_notification("Build Failed", f"Pipeline error: {e}")
+                message = secrets_store.redact(str(e))
+                # A print, not a log call: this stdout is the build log the UI shows.
+                print(f"\n[FATAL ERROR] {message}")
+                BUILD_STATUS["message"] = f"Failed: {message}"
+                send_notification("Build Failed", f"Pipeline error: {message}")
             finally:
                 sys.stdout = old_stdout
                 # Invalidate update cache when build finishes
@@ -1124,14 +1193,16 @@ def trigger_build(payload: TriggerBuildPayload):
 
 @app.get("/api/ui/build_status")
 def get_build_status():
-    return BUILD_STATUS
+    """Return the build state; the message has secret values removed."""
+    return {**BUILD_STATUS, "message": _redacted_text(BUILD_STATUS.get("message"))}
 
 
 @app.get("/api/ui/tools_status")
 def get_tools_status():
     return {
         "updating": TOOLS_UPDATING, 
-        "sync_error": SYNC_ERROR,
+        "sync_error": _redacted_text(SYNC_ERROR),
+        "github_token_warning": _redacted_text(github_token_warning()),
         "diagnostics": DIAGNOSTICS,
         "browser": SCRAPER_WORKER.status(),
         "data_dir": str(DATA_DIR)
@@ -1140,11 +1211,12 @@ def get_tools_status():
 
 @app.get("/api/ui/logs")
 def get_logs():
+    """Return the build log, with secret values removed."""
     if not LOG_PATH.exists():
         return {"logs": ""}
     # Use newline="" to prevent \r being converted to \n
     with open(LOG_PATH, "r", encoding="utf-8", errors="replace", newline="") as f:
-        return {"logs": f.read()}
+        return {"logs": secrets_store.redact(f.read())}
 
 
 # --- OBTAINIUM ROUTES ---
@@ -1328,13 +1400,19 @@ def setup_cron_job(config):
             # Refresh versions every hour to keep UI up to date
             scheduler.add_job(refresh_versions_task, CronTrigger(hour="*"), id="version_refresh")
             print("[Cron] Scheduled hourly version cache refresh")
-        except Exception as e:
-            print(f"[Cron] Failed to schedule: {e}")
+        except Exception as e:  # noqa: BLE001 - scheduling must not stop the app
+            logger.error("Cron scheduling failed: %s", _redacted(e))
 
 
 @app.on_event("startup")
 async def startup_event():
     global DIAGNOSTICS
+    # First, before anything is started: take both secrets out of os.environ so
+    # no thread, subprocess or library inherits them.
+    # NOTE: cloakbrowser reads CLOAKBROWSER_LICENSE_KEY from os.environ itself,
+    # so an environment licence key no longer reaches the browser until the
+    # browser launch passes the key explicitly (a later step).
+    secrets_store.absorb_environment()
     ensure_data_dirs()
     config = load_config()
     setup_cron_job(config)

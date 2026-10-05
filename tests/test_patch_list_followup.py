@@ -20,6 +20,8 @@ from tests.test_patch_list_errors import (
 )
 
 BAD_NAMES = [["x"], {"a": 1}, 5]
+# Asset URLs must now be real GitHub release downloads.
+ASSET_BASE = f"https://github.com/{REPO}/releases/download/v1"
 
 
 def named(name: object) -> str:
@@ -92,10 +94,16 @@ class Release:
         return {
             "tag_name": "v1",
             "assets": [
-                {"name": "p.mpp", "browser_download_url": "https://x/p.mpp"},
-                {"name": "p.json", "browser_download_url": "https://x/p.json"},
+                {"name": "p.mpp", "browser_download_url": f"{ASSET_BASE}/p.mpp"},
+                {"name": "p.json", "browser_download_url": f"{ASSET_BASE}/p.json"},
             ],
         }
+
+
+RAW_V1 = [
+    f"https://raw.githubusercontent.com/{REPO}/v1/{name}"
+    for name in patcher.JSON_FILENAME_CANDIDATES
+]
 
 
 @pytest.fixture
@@ -124,7 +132,7 @@ def test_sync_at_the_same_tag_repairs_a_corrupt_list(synced_source):
     changed = patcher.check_and_download_release(REPO, paths, force=True)
 
     assert changed is True
-    assert downloads == ["https://x/p.json"]
+    assert downloads == [f"{ASSET_BASE}/p.json"]
     assert patcher.load_patch_list(REPO) == VALID["patches"]
 
 
@@ -135,7 +143,7 @@ def test_unthrottled_repair_does_not_wait_for_the_throttle(synced_source):
     changed = patcher.check_and_download_release(REPO, paths, force=False)
 
     assert changed is True
-    assert downloads == ["https://x/p.json"]
+    assert downloads == [f"{ASSET_BASE}/p.json"]
 
 
 def test_healthy_source_stays_throttled_and_makes_no_network_call(
@@ -187,7 +195,7 @@ def test_list_still_unreadable_after_download_is_bounded_and_reported(
     changed = patcher.check_and_download_release(REPO, paths, force=True)
 
     assert changed is False
-    assert downloads == ["https://x/p.json"]
+    assert downloads == [f"{ASSET_BASE}/p.json", *RAW_V1]
     assert "still unreadable" in capsys.readouterr().out
     assert patcher.load_local_versions() == {REPO: "v1"}
     with pytest.raises(patcher.PatchListError):
@@ -234,7 +242,7 @@ def test_new_release_with_a_broken_list_still_counts_as_an_update(
     changed = patcher.check_and_download_release(REPO, paths, force=True)
 
     assert changed is True
-    assert downloads == ["https://x/p.mpp", "https://x/p.json"]
+    assert downloads == [f"{ASSET_BASE}/p.mpp", f"{ASSET_BASE}/p.json", *RAW_V1]
     assert "still unreadable" in capsys.readouterr().out
     assert patcher.load_local_versions()[REPO] == "v1"
 
@@ -296,7 +304,7 @@ def test_sync_downloads_the_list_again_once_the_file_is_deleted(synced_source):
     changed = patcher.check_and_download_release(REPO, paths, force=False)
 
     assert changed is True
-    assert "https://x/p.json" in downloads
+    assert f"{ASSET_BASE}/p.json" in downloads
     assert patcher.load_patch_list(REPO) == VALID["patches"]
 
 

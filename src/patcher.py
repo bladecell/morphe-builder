@@ -1,3 +1,4 @@
+import builtins
 import requests
 import re
 import subprocess
@@ -12,12 +13,89 @@ import logging
 from collections import deque
 from datetime import UTC, datetime
 from pathlib import Path
+from collections.abc import Sequence
+from typing import Any, TextIO
+from urllib.parse import unquote, urljoin, urlsplit
 from packaging import version
 from src.apkmirror_downloader import ApkMirror_Downloader, Arch, Dpi, BundleType
 
+from src import secrets_store
 from src.config_store import DATA_DIR, load_config, update_config
 
 logger = logging.getLogger(__name__)
+secrets_store.install_log_redaction()
+
+
+def print(
+    *values: object,
+    sep: str | None = " ",
+    end: str | None = "\n",
+    file: TextIO | None = None,
+    flush: bool = False,
+) -> None:
+    """Print like the builtin, with secret values removed from the text.
+
+    This module reports progress and failures with plain prints, and some of
+    them include exception text. Shadowing the builtin covers every print made
+    by this module and nothing else: other modules print through their own
+    means, and a direct `sys.stdout.write` here must call `secrets_store.redact`
+    itself (the java output in `patch_app` does). While a web build runs, the
+    build log also redacts what it captures.
+
+    Args:
+        *values: Objects to print, as for the builtin.
+        sep: Separator between values.
+        end: Text added at the end.
+        file: Stream to write to; the current `sys.stdout` when None.
+        flush: Flush the stream after writing.
+    """
+    text = (" " if sep is None else sep).join(str(value) for value in values)
+    builtins.print(secrets_store.redact(text), end=end, file=file, flush=flush)
+
+
+def run_child(
+    command: Sequence[str | Path], **kwargs: Any
+) -> subprocess.CompletedProcess[Any]:
+    """Run a subprocess without the secrets in its environment.
+
+    Every subprocess of the app must be started through this or `start_child`
+    (a test enforces it): patch bundles run as code inside java.
+
+    Args:
+        command: The program and its arguments.
+        **kwargs: Keyword arguments of `subprocess.run`, except `env`.
+
+    Returns:
+        The completed process.
+
+    Raises:
+        TypeError: `env` was passed; the environment is not the caller's choice.
+        subprocess.SubprocessError: As `subprocess.run`.
+        OSError: As `subprocess.run`.
+    """
+    return subprocess.run(  # noqa: PLW1510 - callers choose `check`
+        command, env=secrets_store.child_environment(), **kwargs
+    )
+
+
+def start_child(
+    command: Sequence[str | Path], **kwargs: Any
+) -> subprocess.Popen[Any]:
+    """Start a subprocess without the secrets in its environment.
+
+    Args:
+        command: The program and its arguments.
+        **kwargs: Keyword arguments of `subprocess.Popen`, except `env`.
+
+    Returns:
+        The running process.
+
+    Raises:
+        TypeError: `env` was passed; the environment is not the caller's choice.
+        OSError: As `subprocess.Popen`.
+    """
+    return subprocess.Popen(command, env=secrets_store.child_environment(), **kwargs)
+
 VERSIONS_FILE = DATA_DIR / "bin" / "versions.json"
 VERSION_CACHE_FILE = DATA_DIR / "bin" / "version_cache.json"
 
@@ -133,25 +211,243 @@ class GitHubRateLimitError(Exception):
 
     Attributes:
         reset_epoch: Reset time in epoch seconds, or None when GitHub gave none.
+        suggest_token: True when the message points at the GitHub token setting
+            (no token was in use).
     """
 
-    def __init__(self, reset_epoch: float | None = None) -> None:
+    def __init__(
+        self, reset_epoch: float | None = None, suggest_token: bool = False
+    ) -> None:
         self.reset_epoch = reset_epoch
+        self.suggest_token = suggest_token
         if reset_epoch is None:
             when = "Try again later."
         else:
             reset = datetime.fromtimestamp(reset_epoch, tz=UTC)
             when = f"Resets at {reset:%Y-%m-%d %H:%M} UTC."
-        super().__init__(f"GitHub API rate limit reached. {when}")
+        hint = f" {RATE_LIMIT_TOKEN_HINT}" if suggest_token else ""
+        super().__init__(f"GitHub API rate limit reached. {when}{hint}")
+
+
+class GitHubHostError(ValueError):
+    """A GitHub API call was asked for a target other than https://api.github.com."""
+
+
+class GitHubApiError(requests.exceptions.RequestException):
+    """An authenticated GitHub API request failed.
+
+    The message is fixed text plus the failure's class name, never the original
+    error text: that text can echo request headers, and so the token.
+    """
+
+
+class GitHubTokenRejectedError(Exception):
+    """GitHub answered 401: the saved token is invalid, expired or revoked.
+
+    The message is fixed. It holds neither the token nor the response body.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(TOKEN_REJECTED_MESSAGE)
+
+
+TOKEN_REJECTED_MESSAGE = (
+    "GitHub rejected the saved GitHub token (HTTP 401). "
+    "Replace or remove the GitHub token in Settings."
+)
+RATE_LIMIT_TOKEN_HINT = "Set a GitHub token in Settings to raise the limit."
+GITHUB_API_HOST = "api.github.com"
+# Redirects the API may send inside api.github.com (a renamed repository).
+MAX_API_REDIRECTS = 3
+_SCOPE_NAME = re.compile(r"[A-Za-z0-9_:.-]{1,32}")
+_MAX_SCOPE_NAMES = 20
+# Scope names GitHub reported on the last authenticated response, or None when
+# the token was not used, was rejected, or the response had no scope header.
+_seen_token_scopes: tuple[str, ...] | None = None
+
+
+def _is_api_url(url: object) -> bool:
+    """Tell whether `url` is exactly an https URL on api.github.com.
+
+    Args:
+        url: Candidate URL.
+
+    Returns:
+        True only for the https scheme, host api.github.com, default port and no
+        user info. Anything with spaces, control characters, backslashes or
+        non-ASCII text is refused, so parsers cannot disagree about the host.
+    """
+    if not isinstance(url, str) or not url.isascii() or not url.isprintable():
+        return False
+    if " " in url or "\\" in url:
+        return False
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return False
+    return parts.scheme == "https" and parts.netloc.lower() == GITHUB_API_HOST
+
+
+def _record_token_scopes(header: str | None) -> None:
+    """Remember the scope names of the token from a response header.
+
+    Args:
+        header: Value of `X-OAuth-Scopes`, or None when GitHub sent none (a
+            fine-grained token, whose permissions are not reported this way).
+    """
+    global _seen_token_scopes
+    if header is None:
+        _seen_token_scopes = None
+        return
+    names = [part.strip() for part in header.split(",")]
+    # Only plain scope names, never anything the secret store would mask.
+    plain = [
+        name
+        for name in names
+        if _SCOPE_NAME.fullmatch(name) and secrets_store.redact(name) == name
+    ]
+    _seen_token_scopes = tuple(plain[:_MAX_SCOPE_NAMES])
+
+
+def github_token_warning() -> str | None:
+    """Tell the owner when the GitHub token in use carries permissions.
+
+    Only a classic token reports its scopes (`X-OAuth-Scopes`), and only after
+    a request was made with it. A fine-grained token sends no such header, so
+    its permissions cannot be seen and no warning is given for it.
+
+    Returns:
+        A warning naming the scopes, or None when the last authenticated
+        response showed none, none was seen, or no token is set now.
+    """
+    scopes = _seen_token_scopes
+    if not scopes:
+        return None
+    try:
+        token_is_set = secrets_store.get_secret(secrets_store.GITHUB_TOKEN) is not None
+    except OSError:
+        logger.error("Could not read the secrets file to check the GitHub token")
+        return None
+    if not token_is_set:
+        return None
+    return (
+        f"The GitHub token has permissions ({', '.join(scopes)}). Patch bundles "
+        "can read it. Use a token with no permissions."
+    )
+
+
+def _get_with_token(url: str, token: str) -> requests.Response:
+    """GET `url` on api.github.com with the token as a bearer header.
+
+    The session ignores the environment (no netrc, which could replace the
+    header), takes proxies and the CA bundle from it explicitly, and never lets
+    `requests` follow a redirect: only a redirect that stays on
+    https://api.github.com is followed, by this function, with the same header.
+
+    Args:
+        url: A URL that already passed `_is_api_url`.
+        token: The GitHub token.
+
+    Returns:
+        The final response, never a 401 (that raises).
+
+    Raises:
+        GitHubApiError: The request failed or was redirected away. The message
+            holds only the failure's class name.
+        GitHubTokenRejectedError: GitHub answered 401.
+    """
+    failure: str | None = None
+    response: requests.Response | None = None
+    try:
+        with requests.Session() as session:
+            session.trust_env = False
+            session.proxies.update(requests.utils.get_environ_proxies(url))
+            verify = (
+                os.environ.get("REQUESTS_CA_BUNDLE")
+                or os.environ.get("CURL_CA_BUNDLE")
+                or True
+            )
+            headers = {"Authorization": f"Bearer {token}"}
+            target = url
+            for _ in range(MAX_API_REDIRECTS + 1):
+                response = session.get(
+                    target,
+                    headers=headers,
+                    timeout=30,
+                    verify=verify,
+                    allow_redirects=False,
+                )
+                if not response.is_redirect:
+                    break
+                target = urljoin(target, response.headers["location"])
+                if not _is_api_url(target):
+                    failure = "RedirectedAway"
+                    break
+            else:
+                failure = "TooManyRedirects"
+    except (requests.exceptions.RequestException, ValueError) as error:
+        # Raised below, outside this block: the original error text and the
+        # exception chain can carry the request headers.
+        failure = type(error).__name__
+    if failure is not None or response is None:
+        raise GitHubApiError(f"GitHub API request failed ({failure}).")
+    if response.status_code == 401:
+        raise GitHubTokenRejectedError()
+    return response
+
+
+def github_api_get(url: str) -> tuple[requests.Response, bool]:
+    """GET a URL on the GitHub REST API, with the saved token when there is one.
+
+    This is the only place the token is read for a request. It goes to
+    https://api.github.com as a header and nowhere else: any other target is
+    refused, redirects off api.github.com are not followed, and the token is
+    never in the URL or a body. Without a token the request is a plain
+    `requests.get`.
+
+    Args:
+        url: Absolute https://api.github.com/... URL, already built from a
+            repository name that passed `is_valid_repo`.
+
+    Returns:
+        The response and whether the token was sent.
+
+    Raises:
+        GitHubHostError: `url` is not an https URL on api.github.com. Nothing
+            was sent.
+        GitHubApiError: The authenticated request failed (fixed text).
+        GitHubTokenRejectedError: GitHub rejected the token with 401.
+        requests.exceptions.RequestException: The unauthenticated request failed.
+    """
+    global _seen_token_scopes
+    if not _is_api_url(url):
+        raise GitHubHostError("Only https://api.github.com can receive API calls.")
+    try:
+        token = secrets_store.get_secret(secrets_store.GITHUB_TOKEN)
+    except OSError:
+        logger.error("Could not read the GitHub token; calling GitHub without it")
+        token = None
+    if token is None:
+        _seen_token_scopes = None
+        return requests.get(url, timeout=30), False
+    try:
+        response = _get_with_token(url, token)
+    except GitHubTokenRejectedError:
+        _seen_token_scopes = None
+        raise
+    _record_token_scopes(response.headers.get("X-OAuth-Scopes"))
+    return response, True
 
 
 def _rate_limit_from_response(
-    response: requests.Response,
+    response: requests.Response, token_set: bool = True
 ) -> GitHubRateLimitError | None:
     """Builds a rate limit error if the response is a GitHub rate limit refusal.
 
     Args:
         response: Response from the GitHub API.
+        token_set: Whether the request carried the GitHub token. When False the
+            error says a token can be set in Settings.
 
     Returns:
         The error to raise, or None when the response is not a rate limit
@@ -162,25 +458,198 @@ def _rate_limit_from_response(
     headers = response.headers
     try:
         if headers.get("retry-after") is not None:
-            return GitHubRateLimitError(time.time() + float(headers["retry-after"]))
+            reset_epoch = time.time() + float(headers["retry-after"])
+            return GitHubRateLimitError(reset_epoch, not token_set)
         if headers.get("x-ratelimit-remaining") == "0":
             reset = headers.get("x-ratelimit-reset")
-            return GitHubRateLimitError(float(reset) if reset else None)
+            return GitHubRateLimitError(float(reset) if reset else None, not token_set)
     except ValueError:
-        return GitHubRateLimitError()
+        return GitHubRateLimitError(suggest_token=not token_set)
+    return None
+
+
+# Release `.json` assets named like a patch list: `patches.json`,
+# `patches-list.json`, optionally with a plain version (`patches-1.2.3.json`).
+# Other names (`patches-1.2.3.cdx.json`, `*.tooling.json`) are not tried first.
+PATCH_LIST_ASSET_NAME = re.compile(
+    r"patches(-list)?(-v?\d+(\.\d+)*([-+][0-9A-Za-z.]+)?)?\.json", re.IGNORECASE
+)
+
+# Largest oddly named `.json` asset still tried as a patch list.
+MAX_UNNAMED_LIST_BYTES = 256 * 1024
+
+
+def _download_patch_list(url: str, output_path: Path) -> bool:
+    """Download a file and keep it only when it is a real patch list.
+
+    The data goes to a side file first, so an unreadable download never
+    replaces what is at `output_path`.
+
+    Args:
+        url: URL to fetch.
+        output_path: Final location of the patch list.
+
+    Returns:
+        True when the file was a patch list and now sits at `output_path`.
+        False when the download failed or the file is not a patch list; the
+        reason is printed and `output_path` is untouched.
+    """
+    candidate_path = Path(f"{output_path}.candidate")
+    try:
+        download_with_progress(url, candidate_path)
+        _read_patch_list(candidate_path)
+        os.replace(candidate_path, output_path)
+    except _PatchListFormatError as error:
+        print(f"    [!] Not a patch list, ignored: {error}")
+        return False
+    except (requests.exceptions.RequestException, OSError) as error:
+        print(f"    [!] Failed to download {url.rsplit('/', 1)[-1]}: {error}")
+        return False
+    finally:
+        candidate_path.unlink(missing_ok=True)
+    return True
+
+
+def _json_assets_to_try(assets: list[dict], named: bool) -> list[dict]:
+    """Pick the release `.json` assets worth trying as the patch list.
+
+    Args:
+        assets: Asset objects of a GitHub release.
+        named: True for assets named like a patch list, best name first
+            (`patches-list.json`, `patches.json`, then versioned names). False
+            for the other small `.json` assets, smallest first.
+
+    Returns:
+        The assets to try, in order. Large unnamed files are never included.
+    """
+    json_assets = [a for a in assets if str(a.get("name", "")).endswith(".json")]
+    if named:
+        matching = [
+            a for a in json_assets if PATCH_LIST_ASSET_NAME.fullmatch(a["name"])
+        ]
+        return sorted(
+            matching, key=lambda a: a["name"].lower() not in JSON_FILENAME_CANDIDATES
+        )
+    others = [
+        a
+        for a in json_assets
+        if not PATCH_LIST_ASSET_NAME.fullmatch(a["name"])
+        and int(a.get("size") or 0) <= MAX_UNNAMED_LIST_BYTES
+    ]
+    return sorted(others, key=lambda a: int(a.get("size") or 0))
+
+
+def _download_release_patch_list(
+    repo_path: str, release_data: dict, output_path: Path
+) -> bool:
+    """Get a source's patch list for a release, keeping only a real one.
+
+    Order: release assets named like a patch list, small other `.json` assets,
+    then the list file in the repository at the release tag. A file that is not
+    a patch list (for example an SBOM) is skipped, never kept.
+
+    Args:
+        repo_path: GitHub 'owner/repo'.
+        release_data: GitHub release object.
+        output_path: Final location of the patch list.
+
+    Returns:
+        True when a patch list was written to `output_path`.
+    """
+    assets = release_data.get("assets", [])
+    for named in (True, False):
+        for asset in _json_assets_to_try(assets, named):
+            url = _asset_url(asset)
+            if url is None:
+                continue
+            print(f"    -> Downloading {asset['name']}...")
+            if _download_patch_list(url, output_path):
+                return True
+    tag = release_data.get("tag_name")
+    print(f"    -> No patch list in the release assets. Fetching it from source ({tag})...")
+    return _try_download_json_candidates(repo_path, tag, output_path)
+
+
+# A git ref safe to put in a raw.githubusercontent.com path: git also allows
+# `%`, `#`, `?` and `/` in tag names, and percent-decoding can make `..` segments.
+_REF_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,99}")
+
+# https://github.com/<owner>/<repo>/releases/download/<tag>/<file>: the form of
+# every `browser_download_url` (it redirects to release-assets.githubusercontent.com,
+# which is reached only by following that redirect, never named by a release).
+_ASSET_PATH = re.compile(
+    r"/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/releases/download/[^/?#]+/[^/?#]+"
+)
+
+
+def _is_valid_ref(ref: object) -> bool:
+    """Tell whether a release tag or branch is safe inside a raw file URL.
+
+    Args:
+        ref: Candidate tag taken from a GitHub response.
+
+    Returns:
+        True for 1-100 ASCII letters, digits, `.`, `_`, `+` or `-` that start
+        with a letter or digit and hold no `..`.
+    """
+    if not isinstance(ref, str) or _REF_PATTERN.fullmatch(ref) is None:
+        return False
+    return ".." not in ref
+
+
+def _is_release_asset_url(url: object) -> bool:
+    """Tell whether a `browser_download_url` is a real GitHub release download.
+
+    Args:
+        url: Value taken from a GitHub release response.
+
+    Returns:
+        True only for https on exactly github.com (no user info, port, query or
+        fragment) with a `/<owner>/<repo>/releases/download/<tag>/<file>` path
+        that has no dot segment, even after percent-decoding.
+    """
+    if not isinstance(url, str) or not url.isascii() or not url.isprintable():
+        return False
+    if " " in url or "\\" in url:
+        return False
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return False
+    if parts.scheme != "https" or parts.netloc != "github.com":
+        return False
+    if parts.query or parts.fragment or not _ASSET_PATH.fullmatch(parts.path):
+        return False
+    return not {".", ".."} & set(unquote(parts.path).split("/"))
+
+
+def _asset_url(asset: dict) -> str | None:
+    """Return the asset's download URL when it is valid, else None (reported).
+
+    Args:
+        asset: Asset object of a GitHub release.
+
+    Returns:
+        The `browser_download_url`, or None when it failed `_is_release_asset_url`.
+    """
+    url = asset.get("browser_download_url")
+    if _is_release_asset_url(url):
+        return str(url)
+    print(f"    [!] Refusing the download URL of {_quoted(asset.get('name'))}.")
     return None
 
 
 def _try_download_json_candidates(repo_path, ref, output_path):
     """Tries candidate JSON filenames from a repo ref via raw.githubusercontent.
-    Returns True on the first success."""
+    Returns True on the first success; a file that is not a patch list is not
+    kept. A repository or ref that is not valid is refused without a request."""
+    if not is_valid_repo(repo_path) or not _is_valid_ref(ref):
+        print(f"    [!] Not fetching from source: unusable ref {_quoted(ref)}.")
+        return False
     for filename in JSON_FILENAME_CANDIDATES:
         raw_url = f"https://raw.githubusercontent.com/{repo_path}/{ref}/{filename}"
-        try:
-            download_with_progress(raw_url, output_path)
+        if _download_patch_list(raw_url, Path(output_path)):
             return True
-        except Exception:
-            continue
     return False
 
 
@@ -230,12 +699,20 @@ def check_and_download_release(repo_path, extensions_to_paths, force=False):
 
     Returns:
         True when files were downloaded and the tag was recorded; False on
-        failure, when already up to date, or when a repair fetched a list that
-        is still unreadable.
+        failure, when already up to date, when a repair fetched a list that
+        is still unreadable, or when `repo_path` is not a valid `owner/name`
+        (logged, and no request is made).
 
     Raises:
         GitHubRateLimitError: GitHub refused the release lookup due to a rate limit.
+        GitHubTokenRejectedError: GitHub rejected the saved token (HTTP 401). The
+            lookup is not retried without it.
     """
+    if not is_valid_repo(repo_path):
+        # Checked here, where every GitHub URL is built, so no caller can send
+        # a request for a name that is not a real owner/name.
+        logger.error("Skipping sync of invalid repository %r", str(repo_path)[:100])
+        return False
     api_url = f"https://api.github.com/repos/{repo_path}/releases/latest"
     local_versions = load_local_versions()
     current_tag = local_versions.get(repo_path)
@@ -257,7 +734,7 @@ def check_and_download_release(repo_path, extensions_to_paths, force=False):
 
     release_data = None
     try:
-        response = requests.get(api_url, timeout=30)
+        response, token_used = github_api_get(api_url)
         if response.status_code == 404:
             # Repo has no releases: fall back to default-branch raw files for .json
             print(f"[!] {repo_path} has no releases. Falling back to default branch...")
@@ -276,7 +753,7 @@ def check_and_download_release(repo_path, extensions_to_paths, force=False):
                         save_local_versions(local_versions)
                         return True
             return False
-        rate_limit = _rate_limit_from_response(response)
+        rate_limit = _rate_limit_from_response(response, token_used)
         if rate_limit is not None:
             raise rate_limit
         response.raise_for_status()
@@ -305,26 +782,26 @@ def check_and_download_release(repo_path, extensions_to_paths, force=False):
 
     all_found = True
     for ext, output_path in extensions_to_paths.items():
-        found = False
-        for asset in release_data.get("assets", []):
-            if asset["name"].endswith(ext):
-                asset_url = asset["browser_download_url"]
-                print(f"    -> Downloading {asset['name']}...")
-                try:
-                    download_with_progress(asset_url, output_path)
-                    found = True
-                except Exception as e:
-                    print(f"    [!] Failed to download {asset['name']}: {e}")
-                break
-
-        # Fallback: fetch the patches JSON from the repo at the release tag
-        # (Morphe/ReVanced-style sources don't ship it as a release asset)
-        if not found and ext == ".json":
-            print(
-                f"    -> JSON asset not found. Fetching patches JSON from source ({latest_tag})..."
-            )
-            if _try_download_json_candidates(repo_path, latest_tag, output_path):
+        if ext == ".json":
+            found = _download_release_patch_list(repo_path, release_data, output_path)
+            if not found and output_path.exists():
+                # Keep what is there; a list that stays unreadable is reported below.
+                print(f"    [!] No readable patch list for {repo_path} in {latest_tag}.")
                 found = True
+        else:
+            found = False
+            for asset in release_data.get("assets", []):
+                if asset["name"].endswith(ext):
+                    url = _asset_url(asset)
+                    if url is None:
+                        break
+                    print(f"    -> Downloading {asset['name']}...")
+                    try:
+                        download_with_progress(url, output_path)
+                        found = True
+                    except Exception as e:
+                        print(f"    [!] Failed to download {asset['name']}: {e}")
+                    break
 
         if not found:
             print(f"    [!] Could not obtain {ext} for {repo_path}. Not marking as synced.")
@@ -346,7 +823,34 @@ def check_and_download_release(repo_path, extensions_to_paths, force=False):
     return True
 
 
-REPO_PATTERN = re.compile(r"^[\w.-]+/[\w.-]+$")
+# GitHub owner: 1-39 ASCII letters, digits or hyphens, no hyphen at either end.
+# Repository name: 1-100 ASCII letters, digits, ".", "_" or "-". Python's \w and
+# $ are not used: \w matches non-ASCII letters and $ matches before a newline.
+REPO_PATTERN = re.compile(
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?/[A-Za-z0-9._-]{1,100}"
+)
+
+
+def is_valid_repo(repo: object) -> bool:
+    """Tell whether `repo` is a real GitHub `owner/name`, safe inside a URL.
+
+    Args:
+        repo: Candidate value, for example from the config file.
+
+    Returns:
+        True for an ASCII `owner/name` that follows GitHub's naming rules. False
+        for anything else: dot-only names such as `.` and `..` (they would move
+        the request to another API path), a `.git` suffix, extra path segments,
+        whitespace, control characters, non-ASCII letters and non-strings.
+
+    Example:
+        is_valid_repo("MorpheApp/morphe-patches") -> True
+        is_valid_repo("owner/..") -> False
+    """
+    if not isinstance(repo, str) or REPO_PATTERN.fullmatch(repo) is None:
+        return False
+    name = repo.split("/", 1)[1]
+    return set(name) != {"."} and not name.lower().endswith(".git")
 
 
 def normalize_repo(raw):
@@ -360,7 +864,75 @@ def normalize_repo(raw):
     if len(parts) < 2:
         return None
     repo = "/".join(parts[:2]).removesuffix(".git")
-    return repo if REPO_PATTERN.match(repo) else None
+    return repo if is_valid_repo(repo) else None
+
+
+def _quoted(value: object, limit: int = 60) -> str:
+    """Return a short, single-line, quoted form of any config value for messages."""
+    text = value if isinstance(value, str) else repr(value)
+    return repr(text[:limit])
+
+
+def find_file_collision(repo: str, sources: list[dict]) -> str | None:
+    """Find an existing source whose local files `repo` would share.
+
+    Two different repos can name the same files (`/` becomes `-`, case is
+    folded), and syncing one would then replace the other's bundle.
+
+    Args:
+        repo: A valid `owner/name`.
+        sources: The `sources` list of the config; entries with a missing,
+            non-text or invalid repo are ignored.
+
+    Returns:
+        The repo of the first source with the same files, or None.
+    """
+    files = get_source_paths(repo)[".mpp"]
+    for source in sources:
+        other = source.get("repo")
+        if is_valid_repo(other) and get_source_paths(other)[".mpp"] == files:
+            return str(other)
+    return None
+
+
+def plan_source_sync(config: dict) -> tuple[list[dict], list[str]]:
+    """Decide which active sources can be synced and describe the ones that cannot.
+
+    A source is skipped when its repo is not a valid `owner/name` (a hand-edited
+    config) or when its local files are already taken by an earlier active
+    source: the first in config order keeps them.
+
+    Args:
+        config: The loaded config.
+
+    Returns:
+        The sources to sync, and one message per skipped source or tool
+        repository (naming it, never a secret). Nothing is requested here.
+    """
+    usable: list[dict] = []
+    problems: list[str] = []
+    owners: dict[Path, str] = {}
+    for key, repo in (config.get("repositories") or {}).items():
+        if key in ("cli", "apkeditor") and not is_valid_repo(repo):
+            problems.append(f"Tool repository {key!r} is invalid: {_quoted(repo)}")
+    for source in config.get("sources", []):
+        if not source.get("active", True):
+            continue
+        label = _quoted(source.get("name"))
+        repo = source.get("repo")
+        if not is_valid_repo(repo):
+            problems.append(f"Source {label} has an invalid repository {_quoted(repo)}")
+            continue
+        files = get_source_paths(repo)[".mpp"]
+        if files in owners:
+            problems.append(
+                f"Source {label} ({repo}) uses the same local files as source "
+                f"{owners[files]} and is skipped"
+            )
+            continue
+        owners[files] = f"{label} ({repo})"
+        usable.append(source)
+    return usable, problems
 
 
 def get_source_paths(repo_path):
@@ -378,7 +950,7 @@ def check_dependencies(config):
     java_bin = config.get("settings", {}).get("java_path", "java")
     
     try:
-        subprocess.run([java_bin, "-version"], capture_output=True, check=True)
+        run_child([java_bin, "-version"], capture_output=True, check=True)
         results["java"] = True
     except:
         pass
@@ -400,7 +972,8 @@ def _apply_versions(config: dict, local_versions: dict) -> None:
         local_versions: Installed version per repo, from `load_local_versions`.
     """
     for source in config.get("sources", []):
-        version_tag = local_versions.get(source["repo"])
+        repo = source.get("repo")
+        version_tag = local_versions.get(repo) if isinstance(repo, str) else None
         if version_tag:
             source["version"] = version_tag
 
@@ -516,8 +1089,11 @@ def save_app_result(app_id: str, **fields: object) -> None:
 
     Args:
         app_id: Package id of the app the result belongs to.
-        **fields: Result fields: status, error, last_successful_build.
+        **fields: Result fields: status, error, last_successful_build. A text
+            `error` is stored with secret values removed.
     """
+    if isinstance(fields.get("error"), str):
+        fields["error"] = secrets_store.redact(str(fields["error"]))
 
     def apply(config: dict) -> None:
         for app in config.get("apps", []):
@@ -544,6 +1120,8 @@ def update_tools(config, quiet=False, force=False):
     Raises:
         GitHubRateLimitError: GitHub rate limited the sync. Repos checked before
             the limit are still saved; the rest were skipped.
+        GitHubTokenRejectedError: GitHub rejected the saved token. Every later
+            call would fail the same way, so the rest were skipped (as above).
     """
     if not quiet:
         print("--- Checking for Tool Updates ---")
@@ -554,7 +1132,7 @@ def update_tools(config, quiet=False, force=False):
     tools = config["tools"]
     
     any_updated = False
-    rate_limit = None
+    stop_error: GitHubRateLimitError | GitHubTokenRejectedError | None = None
 
     try:
         if check_and_download_release(
@@ -571,18 +1149,20 @@ def update_tools(config, quiet=False, force=False):
             ):
                 any_updated = True
 
-        # Update each source
-        for source in config.get("sources", []):
-            if source.get("active", True):
-                if not quiet:
-                    print(f"Checking for updates for source: {source['name']} ({source['repo']})...")
-                if check_and_download_release(
-                    source["repo"], get_source_paths(source["repo"]), force=force
-                ):
-                    any_updated = True
-    except GitHubRateLimitError as e:
-        # Every remaining repo would hit the same limit: stop and report below.
-        rate_limit = e
+        # Update each source that has a usable repository of its own
+        usable_sources, problems = plan_source_sync(config)
+        for problem in problems:
+            logger.error("Not syncing: %s", problem)
+        for source in usable_sources:
+            repo = source["repo"]
+            if not quiet:
+                print(f"Checking for updates for source: {source.get('name')} ({repo})...")
+            if check_and_download_release(repo, get_source_paths(repo), force=force):
+                any_updated = True
+    except (GitHubRateLimitError, GitHubTokenRejectedError) as e:
+        # Every remaining repo would hit the same limit or the same rejected
+        # token: stop and report below, once.
+        stop_error = e
 
     # SYNC VERSIONS BACK TO CONFIG
     local_versions = load_local_versions()
@@ -593,8 +1173,8 @@ def update_tools(config, quiet=False, force=False):
 
     if not quiet:
         print("---------------------------------\n")
-    if rate_limit is not None:
-        raise rate_limit
+    if stop_error is not None:
+        raise stop_error
     return any_updated
 
 
@@ -639,6 +1219,44 @@ class PatchListError(Exception):
         )
 
 
+class _PatchListFormatError(Exception):
+    """A file is not a usable patch list; the message gives the reason."""
+
+
+def _read_patch_list(json_path: Path) -> list[dict[str, object]]:
+    """Read and validate a patch list file.
+
+    Accepts a top-level list of patches or an object with a `patches` list.
+
+    Args:
+        json_path: File to read.
+
+    Returns:
+        The patches, every one a JSON object.
+
+    Raises:
+        _PatchListFormatError: The file cannot be read, is not valid JSON, or
+            does not have the shape of a patch list.
+    """
+    try:
+        with open(json_path, "r", encoding="utf-8") as file:
+            data = json.load(file)
+    except json.JSONDecodeError as error:
+        raise _PatchListFormatError(f"invalid JSON: {error}") from error
+    except UnicodeDecodeError as error:
+        raise _PatchListFormatError("not valid UTF-8 text") from error
+    except OSError as error:
+        raise _PatchListFormatError(error.strerror or type(error).__name__) from error
+    patches = data.get("patches") if isinstance(data, dict) else data
+    if not isinstance(patches, list):
+        raise _PatchListFormatError("no list of patches")
+    if not all(isinstance(patch, dict) for patch in patches):
+        raise _PatchListFormatError("an entry is not a JSON object")
+    if not all(isinstance(p.get("name"), str | None) for p in patches):
+        raise _PatchListFormatError("a patch name is not text")
+    return patches
+
+
 def load_patch_list(repo: str) -> list[dict[str, object]]:
     """Read and validate the downloaded patch list of one source.
 
@@ -655,24 +1273,10 @@ def load_patch_list(repo: str) -> list[dict[str, object]]:
         PatchListError: The file cannot be read, is not valid JSON, or does not
             have the shape of a patch list.
     """
-    json_path = get_source_paths(repo)[".json"]
     try:
-        with open(json_path, "r", encoding="utf-8") as file:
-            data = json.load(file)
-    except json.JSONDecodeError as error:
-        raise PatchListError(repo, f"invalid JSON: {error}") from error
-    except UnicodeDecodeError as error:
-        raise PatchListError(repo, "not valid UTF-8 text") from error
-    except OSError as error:
-        raise PatchListError(repo, error.strerror or type(error).__name__) from error
-    patches = data.get("patches") if isinstance(data, dict) else data
-    if not isinstance(patches, list):
-        raise PatchListError(repo, "no list of patches")
-    if not all(isinstance(patch, dict) for patch in patches):
-        raise PatchListError(repo, "an entry is not a JSON object")
-    if not all(isinstance(p.get("name"), str | None) for p in patches):
-        raise PatchListError(repo, "a patch name is not text")
-    return patches
+        return _read_patch_list(get_source_paths(repo)[".json"])
+    except _PatchListFormatError as error:
+        raise PatchListError(repo, str(error)) from error
 
 
 def get_supported_versions(
@@ -840,7 +1444,7 @@ def extract_app_metadata(apk_path, package_id, scraper=None):
         version_name = "Unknown"
 
         if apkeditor_path.exists():
-            result = subprocess.run(
+            result = run_child(
                 [java_bin, "-jar", str(apkeditor_path), "info", "-i", str(apk_path)],
                 capture_output=True,
                 text=True
@@ -1008,7 +1612,7 @@ def download_apk(package_name, target_version, final_path, tools_config, config,
                     "-o",
                     str(final_path),
                 ]
-                subprocess.run(merge_command, check=True)
+                run_child(merge_command, check=True)
                 print(f"Successfully merged Universal APK to {final_path}")
             else:
                 shutil.move(downloaded_path, final_path)
@@ -1051,7 +1655,7 @@ def _read_package_id(java_bin: str, input_apk: Path | str, fallback: str) -> str
     """
     apkeditor_path = DATA_DIR / "bin" / "APKEditor.jar"
     try:
-        info_result = subprocess.run(
+        info_result = run_child(
             [java_bin, "-jar", str(apkeditor_path), "info", "-i", str(input_apk)],
             capture_output=True,
             text=True,
@@ -1222,7 +1826,7 @@ def patch_app(
     recent_lines: deque[str] = deque(maxlen=CLI_TAIL_LINES)
     output_path = Path(output_apk)
     try:
-        process = subprocess.Popen(
+        process = start_child(
             command,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -1243,7 +1847,7 @@ def patch_app(
                     applied_count += 1
                 if line.strip():
                     recent_lines.append(line.strip())
-                sys.stdout.write(line)
+                sys.stdout.write(secrets_store.redact(line))
                 sys.stdout.flush()
         except BaseException:
             # A failed read must not leave the child running or a partial APK.
@@ -1336,7 +1940,7 @@ def run_pipeline(package_ids=None, quiet=False, scraper=None):
     config = load_config()
     try:
         was_updated = update_tools(config, quiet=quiet)
-    except GitHubRateLimitError as e:
+    except (GitHubRateLimitError, GitHubTokenRejectedError) as e:
         print(f"[x] {e} Continuing with the tools and patches already on disk.")
         was_updated = False
     
@@ -1561,4 +2165,5 @@ def get_all_available_apps(config):
 
 
 if __name__ == "__main__":
+    secrets_store.absorb_environment()
     run_pipeline()
