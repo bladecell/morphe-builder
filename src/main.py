@@ -6,6 +6,7 @@ from fastapi.templating import Jinja2Templates
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
+import hashlib
 import json
 import math
 import re
@@ -376,6 +377,40 @@ async def redacted_http_exception_handler(
 
 # Setup templates directory
 templates = Jinja2Templates(directory=str(PROJECT_ROOT / "src" / "templates"))
+
+# Self-hosted page assets: the built Tailwind stylesheet and vendored Alpine.
+STATIC_DIR = PROJECT_ROOT / "src" / "static"
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+def asset_url(filename: str) -> str:
+    """Return the URL of a static file, tagged with a hash of its content.
+
+    The app sends no Cache-Control for static files, so a browser may reuse an old
+    copy; the changing query string makes it fetch a rebuilt stylesheet.
+
+    Args:
+        filename: Name of a file directly under `src/static/`.
+
+    Returns:
+        `/static/<filename>?v=<first 12 hex of the SHA-256 of the file>`. If the
+        file is missing, the plain `/static/<filename>` and an error is logged, so
+        the admin page still renders (unstyled) instead of answering 500.
+    """
+    path = STATIC_DIR / filename
+    try:
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    except FileNotFoundError:
+        logger.error(
+            "Static file %s is missing; rebuild the stylesheet with: "
+            "uv run python scripts/build_css.py",
+            path,
+        )
+        return f"/static/{filename}"
+    return f"/static/{filename}?v={digest[:12]}"
+
+
+templates.env.globals["asset_url"] = asset_url
 
 # Mount static icons directory
 icons_dir = DATA_DIR / "apks" / "icons"

@@ -227,7 +227,10 @@ branch `secrets-guards-worker`.
       and secret fixes from the reviews (2026-10-06)
 - [x] Server URL stays a trust anchor until `ALLOWED_HOSTS` lists a full origin;
       an empty server URL can be saved (decided 2026-10-06)
-- [ ] Pin or vendor Tailwind and Alpine before a secret can be typed into the page
+- [x] Tailwind and Alpine no longer load from a CDN (done 2026-10-06 on branch
+      `local-static-assets`: stylesheet built ahead of time with the Tailwind
+      3.4.17 standalone CLI and committed, Alpine 3.17.4 vendored, both served
+      from `/static`; independently reviewed; not checked in a browser)
 - [ ] Step 4: Settings UI for both secrets, with the `environment_invalid` state
       and the token-permissions warning
 - [ ] Step 5: licence key passed to the browser explicitly; keyless fallback when

@@ -15,3 +15,6 @@ apks/
 config.yaml
 .env*
 ..env-*
+
+# Tailwind standalone CLI cache (scripts/build_css.py)
+.cache/

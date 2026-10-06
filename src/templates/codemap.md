@@ -7,7 +7,10 @@ scrapes.
 
 ## Design
 
-**`index.html`** is one file with no build step. Tailwind and Alpine.js load from CDNs.
+**`index.html`** is one file. Its stylesheet (`src/static/app.css`, built from the
+templates by `scripts/build_css.py`) and Alpine.js (vendored in `src/static/`) are
+served by the app; nothing loads from a CDN. Rebuild the stylesheet after changing
+classes here.
 All client state and behaviour live in a single Alpine component,
 `Alpine.data('morphe', ...)`, bound on `<body x-data="morphe">`.
 
