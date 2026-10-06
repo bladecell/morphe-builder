@@ -67,6 +67,7 @@ def test_updates_runs_one_refresh_while_another_is_in_progress(updates_env):
     calls_during = worker.calls
     worker.release.set()
     first.join(WAIT)
+    assert not first.is_alive()
 
     assert not first_errors
     assert during == [{}] * 5
@@ -87,6 +88,7 @@ def test_updates_in_progress_answer_is_the_stale_result_when_there_is_one(
     during = main.check_updates()
     worker.release.set()
     first.join(WAIT)
+    assert not first.is_alive()
 
     assert during == stale
     assert worker.calls == 2

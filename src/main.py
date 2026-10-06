@@ -13,7 +13,6 @@ import sys
 import io
 import time
 import apprise
-from playwright.sync_api import Error as PlaywrightError
 from dataclasses import dataclass
 from typing import Any, Callable, List, Protocol, TypeVar, cast
 from pathlib import Path
@@ -38,16 +37,22 @@ from src.patcher import (
     GitHubRateLimitError,
     GitHubTokenRejectedError,
     github_token_warning,
+    github_token_rejected,
+    SYNC_LOCK,
+    remove_stale_download_files,
 )
 from packaging import version
+from apscheduler.jobstores.base import JobLookupError  # type: ignore[import-untyped]
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 import threading
+import uuid
 import asyncio
 import logging
 import queue
 from src import secrets_store
+from src import request_guards
 from src.request_guards import RequestGuardMiddleware
 from src.config_store import load_config, update_config
 
@@ -133,6 +138,8 @@ class ScraperWorker(threading.Thread):
         self._clock = clock
         self._cooldown = cooldown
         self._next_attempt_at = 0.0
+        self._launching = False  # True while `_launch` runs
+        self._busy_since: float | None = None  # epoch seconds; None when idle
         # Guards `_stopping` together with the queue put, so that no task can be
         # queued after the STOP/drain: execute and shutdown cannot interleave.
         self._lock = threading.Lock()
@@ -152,6 +159,14 @@ class ScraperWorker(threading.Thread):
 
     def _run_task(self, task: _Task) -> None:
         """Run one task and hand its result or error to the waiting caller."""
+        self._busy_since = time.time()
+        try:
+            self._run_task_body(task)
+        finally:
+            self._busy_since = None
+
+    def _run_task_body(self, task: _Task) -> None:
+        """Launch the browser if needed, run the task and answer its caller."""
         try:
             if self.downloader is None and self._clock() >= self._next_attempt_at:
                 self._try_launch()
@@ -171,6 +186,7 @@ class ScraperWorker(threading.Thread):
     def _try_launch(self) -> None:
         """Launch the browser; on failure record the redacted error and cooldown."""
         logger.info("Initializing persistent ApkMirror_Downloader...")
+        self._launching = True
         try:
             self.downloader = self._launch()
         except Exception as error:  # noqa: BLE001 - any launch failure is recoverable
@@ -179,6 +195,8 @@ class ScraperWorker(threading.Thread):
             self._next_attempt_at = self._clock() + self._cooldown
             logger.error("Browser launch failed: %s", self.error)
             return
+        finally:
+            self._launching = False
         self.error = None
 
     def _finish(self) -> None:
@@ -186,7 +204,13 @@ class ScraperWorker(threading.Thread):
         with self._lock:
             self._stopping = True  # no task can be queued after this
         self.initialized.set()
-        self._close_downloader()
+        try:
+            self._close_downloader()
+        finally:
+            self._answer_queued_tasks()
+
+    def _answer_queued_tasks(self) -> None:
+        """Answer every task still queued with `ScraperUnavailableError`."""
         while True:
             try:
                 task = self.task_queue.get_nowait()
@@ -201,7 +225,11 @@ class ScraperWorker(threading.Thread):
             return
         try:
             self.downloader.close()
-        except (PlaywrightError, OSError) as error:
+        except Exception as error:  # noqa: BLE001 - see below
+            # Deliberately broad: this runs at the thread boundary. Any error
+            # escaping here would skip the queue drain, end the thread through
+            # `threading.excepthook` and print an unredacted traceback outside
+            # the logger. The error is logged (redacted), never swallowed.
             logger.error(
                 "Closing the browser failed: %s", secrets_store.redact(str(error))
             )
@@ -209,7 +237,7 @@ class ScraperWorker(threading.Thread):
 
     def _retry_in(self) -> int | None:
         """Whole seconds until the next launch attempt, or None when not waiting."""
-        if self.downloader is not None or self._stopping:
+        if self.downloader is not None or self._stopping or self._launching:
             return None
         return max(0, math.ceil(self._next_attempt_at - self._clock()))
 
@@ -217,24 +245,32 @@ class ScraperWorker(threading.Thread):
         """Text for a task refused because the browser is down."""
         return f"Browser unavailable ({self.error}); it is retried after a cooldown"
 
-    def status(self) -> dict[str, str | int | None]:
+    def status(self) -> dict[str, str | int | float | None]:
         """Report the browser state for the UI.
 
         Returns:
-            `state` ("starting", "available", "unavailable", "stopping" while
-            work still runs after a stop request, or "stopped" once the thread
-            has ended), the redacted last launch `error` (or None) and `retry_in`
-            seconds until the next launch attempt (or None).
+            `state` ("starting" during the first launch and any relaunch,
+            "available", "unavailable", "stopping" while work still runs after
+            a stop request, or "stopped" once the thread has ended), the
+            redacted last launch `error` (or None), `retry_in` seconds until the
+            next launch attempt (or None) and `busy_since`, the epoch seconds at
+            which the running task started (or None when idle). A `busy_since`
+            far in the past with "available" is a stuck task.
         """
         if self._stopping:
             state = "stopping" if self.is_alive() else "stopped"
         elif self.downloader is not None:
             state = "available"
-        elif not self.initialized.is_set():
+        elif self._launching or not self.initialized.is_set():
             state = "starting"
         else:
             state = "unavailable"
-        return {"state": state, "error": self.error, "retry_in": self._retry_in()}
+        return {
+            "state": state,
+            "error": self.error,
+            "retry_in": self._retry_in(),
+            "busy_since": self._busy_since,
+        }
 
     def execute(
         self, func: Callable[..., T], *args: object, **kwargs: object
@@ -299,7 +335,14 @@ class ScraperWorker(threading.Thread):
 
 
 SCRAPER_WORKER = ScraperWorker()
+# True while any scraper activity (a version refresh or a build) is queued or
+# running. It is derived from `_ACTIVITY_COUNT`, so one activity ending cannot
+# clear it while another still runs.
 SCRAPER_ACTIVE = False
+_ACTIVITY_COUNT = 0
+# Guards the build flag, the activity count, the sync flag and the update cache
+# generation. Never held across a network call or a worker wait.
+_STATE_LOCK = threading.Lock()
 
 app.add_middleware(RequestGuardMiddleware)
 
@@ -357,11 +400,28 @@ def ensure_data_dirs():
 # Cache for update status to prevent excessive polling load
 UPDATE_CACHE: dict[str, Any] = {"timestamp": 0, "results": None}
 UPDATE_LOCK = threading.Lock()
+# Bumped on every invalidation. A refresh remembers the value it started with and
+# stamps its result fresh only if it is unchanged when the refresh ends.
+_UPDATE_GENERATION = 0
+
+
+def _invalidate_updates() -> None:
+    """Mark the cached update status as out of date, including a running refresh."""
+    global _UPDATE_GENERATION
+    with _STATE_LOCK:
+        _UPDATE_GENERATION += 1
+        UPDATE_CACHE["timestamp"] = 0
+
 
 @app.get("/api/ui/updates")
-def check_updates():
-    """Checks each pipeline app for updates against remote sources."""
-    global UPDATE_CACHE
+def check_updates() -> dict:
+    """Check each pipeline app for updates against remote sources.
+
+    Returns:
+        The update status per app id: the cached result while it is under 60
+        seconds old, the last (stale) result or {} while a build, another
+        scraper activity or another refresh is running, else a fresh one.
+    """
     now = time.time()
 
     # Return cached results if they are less than 60 seconds old
@@ -458,31 +518,40 @@ def _redacted(error: BaseException) -> str:
 def _refresh_updates() -> dict:
     """Compute the update status of every pipeline app and cache it.
 
-    Called with `UPDATE_LOCK` held.
+    Called with `UPDATE_LOCK` held. The result is stamped fresh only when no
+    invalidation happened while it was being computed; otherwise it is kept as
+    the stale fallback with timestamp 0 and the next poll refreshes again.
+
+    Returns:
+        The update status per app id.
     """
     global UPDATE_CACHE
+    with _STATE_LOCK:
+        started_generation = _UPDATE_GENERATION
     config = load_config()
     update_status = {}
-    
+
     # Check which apps actually have patched files existing
     patched_dir = DATA_DIR / "apks" / "patched"
     icons_dir = DATA_DIR / "apks" / "icons"
-    
+
     # Get current versions of all active patch sources
     from src.patcher import get_patch_versions
     remote_patch_versions = get_patch_versions(config)
-    
+
     for app_info in config.get("apps", []):
         package_id = app_info["id"]
-        
+
         # Pinned version check
         pinned_version = app_info.get("version")
         patch_list_error = None
         try:
             if pinned_version:
-                # Skip APKMirror completely if pinned. 
+                # Skip APKMirror completely if pinned.
                 # get_supported_versions will return the pinned version via JSON check
-                remote_versions, _, _ = get_supported_versions(package_id, config, quiet=True)
+                remote_versions, _, _ = get_supported_versions(
+                    package_id, config, quiet=True
+                )
             else:
                 # For unpinned apps, use the worker to find the newest from APKMirror
                 # We use quiet=True here to avoid log spam from polling
@@ -508,31 +577,32 @@ def _refresh_updates() -> dict:
             remote_versions = []
             patch_list_error = f"Version lookup failed: {_redacted(error)}"
             logger.error("Update check for %s: %s", package_id, patch_list_error)
-        
+
         # Check if file exists (glob for versioned name or legacy)
         file_exists = False
         if list(patched_dir.glob(f"{package_id}-*.apk")):
             file_exists = True
-        
+
         icon_exists = (icons_dir / f"{package_id}.png").exists()
 
-        # The 'latest' for update purposes is the first item in the list 
+        # The 'latest' for update purposes is the first item in the list
         latest_remote_app_str = remote_versions[0] if remote_versions else "Unknown"
-        
+
         # Use config for current state
         last_build = app_info.get("last_successful_build", {})
         current_patched_app_str = last_build.get("app_version", "None")
-        
+
         has_update = False
         # Update needed if:
         # 1. Remote app version > current patched app version
         # 2. Remote patch versions != our last used patch versions for this app
         # 3. File doesn't exist
         # 4. Patch selection differs from the one the last build used
-        
+
         if latest_remote_app_str != "Unknown" and current_patched_app_str != "None":
             try:
-                if version.parse(latest_remote_app_str) > version.parse(current_patched_app_str):
+                latest = version.parse(latest_remote_app_str)
+                if latest > version.parse(current_patched_app_str):
                     has_update = True
             except version.InvalidVersion:
                 if latest_remote_app_str != current_patched_app_str:
@@ -546,10 +616,11 @@ def _refresh_updates() -> dict:
             has_update = True
         else:
             for repo in used_repos:
-                if remote_patch_versions.get(repo) != last_build.get("patch_versions", {}).get(repo):
+                built_versions = last_build.get("patch_versions", {})
+                if remote_patch_versions.get(repo) != built_versions.get(repo):
                     has_update = True
                     break
-            
+
         if not file_exists:
             has_update = True
 
@@ -569,7 +640,12 @@ def _refresh_updates() -> dict:
         }
 
     # Stamped when the refresh ends: a slow one must not store an expired result.
-    UPDATE_CACHE = {"timestamp": time.time(), "results": update_status}
+    with _STATE_LOCK:
+        is_current = started_generation == _UPDATE_GENERATION
+        UPDATE_CACHE = {
+            "timestamp": time.time() if is_current else 0,
+            "results": update_status,
+        }
     return update_status
 
 # --- WEB UI ROUTES ---
@@ -734,9 +810,35 @@ class AddSourcePayload(BaseModel):
     repo: str
 
 
-def update_tools_task(config, force=False):
+def _claim_tools_sync() -> bool:
+    """Claim the one background tool sync; False when one is already claimed.
+
+    Returns:
+        True when the caller now owns the claim and must end it by running
+        `update_tools_task(..., claimed=True)`.
+    """
+    global TOOLS_UPDATING
+    with _STATE_LOCK:
+        if TOOLS_UPDATING:
+            return False
+        TOOLS_UPDATING = True
+        return True
+
+
+def update_tools_task(config: dict, force: bool = False, claimed: bool = False) -> None:
+    """Sync the tool jars and active sources, one sync at a time.
+
+    Args:
+        config: The loaded config.
+        force: Skip the update-check throttle.
+        claimed: True when the caller already holds the claim from
+            `_claim_tools_sync`. Otherwise one is taken here and, when another
+            sync is running, nothing is started.
+    """
     global TOOLS_UPDATING, SYNC_ERROR
-    TOOLS_UPDATING = True
+    if not claimed and not _claim_tools_sync():
+        logger.info("A tool sync is already running; not starting another")
+        return
     SYNC_ERROR = None
     problems: list[str] = []
     try:
@@ -750,10 +852,37 @@ def update_tools_task(config, force=False):
         TOOLS_UPDATING = False
 
 
-def refresh_versions_task():
+def _begin_activity(exclusive: bool = False) -> bool:
+    """Record one more scraper activity (a refresh or a build).
+
+    Args:
+        exclusive: Refuse when a build is queued or running, or any activity
+            is already going.
+
+    Returns:
+        True when the activity was recorded; the caller must call
+        `_end_activity` once, in a `finally`.
+    """
+    global SCRAPER_ACTIVE, _ACTIVITY_COUNT
+    with _STATE_LOCK:
+        if exclusive and (SCRAPER_ACTIVE or BUILD_STATUS["in_progress"]):
+            return False
+        _ACTIVITY_COUNT += 1
+        SCRAPER_ACTIVE = True
+        return True
+
+
+def _end_activity() -> None:
+    """Record that one scraper activity ended; the flag drops with the last one."""
+    global SCRAPER_ACTIVE, _ACTIVITY_COUNT
+    with _STATE_LOCK:
+        _ACTIVITY_COUNT = max(0, _ACTIVITY_COUNT - 1)
+        SCRAPER_ACTIVE = _ACTIVITY_COUNT > 0
+
+
+def refresh_versions_task() -> None:
     """Background task to refresh the version cache for all apps in the pipeline."""
-    global SCRAPER_ACTIVE
-    if SCRAPER_ACTIVE:
+    if not _begin_activity(exclusive=True):
         print("[Cron] Scraper busy, skipping refresh...")
         return
 
@@ -772,24 +901,49 @@ def refresh_versions_task():
                     logger.error("Version refresh for %s: %s", app["id"], error)
 
     try:
-        SCRAPER_ACTIVE = True
         SCRAPER_WORKER.execute(_do_refresh)
     except Exception as e:
         logger.error("Version refresh failed: %s", _redacted(e))
     finally:
-        SCRAPER_ACTIVE = False
+        _end_activity()
 
 
-def _collision_detail(repo: str, other: str) -> str:
-    """Error text for a new source whose local files an existing one already uses."""
+def _collision_detail(other: str) -> str:
+    """Error text for a new source whose local files an existing one already uses.
+
+    Args:
+        other: The existing source's repo, taken from the config (never from the
+            request: a request value in an error text would be a masking oracle).
+
+    Returns:
+        The message.
+    """
     return (
-        f"Source {repo} would use the same local files as the existing source "
+        "This source would use the same local files as the existing source "
         f"{other}. Remove {other} first."
     )
 
 
 @app.post("/api/ui/add_source")
-def add_source(payload: AddSourcePayload):
+def add_source(payload: AddSourcePayload) -> dict[str, str]:
+    """Sync a new patch source and add it to the config.
+
+    The sync runs before the config is written, so a broken repository is never
+    half-added. It holds the sync lock (not the config lock); when another sync
+    is running the request is refused rather than queued.
+
+    Args:
+        payload: The repository, as `owner/repo` or a GitHub URL.
+
+    Returns:
+        `{"status": "success", "name": <source name>}`.
+
+    Raises:
+        HTTPException: 400 for an invalid, duplicate or colliding repository,
+            409 while another sync runs, 429 on a GitHub rate limit, 502 when
+            GitHub rejected the token or the repository lacks a patch list or
+            bundle.
+    """
     repo = normalize_repo(payload.repo)
     if not repo:
         raise HTTPException(400, "Invalid repository. Use 'owner/repo' or a GitHub URL.")
@@ -797,31 +951,44 @@ def add_source(payload: AddSourcePayload):
     config = load_config()
     sources = config.get("sources", [])
     if any(str(s.get("repo")).lower() == repo.lower() for s in sources):
-        raise HTTPException(400, f"Source {repo} already exists.")
+        raise HTTPException(400, "This source already exists.")
     collides_with = find_file_collision(repo, sources)
     if collides_with is not None:
-        raise HTTPException(400, _collision_detail(repo, collides_with))
+        raise HTTPException(400, _collision_detail(collides_with))
 
     # Sync before saving so a broken repo never ends up half-added, and the
     # patches .json exists before the frontend re-renders the app list.
     # Success is judged by the files on disk: the sync returns False both on
     # failure and when already up to date.
+    # One sync at a time: when another one runs, this request is refused (409)
+    # instead of waiting, so a request thread is never parked behind a long sync.
+    # The sync lock is not the config lock; no config lock is held here.
     paths = get_source_paths(repo)
+    if not SYNC_LOCK.acquire(blocking=False):
+        raise HTTPException(
+            409, "A sync is already running. Try again when it has finished."
+        )
     try:
+        remove_stale_download_files()
         check_and_download_release(repo, paths, force=True)
     except GitHubRateLimitError as e:
         raise HTTPException(429, str(e)) from e
     except GitHubTokenRejectedError as e:
         # 502, not 401: the browser's own request was fine, GitHub refused ours.
         raise HTTPException(502, str(e)) from e
+    finally:
+        SYNC_LOCK.release()
     if not paths[".json"].exists():
         raise HTTPException(
             502,
-            f"{repo} is missing the patches JSON (patches-list.json or patches.json).",
+            "The repository is missing the patches JSON "
+            "(patches-list.json or patches.json).",
         )
     if not paths[".mpp"].exists():
         raise HTTPException(
-            502, f"{repo} has no .mpp patch bundle in its latest release (or no releases)."
+            502,
+            "The repository has no .mpp patch bundle in its latest release "
+            "(or no releases).",
         )
 
     name = f"{repo.split('/')[0]} Patches"
@@ -836,10 +1003,10 @@ def add_source(payload: AddSourcePayload):
         # Re-check against the file as it is now: the sync above was unlocked.
         current_sources = current.setdefault("sources", [])
         if any(str(s.get("repo")).lower() == repo.lower() for s in current_sources):
-            raise HTTPException(400, f"Source {repo} already exists.")
+            raise HTTPException(400, "This source already exists.")
         other = find_file_collision(repo, current_sources)
         if other is not None:
-            raise HTTPException(400, _collision_detail(repo, other))
+            raise HTTPException(400, _collision_detail(other))
         current_sources.append(new_source)
 
     update_config(apply)
@@ -922,11 +1089,31 @@ def refresh_discovery():
 
 
 @app.post("/api/ui/discovery/sync")
-def sync_discovery(background_tasks: BackgroundTasks):
-    """Queue a forced tool and source sync and return the current app list."""
+def sync_discovery(background_tasks: BackgroundTasks) -> dict:
+    """Queue a forced tool and source sync unless one is already running.
+
+    Args:
+        background_tasks: FastAPI's task queue for work after the response.
+
+    Returns:
+        The current app list. When a sync is already queued or running, nothing
+        is started and the answer also has `sync: "already running"`.
+    """
     config = load_config()
-    background_tasks.add_task(update_tools_task, config, True)
-    return {"apps": get_all_available_apps(config)}
+    # Everything that can fail runs before the claim is taken: after it, only
+    # queueing the task is left, so a failure cannot strand the claim.
+    apps = get_all_available_apps(config)
+    if SYNC_LOCK.locked() or not _claim_tools_sync():
+        return {"apps": apps, "sync": "already running"}
+    background_tasks.add_task(update_tools_task, config, True, True)
+    return {"apps": apps}
+
+
+SERVER_URL_INVALID = (
+    "Server URL must look like http://host:port or https://host/prefix: http or "
+    "https, a plain host name or address, an optional port and path, and no user "
+    "name, query, fragment or spaces."
+)
 
 
 class SaveSettingsPayload(BaseModel):
@@ -974,7 +1161,31 @@ CRON_LOCK = threading.Lock()
 
 
 @app.post("/api/ui/save_settings")
-def save_settings(payload: SaveSettingsPayload):
+def save_settings(payload: SaveSettingsPayload) -> dict[str, str]:
+    """Save the server URL, cron schedule and notification URLs.
+
+    Args:
+        payload: The new settings.
+
+    Returns:
+        `{"status": "success"}`.
+
+    Raises:
+        HTTPException: 400 with a fixed message when the server URL is not
+            `http(s)://host[:port][/prefix]`, is not empty and differs from
+            the stored one; nothing is written then.
+    """
+    stored = load_config().get("settings", {}).get("server_url")
+    unchanged = isinstance(stored, str) and payload.server_url.rstrip(
+        "/"
+    ) == stored.rstrip("/")
+    # A value already stored never blocks saving the other settings (the page
+    # posts all of them); only a changed value has to be valid. Empty means
+    # unset.
+    acceptable = unchanged or payload.server_url == ""
+    if not acceptable and not request_guards.is_valid_server_url(payload.server_url):
+        raise HTTPException(status_code=400, detail=SERVER_URL_INVALID)
+
     def apply(config: dict) -> None:
         settings = config.setdefault("settings", {})
         settings["server_url"] = payload.server_url.rstrip("/")
@@ -1110,20 +1321,57 @@ class TriggerBuildPayload(BaseModel):
     package_ids: List[str] | None = None
 
 
-def build_task(package_ids=None, is_cron=False):
-    global BUILD_STATUS, SCRAPER_ACTIVE
-    
-    current_time_str = time.strftime("%Y-%m-%d %H:%M")
-    if is_cron and BUILD_STATUS.get("last_run_minute") == current_time_str:
-        return
+def _claim_build() -> bool:
+    """Claim the one build slot, at request time.
 
-    if BUILD_STATUS["in_progress"]:
-        print("[Cron] Build already in progress, skipping...")
-        return
+    Returns:
+        True when the caller now owns the slot: `in_progress` is raised and
+        stays raised until the owner's `build_task` ends. False when a build is
+        already queued or running.
+    """
+    with _STATE_LOCK:
+        if BUILD_STATUS["in_progress"]:
+            return False
+        BUILD_STATUS["in_progress"] = True
+        BUILD_STATUS["message"] = "Queued"
+        return True
+
+
+def _release_build() -> None:
+    """Give the build slot back; only the build that claimed it calls this."""
+    with _STATE_LOCK:
+        BUILD_STATUS["in_progress"] = False
+
+
+def build_task(
+    package_ids: list[str] | None = None,
+    is_cron: bool = False,
+    claimed: bool = False,
+) -> None:
+    """Run one build on the scraper worker and always give the slot back.
+
+    At most one build is queued or running: the slot is claimed atomically when
+    the request is accepted and released only here, by the build that owns it.
+
+    Args:
+        package_ids: Apps to build; None or empty means all.
+        is_cron: True for the scheduled build (quiet, once per minute).
+        claimed: True when the caller (`trigger_build`) already claimed the
+            slot. Otherwise it is claimed here and the build is skipped when
+            another one is queued or running.
+    """
+    current_time_str = time.strftime("%Y-%m-%d %H:%M")
+    if not claimed:
+        if is_cron and BUILD_STATUS.get("last_run_minute") == current_time_str:
+            return
+        if not _claim_build():
+            logger.warning(
+                "A %s build was not started: another build is queued or running",
+                "scheduled" if is_cron else "manual",
+            )
+            return
 
     def _do_build(scraper):
-        global SCRAPER_ACTIVE
-        BUILD_STATUS["in_progress"] = True
         BUILD_STATUS["message"] = "Starting..."
         if is_cron:
             BUILD_STATUS["last_run_minute"] = current_time_str
@@ -1138,13 +1386,16 @@ def build_task(package_ids=None, is_cron=False):
                 patched_ids = run_pipeline(package_ids, quiet=is_cron, scraper=scraper)
                 BUILD_STATUS["message"] = "Finished"
                 BUILD_STATUS["last_run"] = time.strftime("%H:%M:%S")
-                
+
                 config = load_config()
                 all_apps = {a["id"]: a["name"] for a in config.get("apps", [])}
-                
+
                 if patched_ids:
                     patched_names = [all_apps.get(pid, pid) for pid in patched_ids]
-                    send_notification("Apps Patched Successfully", f"Updated: {', '.join(patched_names)}")
+                    send_notification(
+                        "Apps Patched Successfully",
+                        f"Updated: {', '.join(patched_names)}",
+                    )
                 elif not is_cron:
                     send_notification("Build Finished", "No updates or build failed.")
             except Exception as e:
@@ -1156,11 +1407,10 @@ def build_task(package_ids=None, is_cron=False):
             finally:
                 sys.stdout = old_stdout
                 # Invalidate update cache when build finishes
-                global UPDATE_CACHE
-                UPDATE_CACHE["timestamp"] = 0
+                _invalidate_updates()
 
+    _begin_activity()
     try:
-        SCRAPER_ACTIVE = True
         SCRAPER_WORKER.execute(_do_build)
     except Exception as e:
         # Raised outside the build body (browser down): nothing else reports it.
@@ -1168,26 +1418,48 @@ def build_task(package_ids=None, is_cron=False):
         logger.error("Build task failed: %s", message)
         BUILD_STATUS["message"] = f"Failed: {message}"
     finally:
-        BUILD_STATUS["in_progress"] = False
-        SCRAPER_ACTIVE = False
+        _end_activity()
+        _release_build()
 
 
 @app.post("/api/ui/trigger_build")
-def trigger_build(payload: TriggerBuildPayload):
-    if BUILD_STATUS["in_progress"]:
+def trigger_build(payload: TriggerBuildPayload) -> dict[str, str]:
+    """Accept a manual build unless one is already queued or running.
+
+    Args:
+        payload: Optional list of package ids; None builds all.
+
+    Returns:
+        `{"status": "Build started"}`, or `{"status": "Build already in
+        progress"}` when the build slot is taken (no second build is queued).
+    """
+    if not _claim_build():
         return {"status": "Build already in progress"}
 
-    # Invalidate cache to ensure UI shows correct status after trigger
-    global UPDATE_CACHE
-    UPDATE_CACHE["timestamp"] = 0
+    scheduled = False
+    try:
+        # Invalidate cache to ensure UI shows correct status after trigger
+        _invalidate_updates()
 
-    # Use an empty list if None is sent to signify "Build All" but manual
-    pkg_ids = payload.package_ids if payload.package_ids is not None else []
-    
-    # Use scheduler instead of BackgroundTasks to ensure it runs in a clean thread
-    # for Playwright compatibility.
-    scheduler.add_job(build_task, id=f"manual_build_{int(time.time())}", kwargs={"package_ids": pkg_ids, "is_cron": False})
-    
+        # Use an empty list if None is sent to signify "Build All" but manual
+        pkg_ids = payload.package_ids if payload.package_ids is not None else []
+
+        # Use scheduler instead of BackgroundTasks to ensure it runs in a clean
+        # thread for Playwright compatibility. A random id: two triggers in one
+        # second must not collide. No misfire grace limit: a job that starts late
+        # (all pool threads busy, a stalled clock) must still run, or the claim
+        # taken above would never be released.
+        scheduler.add_job(
+            build_task,
+            id=f"manual_build_{uuid.uuid4().hex}",
+            kwargs={"package_ids": pkg_ids, "is_cron": False, "claimed": True},
+            misfire_grace_time=None,
+        )
+        scheduled = True
+    finally:
+        if not scheduled:
+            _release_build()
+
     return {"status": "Build started"}
 
 
@@ -1198,14 +1470,24 @@ def get_build_status():
 
 
 @app.get("/api/ui/tools_status")
-def get_tools_status():
+def get_tools_status() -> dict:
+    """Report the sync, diagnostics and browser state shown in the header.
+
+    Returns:
+        `updating`, `sync_error`, `github_token_warning`,
+        `github_token_rejected`, `diagnostics`,
+        `browser` (the worker status, including `busy_since`) and `data_dir`.
+    """
     return {
-        "updating": TOOLS_UPDATING, 
+        "updating": TOOLS_UPDATING,
         "sync_error": _redacted_text(SYNC_ERROR),
-        "github_token_warning": _redacted_text(github_token_warning()),
+        # Not redacted: built from validated scope names and fixed text, so
+        # masking could only remove a scope that happens to match a secret.
+        "github_token_warning": github_token_warning(),
+        "github_token_rejected": github_token_rejected(),
         "diagnostics": DIAGNOSTICS,
         "browser": SCRAPER_WORKER.status(),
-        "data_dir": str(DATA_DIR)
+        "data_dir": str(DATA_DIR),
     }
 
 
@@ -1225,12 +1507,10 @@ def get_logs():
 @app.get("/download/{package_name}")
 def download_app_by_name(package_name: str):
     """Serves the latest patched APK for a given package name or exact filename."""
-    print(f"[Download] Request for: {package_name}")
 
     # Priority 1: Exact filename match in patched directory
     file_path = DATA_DIR / "apks" / "patched" / package_name
     if file_path.exists() and file_path.is_file():
-        print(f"[Download] Found via exact match: {file_path}")
         return FileResponse(file_path, media_type="application/vnd.android.package-archive")
 
     # Clean package name to handle .apk extension if present for globbing
@@ -1252,14 +1532,13 @@ def download_app_by_name(package_name: str):
         ]
         if matches:
             newest = max(matches, key=lambda f: f.stat().st_mtime)
-            print(f"[Download] Found newest for {base_name}: {newest}")
             return FileResponse(
                 newest, media_type="application/vnd.android.package-archive"
             )
 
-    raise HTTPException(
-        status_code=404, detail=f"No patched APK matches {package_name}"
-    )
+    # Fixed text: an error built from the request would let the secret masking
+    # confirm whether the requested name held a secret.
+    raise HTTPException(status_code=404, detail="No patched APK found")
 
 @app.get("/view/{package_id}", response_class=HTMLResponse)
 async def view_app(package_id: str, request: Request):
@@ -1271,7 +1550,6 @@ async def view_app(package_id: str, request: Request):
         app_info = next((a for a in config.get("apps", []) if a.get("obtainium_id") == package_id), None)
         
     if not app_info:
-        print(f"[View] App not found for ID: {package_id}")
         return HTMLResponse("App not found in pipeline", status_code=404)
         
     last_build = app_info.get("last_successful_build", {})
@@ -1316,14 +1594,12 @@ async def view_app(package_id: str, request: Request):
 @app.get("/api/apps/{obtainium_id}")
 def get_single_app(obtainium_id: str, request: Request):
     """Provides Obtainium metadata for a specific application."""
-    print(f"[Obtainium] Request for ID: {obtainium_id}")
     config = load_config()
     settings = config.get("settings", {})
     base_url = settings.get("server_url", str(request.base_url).rstrip("/"))
     
     app_info = next((a for a in config.get("apps", []) if a.get("obtainium_id") == obtainium_id), None)
     if not app_info:
-        print(f"[Obtainium] App with ID {obtainium_id} not found in config.")
         raise HTTPException(status_code=404, detail="App not found")
         
     last_build = app_info.get("last_successful_build", {})
@@ -1348,7 +1624,6 @@ def get_single_app(obtainium_id: str, request: Request):
         "version": version,
         "download_url": f"{base_url}/download/{filename}",
     }
-    print(f"[Obtainium] Returning: {response}")
     return response
 
 
@@ -1385,12 +1660,24 @@ def get_apps(request: Request):
     return {"apps": response_data}
 
 
-def setup_cron_job(config):
+# The only scheduler jobs `setup_cron_job` owns. Others (a pending manual build,
+# the initial version refresh) are never touched by it.
+CRON_JOB_IDS = ("periodic_build", "version_refresh")
+
+
+def setup_cron_job(config: dict) -> None:
+    """Replace the scheduled build and version refresh from the settings.
+
+    Args:
+        config: The loaded config; `settings.cron_schedule` may be empty.
+    """
     cron = config.get("settings", {}).get("cron_schedule")
-    # Remove existing job if any
-    for job in scheduler.get_jobs():
-        job.remove()
-    
+    for job_id in CRON_JOB_IDS:
+        try:
+            scheduler.remove_job(job_id)
+        except JobLookupError:
+            pass  # not scheduled, or already gone: nothing to remove
+
     if cron:
         try:
             # For cron, we pass package_ids=None (default) and is_cron=True
@@ -1405,7 +1692,8 @@ def setup_cron_job(config):
 
 
 @app.on_event("startup")
-async def startup_event():
+async def startup_event() -> None:
+    """Start the worker and scheduler, and sync the tools if they are missing."""
     global DIAGNOSTICS
     # First, before anything is started: take both secrets out of os.environ so
     # no thread, subprocess or library inherits them.
@@ -1438,8 +1726,13 @@ def shutdown_event():
 
     The worker is told first, so a scheduler problem cannot skip it. A running
     build is not cancelled: the scheduler is not waited for, and the worker
-    finishes the build before it closes the browser. If the build outlives
-    `SHUTDOWN_JOIN_SECONDS` the daemon thread ends with the process.
+    finishes the build before it closes the browser.
+
+    This does not make the process exit early. Only the worker thread is a
+    daemon. The scheduler's job thread that runs `build_task` stays blocked in
+    `ScraperWorker.execute` until the worker answers, and the interpreter waits
+    for that thread at exit, so the process ends when the running build ends
+    (`SHUTDOWN_JOIN_SECONDS` only bounds how long this handler waits).
     """
     print("[Shutdown] Stopping scheduler...")
     SCRAPER_WORKER.shutdown()

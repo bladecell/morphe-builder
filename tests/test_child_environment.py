@@ -242,9 +242,8 @@ def test_no_source_file_starts_a_process_except_through_the_helpers():
     ]
 
     # The two helpers in patcher.py are the only allowed direct calls.
-    assert sorted(found) == [
-        f"patcher.py:{line} subprocess.{name}" for line, name in sorted(_helper_lines())
-    ]
+    expected = [f"patcher.py:{line} subprocess.{name}" for line, name in _helper_lines()]
+    assert sorted(found) == sorted(expected)
 
 
 def _helper_lines() -> list[tuple[int, str]]:

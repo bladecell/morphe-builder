@@ -14,8 +14,12 @@ code) inherits them. The store keeps reporting them as coming from the
 environment and keeps validating and locking them. Nothing here ever writes a
 secret into `os.environ`.
 
-Every value this process has read, stored or been given stays masked by
-`redact` for the life of the process, even after it was rotated or cleared.
+Every value that has really been in effect in this process (read from the
+environment or the file, or successfully written) stays masked by `redact`,
+even after it was rotated or cleared. A value that was refused or whose write
+failed is never remembered, and the values replaced since are kept in a bounded
+list (`MAX_RETIRED_VALUES`, oldest dropped first); the values currently in
+effect are never dropped.
 
 `config_store.DATA_DIR` is read at call time so tests can redirect it. Writes
 are atomic, mode 0600, and serialised by one process-wide lock.
@@ -57,9 +61,21 @@ _warned_invalid_file: set[str] = set()
 _captured_environment: dict[str, str] = {}
 # Shorter values are not remembered: masking them would corrupt ordinary text.
 _MIN_MASKED_LENGTH = 8
-# Every secret value this process has seen, longest first. Only ever grows, and is
-# replaced as a whole (never mutated), so `redact` can read it without a lock.
+# Values in effect now, by (secret name, "environment" or "file"). At most four.
+_current: dict[tuple[str, str], str] = {}
+# Values that were in effect and have been replaced or cleared, oldest first.
+# Bounded: a flood of real rotations can only push out older retired values.
+MAX_RETIRED_VALUES = 32
+_retired: tuple[str, ...] = ()
+# The two groups above, longest first. Replaced as a whole (never mutated), so
+# `redact` can read it without a lock.
 _known: tuple[str, ...] = ()
+# The most that `_known` can hold: the retired values plus one per name and source.
+MAX_REMEMBERED_VALUES = MAX_RETIRED_VALUES + 2 * len(SECRET_NAMES)
+# A value being written right now. Masked from before the write until it is
+# either in effect (then it is in `_current`) or dropped, so a log line made
+# during the write cannot show it.
+_pending: tuple[str, ...] = ()
 _known_lock = threading.Lock()
 
 
@@ -80,14 +96,40 @@ class SecretFromEnvironmentError(RuntimeError):
         self.invalid = invalid
 
 
-def _remember(value: str) -> None:
-    """Keep `value` masked for the rest of the process."""
-    global _known
-    if len(value) < _MIN_MASKED_LENGTH or value in _known:
+def _track(name: str, source: str, value: str | None) -> None:
+    """Record the value now in effect for a secret and source; retire the old one.
+
+    A value that is replaced or removed moves to the bounded retired list, so it
+    stays masked. Only values in effect get here: the environment's, the file's
+    and a successfully written one.
+
+    Args:
+        name: Secret name.
+        source: "environment" or "file".
+        value: The value in effect, or None when there is none any more.
+    """
+    global _retired, _known
+    key = (name, source)
+    if _current.get(key) == value:
         return
     with _known_lock:
-        if value not in _known:
-            _known = tuple(sorted({*_known, value}, key=len, reverse=True))
+        old = _current.get(key)
+        if old == value:
+            return
+        if value is None:
+            _current.pop(key, None)
+        else:
+            _current[key] = value
+        if old is not None and old not in _current.values() and old not in _retired:
+            _retired = (*_retired, old)[-MAX_RETIRED_VALUES:]
+        masked = {*_current.values(), *_retired}
+        _known = tuple(
+            sorted(
+                (v for v in masked if len(v) >= _MIN_MASKED_LENGTH),
+                key=len,
+                reverse=True,
+            )
+        )
 
 
 def _env_path() -> Path:
@@ -104,10 +146,8 @@ def _env_value(name: str) -> str | None:
     environment at startup counts as the environment's.
     """
     value = (_captured_environment.get(name) or os.environ.get(name) or "").strip()
-    if not value:
-        return None
-    _remember(value)
-    return value
+    _track(name, "environment", value or None)
+    return value or None
 
 
 def _valid_env_value(name: str) -> str | None:
@@ -177,14 +217,16 @@ def _file_value(name: str) -> str | None:
         value = match.group(2).strip()
     if value is None:
         _warned_invalid_file.discard(name)
+        _track(name, "file", None)
         return None
     if _VALUE_PATTERN.fullmatch(value) is None:
+        _track(name, "file", None)
         if name not in _warned_invalid_file:
             _warned_invalid_file.add(name)
             logger.warning("Ignoring invalid value for %s in the .env file", name)
         return None
     _warned_invalid_file.discard(name)
-    _remember(value)
+    _track(name, "file", value)
     return value
 
 
@@ -277,9 +319,21 @@ def _rewrite(name: str, value: str | None) -> None:
         kept = [line for line in _read_lines() if _line_name(line) != name]
         if value is not None:
             kept.append(f"{name}={value}")
-        config_store.write_file_atomic(
-            _env_path(), "".join(f"{line}\n" for line in kept), mode=0o600
-        )
+        _set_pending((value,) if value is not None else ())
+        try:
+            config_store.write_file_atomic(
+                _env_path(), "".join(f"{line}\n" for line in kept), mode=0o600
+            )
+            # In effect from here on, and remembered before the mask is lifted.
+            _track(name, "file", value)
+        finally:
+            _set_pending(())
+
+
+def _set_pending(values: tuple[str, ...]) -> None:
+    """Set the values that are masked only while a write is in progress."""
+    global _pending
+    _pending = values
 
 
 def set_secret(name: str, value: str) -> None:
@@ -296,8 +350,21 @@ def set_secret(name: str, value: str) -> None:
         OSError: The file could not be read or written.
     """
     _check_name(name)
-    _remember(validate_secret(value))
-    _rewrite(name, value)
+    validate_secret(value)
+    try:
+        _rewrite(name, value)
+    except SecretFromEnvironmentError:
+        raise  # the message is the secret's name
+    except OSError as error:
+        # The text of a failure can quote the new value (a path or a message),
+        # and it is logged later by the caller, after the pending mask is gone.
+        # So it is cleaned here, and the original is not chained.
+        reason = (error.strerror or type(error).__name__).replace(value, "***")
+        raise OSError(error.errno, reason) from None
+    except Exception as error:  # noqa: BLE001 - unknown failure: say only its type
+        raise RuntimeError(
+            f"{type(error).__name__} while storing the secret"
+        ) from None
 
 
 def clear_secret(name: str) -> None:
@@ -356,7 +423,14 @@ def redact(text: str) -> str:
     """
     for name in SECRET_NAMES:
         _env_value(name)  # picks up a variable set since the last call
-    for value in _known:
+    # Pending first, known second: a value moves from pending to known (known is
+    # updated before pending is cleared), so reading in this order never misses
+    # a value that is in either list. Longest first over both, so a short value
+    # inside a longer one cannot leave the rest of the longer one visible.
+    pending = _pending
+    known = _known
+    values = sorted({*known, *pending}, key=len, reverse=True) if pending else known
+    for value in values:
         text = text.replace(value, "***")
     return text
 

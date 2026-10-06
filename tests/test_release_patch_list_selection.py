@@ -56,6 +56,7 @@ BASE_ASSETS = [("patches-1.0.mpp", 2_000_000)]
 
 class Release:
     """GitHub release lookup response."""
+    is_redirect = False
 
     status_code = 200
     headers: ClassVar[dict[str, str]] = {}
@@ -81,12 +82,40 @@ class Release:
         }
 
 
+class FileResponse:
+    """Streaming response for a file fetched with `requests.get` directly."""
+    is_redirect = False
+
+    def __init__(self, text: str | None) -> None:
+        self.text = text
+        self.status_code = 404 if text is None else 200
+        self.headers: dict[str, str] = {}
+
+    def raise_for_status(self) -> None:
+        if self.text is None:
+            raise requests.exceptions.HTTPError("404 Client Error")
+
+    def iter_content(self, size: int):
+        yield (self.text or "").encode()
+
+    def close(self) -> None:
+        return None
+
+
 class Network:
     """Serves release files by URL and records every download."""
 
     def __init__(self, files: dict[str, str]) -> None:
         self.files = files
         self.urls: list[str] = []
+        self.release: Release | None = None
+
+    def get(self, url: str, *args: object, **kwargs: object):
+        """Stand-in for `requests.get`: the release lookup or a bounded fetch."""
+        if url.startswith("https://api.github.com/"):
+            return self.release
+        self.urls.append(url)
+        return FileResponse(self.files.get(url))
 
     def download(self, url: str, path: Path) -> None:
         self.urls.append(url)
@@ -111,8 +140,8 @@ def serve(
     monkeypatch, assets: list[tuple[str, int]], files: dict[str, str], tag: str = TAG
 ) -> Network:
     network = Network(files)
-    release = Release(assets, tag)
-    monkeypatch.setattr(patcher.requests, "get", lambda *a, **k: release)
+    network.release = Release(assets, tag)
+    monkeypatch.setattr(patcher.requests, "get", network.get)
     monkeypatch.setattr(patcher, "download_with_progress", network.download)
     return network
 
@@ -206,7 +235,7 @@ def test_base_source_shape_without_a_json_asset_uses_the_repo_file(paths, monkey
 
     assert changed is True
     assert names_loaded() == ["Hide ads", "Hide reels"]
-    assert network.urls == [DOWNLOAD + "patches-1.0.mpp", RAW + "patches-list.json"]
+    assert network.urls == [RAW + "patches-list.json", DOWNLOAD + "patches-1.0.mpp"]
 
 
 def test_repo_fallback_tries_patches_json_when_patches_list_json_is_missing(
@@ -265,10 +294,13 @@ def test_unreadable_candidates_never_replace_a_readable_stored_list(
     patcher.save_local_versions({REPO: "v0.7.0"})
     serve_hushfacebook(monkeypatch, repo_list=SBOM)
 
-    patcher.check_and_download_release(REPO, paths, force=True)
+    changed = patcher.check_and_download_release(REPO, paths, force=True)
 
+    assert changed is False
     assert paths[".json"].read_text() == OTHER_LIST
-    assert "No readable patch list" in capsys.readouterr().out
+    assert paths[".mpp"].read_text() == "old mpp"
+    assert patcher.load_local_versions()[REPO] == "v0.7.0"
+    assert "Not marking as synced" in capsys.readouterr().out
     assert list(paths[".json"].parent.glob("*.candidate")) == []
 
 
@@ -276,6 +308,7 @@ def test_unreadable_repo_file_never_replaces_a_readable_list_without_releases(
     paths, monkeypatch
 ):
     class NoReleases:
+        is_redirect = False
         status_code = 404
         headers: ClassVar[dict[str, str]] = {}
 
@@ -283,7 +316,14 @@ def test_unreadable_repo_file_never_replaces_a_readable_list_without_releases(
     network = Network(
         {f"https://raw.githubusercontent.com/{REPO}/main/patches-list.json": SBOM}
     )
-    monkeypatch.setattr(patcher.requests, "get", lambda *a, **k: NoReleases())
+
+    def get(url: str, *args: object, **kwargs: object):
+        """The release lookup says 404; the raw file comes from the network."""
+        if url.startswith("https://api.github.com/"):
+            return NoReleases()
+        return network.get(url, *args, **kwargs)
+
+    monkeypatch.setattr(patcher.requests, "get", get)
     monkeypatch.setattr(patcher, "download_with_progress", network.download)
 
     changed = patcher.check_and_download_release(REPO, paths, force=True)

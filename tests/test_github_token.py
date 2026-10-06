@@ -161,7 +161,8 @@ def test_token_never_reaches_asset_or_raw_requests(transport, token, tmp_path):
     transport.route(API_URL, body=release())
     transport.route(ASSET_URL, status=302, headers={"Location": "https://cdn.x/a"})
     transport.route("https://cdn.x/", body=b"mpp")
-    transport.route("https://raw.githubusercontent.com/", body=b"{}")
+    # A real list at the tag: the bundle is only downloaded once a list was found.
+    transport.route("https://raw.githubusercontent.com/", body=b'[{"name": "x"}]')
     paths = {".mpp": tmp_path / "p.mpp", ".json": tmp_path / "p.json"}
 
     patcher.check_and_download_release("own/src", paths, force=True)
@@ -537,7 +538,7 @@ def lookup_with_scopes(transport, scopes: str | None, tmp_path) -> None:
 
 @pytest.fixture(autouse=True)
 def fresh_scope_state(monkeypatch):
-    monkeypatch.setattr(patcher, "_seen_token_scopes", None)
+    monkeypatch.setattr(patcher, "_token_state", None, raising=False)
 
 
 def test_classic_token_with_scopes_is_reported_by_scope_name(
@@ -609,8 +610,9 @@ HOSTILE_TAGS = [
     "v1#frag",
     "v1?x=1",
     "../x",
-    "a/b",
     "a/../b",
+    "a//b",
+    "a/./b",
     "..",
     ".",
     "v1 2",
@@ -636,7 +638,9 @@ def test_hostile_tag_never_builds_a_raw_url(transport, token, tmp_path, tag):
     assert "raw.githubusercontent.com" not in transport.hosts()
 
 
-@pytest.mark.parametrize("tag", ["v1.2.3", "1.0.0-beta+1", "patches_v2"])
+@pytest.mark.parametrize(
+    "tag", ["v1.2.3", "1.0.0-beta+1", "patches_v2", "a/b", "release/1.0"]
+)
 def test_ordinary_tag_still_fetches_from_raw(transport, token, tmp_path, tag):
     transport.route(API_URL, body={"tag_name": tag, "assets": []})
     transport.route("https://raw.githubusercontent.com/", body=b"{}")
@@ -731,3 +735,180 @@ def test_token_is_never_written_to_the_environment(transport, token, tmp_path):
     patcher.check_and_download_release("own/src", sync_mpp(tmp_path), force=True)
 
     assert dict(os.environ) == before
+
+
+# --- the scope warning stands on its own terms, and follows the token in use ----
+
+SECOND_TOKEN = "ghp_secondtoken0123456789abcdef"
+
+
+def status_body() -> dict:
+    return TestClient(main.app).get("/api/ui/tools_status").json()
+
+
+def test_a_remembered_word_does_not_remove_a_scope_from_the_warning(
+    transport, monkeypatch, tmp_path, data_dir
+):
+    monkeypatch.setenv(secrets_store.GITHUB_TOKEN, TOKEN)
+    monkeypatch.setenv(secrets_store.CLOAKBROWSER_LICENSE_KEY, "workflow")
+    secrets_store.redact("")  # the licence key is now remembered for masking
+    lookup_with_scopes(transport, "repo, workflow", tmp_path)
+
+    warning = patcher.github_token_warning()
+
+    assert warning is not None and "workflow" in warning
+    assert "workflow" in status_body()["github_token_warning"]
+
+
+def test_scope_header_is_bounded_and_limited_to_plain_names(
+    transport, token, tmp_path
+):
+    many = ", ".join(f"scope{n}" for n in range(60))
+    lookup_with_scopes(transport, f"repo, UPPER, a b, {'z' * 40}, {many}", tmp_path)
+
+    warning = patcher.github_token_warning()
+
+    assert warning is not None and "repo" in warning
+    assert "UPPER" not in warning and "a b" not in warning and "z" * 40 not in warning
+    assert warning.count("scope") <= 20
+    assert len(warning) < 400
+
+
+def test_an_oversized_scope_header_is_ignored(transport, token, tmp_path):
+    lookup_with_scopes(transport, "repo," + "x," * 5000, tmp_path)
+
+    assert patcher.github_token_warning() is None
+
+
+def file_token(value: str) -> None:
+    secrets_store.set_secret(secrets_store.GITHUB_TOKEN, value)
+
+
+def test_warning_goes_away_when_the_token_is_replaced(transport, data_dir, tmp_path):
+    file_token(TOKEN)
+    lookup_with_scopes(transport, "repo", tmp_path)
+    assert patcher.github_token_warning() is not None
+
+    file_token(SECOND_TOKEN)
+
+    assert patcher.github_token_warning() is None
+    assert status_body()["github_token_warning"] is None
+
+
+def test_warning_goes_away_when_the_token_is_cleared(transport, data_dir, tmp_path):
+    file_token(TOKEN)
+    lookup_with_scopes(transport, "repo", tmp_path)
+
+    secrets_store.clear_secret(secrets_store.GITHUB_TOKEN)
+
+    assert patcher.github_token_warning() is None
+
+
+def test_warning_comes_back_for_the_new_token_after_its_own_lookup(
+    transport, data_dir, tmp_path
+):
+    file_token(TOKEN)
+    lookup_with_scopes(transport, "repo", tmp_path)
+    file_token(SECOND_TOKEN)
+    lookup_with_scopes(transport, "gist", tmp_path)
+
+    warning = patcher.github_token_warning()
+
+    assert warning is not None and "gist" in warning and "repo" not in warning
+
+
+def test_the_token_is_not_kept_next_to_the_scopes(transport, token, tmp_path):
+    lookup_with_scopes(transport, "repo", tmp_path)
+
+    assert TOKEN not in repr(patcher._token_state)
+
+
+# --- a rejected token is a lasting warning --------------------------------------
+
+
+def reject(transport, tmp_path) -> None:
+    transport.route(API_URL, status=401)
+    with pytest.raises(patcher.GitHubTokenRejectedError):
+        patcher.check_and_download_release("own/src", sync_mpp(tmp_path), force=True)
+
+
+def test_a_rejected_token_stays_reported_in_the_status(transport, token, tmp_path):
+    reject(transport, tmp_path)
+
+    body = status_body()
+
+    assert body["github_token_rejected"] == patcher.TOKEN_REJECTED_MESSAGE
+    assert TOKEN not in json.dumps(body)
+    assert status_body()["github_token_rejected"] is not None  # and it stays
+
+
+def test_a_rejected_token_is_still_not_retried_without_the_token(
+    transport, token, tmp_path
+):
+    reject(transport, tmp_path)
+
+    assert transport.with_header("Authorization")
+    assert len(transport.calls) == 1
+
+
+def test_replacing_the_rejected_token_clears_the_warning(transport, data_dir, tmp_path):
+    file_token(TOKEN)
+    reject(transport, tmp_path)
+
+    file_token(SECOND_TOKEN)
+
+    assert status_body()["github_token_rejected"] is None
+
+
+def test_clearing_the_rejected_token_clears_the_warning(transport, data_dir, tmp_path):
+    file_token(TOKEN)
+    reject(transport, tmp_path)
+
+    secrets_store.clear_secret(secrets_store.GITHUB_TOKEN)
+
+    assert status_body()["github_token_rejected"] is None
+
+
+def test_a_later_authenticated_success_clears_the_warning(transport, token, tmp_path):
+    reject(transport, tmp_path)
+
+    lookup_with_scopes(transport, "", tmp_path)
+
+    assert status_body()["github_token_rejected"] is None
+
+
+def test_no_rejection_is_reported_for_a_token_never_rejected(token, data_dir):
+    assert status_body()["github_token_rejected"] is None
+
+
+# --- downloads ignore the operator's netrc ----------------------------------------
+
+
+def with_netrc(monkeypatch, tmp_path) -> None:
+    netrc = tmp_path / "netrc"
+    netrc.write_text("machine github.com login netrcuser password netrcpass\n")
+    netrc.chmod(0o600)
+    monkeypatch.setenv("NETRC", str(netrc))
+
+
+def test_asset_download_does_not_send_netrc_credentials(
+    transport, monkeypatch, tmp_path
+):
+    with_netrc(monkeypatch, tmp_path)
+    transport.route(ASSET_URL, body=b"mpp")
+
+    patcher.download_with_progress(ASSET_URL, tmp_path / "p.mpp")
+
+    assert (tmp_path / "p.mpp").read_bytes() == b"mpp"
+    assert transport.with_header("Authorization") == []
+
+
+def test_bounded_download_does_not_send_netrc_credentials(
+    transport, monkeypatch, tmp_path
+):
+    with_netrc(monkeypatch, tmp_path)
+    transport.route(ASSET_URL, body=b"[]")
+
+    patcher._download_bounded(ASSET_URL, tmp_path / "p.json", 1024)
+
+    assert transport.with_header("Authorization") == []

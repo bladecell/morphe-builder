@@ -23,9 +23,6 @@ SERVER_URL = "https://morphe.example.com"
         "LocalHost:8000",
         "localhost.",
         "localhost.:8000",
-        "morphe.example.com",
-        "Morphe.Example.COM:443",
-        "morphe.example.com.",
         "nas.lan",
         "NAS.lan.:8000",
     ],
@@ -34,6 +31,22 @@ def test_allowed_hosts(header):
     names = request_guards.allowed_host_names(SERVER_URL, "nas.lan, other.local")
 
     assert request_guards.is_host_allowed(header, names)
+
+
+@pytest.mark.parametrize(
+    "header", ["morphe.example.com", "Morphe.Example.COM:443", "morphe.example.com."]
+)
+def test_server_url_host_is_allowed_while_allowed_hosts_is_unset(header):
+    names = request_guards.allowed_host_names(SERVER_URL, None)
+
+    assert request_guards.is_host_allowed(header, names)
+
+
+@pytest.mark.parametrize("header", ["morphe.example.com", "Morphe.Example.COM:443"])
+def test_server_url_host_is_not_allowed_once_allowed_hosts_is_set(header):
+    names = request_guards.allowed_host_names(SERVER_URL, "https://nas.lan, other.local")
+
+    assert not request_guards.is_host_allowed(header, names)
 
 
 @pytest.mark.parametrize(

@@ -7,15 +7,18 @@ import json
 import time
 import tempfile
 import hashlib
+import uuid
+import threading
 import shutil
 import sys
 import logging
 from collections import deque
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from collections.abc import Sequence
 from typing import Any, TextIO
-from urllib.parse import unquote, urljoin, urlsplit
+from urllib.parse import quote, urljoin, urlsplit
 from packaging import version
 from src.apkmirror_downloader import ApkMirror_Downloader, Arch, Dpi, BundleType
 
@@ -137,11 +140,69 @@ def _safe_version_sort_key(v):
         return (0, version.parse("0"), str(v))
 
 
+def _no_netrc(request: requests.PreparedRequest) -> requests.PreparedRequest:
+    """Auth hook that adds nothing.
+
+    Passing any `auth` stops `requests` from reading `~/.netrc` for the host of
+    one request. It does not cover a redirect (`requests` looks the netrc up
+    again for every hop), so `_get_following` sends each hop itself.
+
+    Args:
+        request: The request about to be sent.
+
+    Returns:
+        The same request, unchanged.
+    """
+    return request
+
+
+# Redirects followed for one download (a release asset normally redirects once).
+MAX_DOWNLOAD_REDIRECTS = 5
+
+
+def _get_following(url: str, **kwargs: Any) -> requests.Response:
+    """GET a URL and follow redirects one hop at a time, never using `~/.netrc`.
+
+    `requests.get` with `trust_env` on reads the operator's netrc on every
+    redirect hop. Here each hop is its own `requests.get` with `auth` set and
+    `allow_redirects=False`, so no hop can pick up netrc credentials. Proxies and
+    the CA bundle still come from the environment, as `requests.get` reads them.
+    Only https redirect targets are followed.
+
+    Args:
+        url: First URL.
+        **kwargs: Passed to `requests.get` (for example `stream=True`).
+
+    Returns:
+        The first response that is not a redirect.
+
+    Raises:
+        requests.exceptions.TooManyRedirects: More than `MAX_DOWNLOAD_REDIRECTS`.
+        requests.exceptions.InvalidURL: A redirect led to a non-https target.
+        requests.exceptions.RequestException: The request failed.
+    """
+    target = url
+    for _ in range(MAX_DOWNLOAD_REDIRECTS + 1):
+        response = requests.get(
+            target, timeout=30, auth=_no_netrc, allow_redirects=False, **kwargs
+        )
+        if not response.is_redirect:
+            return response
+        location = response.headers.get("location")
+        response.close()
+        target = urljoin(target, location or "")
+        if not target.startswith("https://"):
+            raise requests.exceptions.InvalidURL("Redirect to a non-https target")
+    raise requests.exceptions.TooManyRedirects("Too many redirects")
+
+
 def download_with_progress(url: str, path: Path) -> None:
     """Download a file with a progress bar, replacing `path` only when complete.
 
-    The data goes to `<path>.part` first, so an interrupted download never leaves
-    a truncated file at `path` and an existing file there stays intact.
+    The data goes to a temp file of its own next to `path`
+    (`<name>.<random>.part`), so an interrupted download never leaves a truncated
+    file at `path`, an existing file there stays intact, and two downloads of the
+    same target cannot publish each other's half-written data.
 
     Args:
         url: URL to fetch.
@@ -151,7 +212,7 @@ def download_with_progress(url: str, path: Path) -> None:
         requests.exceptions.RequestException: The request or the transfer failed.
         OSError: The file could not be written or moved into place.
     """
-    partial_path = Path(f"{path}.part")
+    partial_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.part")
     try:
         _stream_to_file(url, partial_path)
         os.replace(partial_path, path)
@@ -171,7 +232,7 @@ def _stream_to_file(url: str, path: Path) -> None:
         requests.exceptions.RequestException: The request or the transfer failed.
         OSError: The file could not be written.
     """
-    response = requests.get(url, stream=True, timeout=30)
+    response = _get_following(url, stream=True)
     response.raise_for_status()
     total_size = int(response.headers.get("content-length", 0))
     block_size = 1024 * 64  # 64KB
@@ -259,11 +320,45 @@ RATE_LIMIT_TOKEN_HINT = "Set a GitHub token in Settings to raise the limit."
 GITHUB_API_HOST = "api.github.com"
 # Redirects the API may send inside api.github.com (a renamed repository).
 MAX_API_REDIRECTS = 3
-_SCOPE_NAME = re.compile(r"[A-Za-z0-9_:.-]{1,32}")
+# A real scope looks like `repo`, `admin:org`, `read:packages`, `delete_repo`.
+# The response header is untrusted text: only such short names are kept.
+_SCOPE_NAME = re.compile(r"[a-z][a-z0-9_:]{0,31}")
 _MAX_SCOPE_NAMES = 20
-# Scope names GitHub reported on the last authenticated response, or None when
-# the token was not used, was rejected, or the response had no scope header.
-_seen_token_scopes: tuple[str, ...] | None = None
+_MAX_SCOPE_HEADER_CHARS = 1024
+
+
+@dataclass(frozen=True)
+class _TokenState:
+    """What the last authenticated GitHub request showed about one token.
+
+    Attributes:
+        fingerprint: SHA-256 of the token that was used. It ties the state to
+            that token without keeping the token (or anything that is it).
+        scopes: Scope names GitHub reported, or None (none reported).
+        rejected: True when GitHub answered 401 for this token.
+    """
+
+    fingerprint: bytes
+    scopes: tuple[str, ...] | None
+    rejected: bool
+
+
+# The state of the token last used, or None when none was used yet or the last
+# request had no token. It only counts while the token in effect has the same
+# fingerprint, so replacing or clearing the token drops it.
+_token_state: _TokenState | None = None
+
+
+def _fingerprint(token: str) -> bytes:
+    """Return a digest that identifies a token without holding it.
+
+    Args:
+        token: The GitHub token.
+
+    Returns:
+        Its SHA-256 digest.
+    """
+    return hashlib.sha256(token.encode()).digest()
 
 
 def _is_api_url(url: object) -> bool:
@@ -288,25 +383,43 @@ def _is_api_url(url: object) -> bool:
     return parts.scheme == "https" and parts.netloc.lower() == GITHUB_API_HOST
 
 
-def _record_token_scopes(header: str | None) -> None:
-    """Remember the scope names of the token from a response header.
+def _parse_scopes(header: str | None, token: str) -> tuple[str, ...] | None:
+    """Pick the plain scope names out of an `X-OAuth-Scopes` header.
 
     Args:
-        header: Value of `X-OAuth-Scopes`, or None when GitHub sent none (a
-            fine-grained token, whose permissions are not reported this way).
+        header: Header value, or None when GitHub sent none (a fine-grained
+            token, whose permissions are not reported this way).
+        token: The token used; a name equal to it is dropped.
+
+    Returns:
+        Up to `_MAX_SCOPE_NAMES` names that look like scopes, or None when there
+        was no header or it was longer than `_MAX_SCOPE_HEADER_CHARS`.
     """
-    global _seen_token_scopes
-    if header is None:
-        _seen_token_scopes = None
-        return
-    names = [part.strip() for part in header.split(",")]
-    # Only plain scope names, never anything the secret store would mask.
-    plain = [
-        name
-        for name in names
-        if _SCOPE_NAME.fullmatch(name) and secrets_store.redact(name) == name
-    ]
-    _seen_token_scopes = tuple(plain[:_MAX_SCOPE_NAMES])
+    if header is None or len(header) > _MAX_SCOPE_HEADER_CHARS:
+        return None
+    names = (part.strip() for part in header.split(","))
+    plain = [n for n in names if _SCOPE_NAME.fullmatch(n) and n != token]
+    return tuple(plain[:_MAX_SCOPE_NAMES])
+
+
+def _state_of_current_token() -> _TokenState | None:
+    """Return the recorded token state if it belongs to the token in effect now.
+
+    Returns:
+        The state, or None when there is none, no token is set, the token was
+        replaced since, or the secrets file cannot be read (logged).
+    """
+    state = _token_state
+    if state is None:
+        return None
+    try:
+        token = secrets_store.get_secret(secrets_store.GITHUB_TOKEN)
+    except OSError:
+        logger.error("Could not read the secrets file to check the GitHub token")
+        return None
+    if token is None or _fingerprint(token) != state.fingerprint:
+        return None
+    return state
 
 
 def github_token_warning() -> str | None:
@@ -317,23 +430,29 @@ def github_token_warning() -> str | None:
     its permissions cannot be seen and no warning is given for it.
 
     Returns:
-        A warning naming the scopes, or None when the last authenticated
-        response showed none, none was seen, or no token is set now.
+        A warning naming the scopes of the token in effect now, or None when its
+        last authenticated response showed none, none was seen yet, the token
+        was replaced or cleared since, or no token is set.
     """
-    scopes = _seen_token_scopes
-    if not scopes:
-        return None
-    try:
-        token_is_set = secrets_store.get_secret(secrets_store.GITHUB_TOKEN) is not None
-    except OSError:
-        logger.error("Could not read the secrets file to check the GitHub token")
-        return None
-    if not token_is_set:
+    state = _state_of_current_token()
+    if state is None or state.rejected or not state.scopes:
         return None
     return (
-        f"The GitHub token has permissions ({', '.join(scopes)}). Patch bundles "
-        "can read it. Use a token with no permissions."
+        f"The GitHub token has permissions ({', '.join(state.scopes)}). Patch "
+        "bundles can read it. Use a token with no permissions."
     )
+
+
+def github_token_rejected() -> str | None:
+    """Tell the owner that GitHub rejected the token in effect now.
+
+    Returns:
+        The fixed rejection text (never the token) while the last authenticated
+        request with the current token got a 401; None once the token is
+        replaced or cleared or a later authenticated request succeeds.
+    """
+    state = _state_of_current_token()
+    return TOKEN_REJECTED_MESSAGE if state is not None and state.rejected else None
 
 
 def _get_with_token(url: str, token: str) -> requests.Response:
@@ -419,7 +538,7 @@ def github_api_get(url: str) -> tuple[requests.Response, bool]:
         GitHubTokenRejectedError: GitHub rejected the token with 401.
         requests.exceptions.RequestException: The unauthenticated request failed.
     """
-    global _seen_token_scopes
+    global _token_state
     if not _is_api_url(url):
         raise GitHubHostError("Only https://api.github.com can receive API calls.")
     try:
@@ -428,14 +547,16 @@ def github_api_get(url: str) -> tuple[requests.Response, bool]:
         logger.error("Could not read the GitHub token; calling GitHub without it")
         token = None
     if token is None:
-        _seen_token_scopes = None
-        return requests.get(url, timeout=30), False
+        _token_state = None
+        return _get_following(url), False
+    fingerprint = _fingerprint(token)
     try:
         response = _get_with_token(url, token)
     except GitHubTokenRejectedError:
-        _seen_token_scopes = None
+        _token_state = _TokenState(fingerprint, None, True)
         raise
-    _record_token_scopes(response.headers.get("X-OAuth-Scopes"))
+    scopes = _parse_scopes(response.headers.get("X-OAuth-Scopes"), token)
+    _token_state = _TokenState(fingerprint, scopes, False)
     return response, True
 
 
@@ -475,11 +596,60 @@ PATCH_LIST_ASSET_NAME = re.compile(
     r"patches(-list)?(-v?\d+(\.\d+)*([-+][0-9A-Za-z.]+)?)?\.json", re.IGNORECASE
 )
 
-# Largest oddly named `.json` asset still tried as a patch list.
+# Largest oddly named `.json` asset tried before the repository list. Enforced on
+# the bytes received, not on the size the release declares.
 MAX_UNNAMED_LIST_BYTES = 256 * 1024
 
+# Largest patch list accepted from a named asset or from the repository. Real
+# lists hold a few hundred patches (tens to a few hundred KiB, and the biggest
+# known is about 1 MiB), so 8 MiB leaves a wide margin and still bounds what is
+# held in memory while `SYNC_LOCK` is held.
+MAX_NAMED_LIST_BYTES = 8 * 1024 * 1024
 
-def _download_patch_list(url: str, output_path: Path) -> bool:
+# Largest oddly named `.json` asset tried at all, as the very last resort.
+MAX_OVERSIZED_LIST_BYTES = 2 * 1024 * 1024
+
+# Longest release tag or ref accepted in a URL.
+MAX_REF_LENGTH = 200
+
+
+class _TooLargeError(Exception):
+    """A download passed its byte limit; the message says which one."""
+
+
+def _download_bounded(url: str, path: Path, max_bytes: int) -> None:
+    """Download a file, stopping as soon as it is larger than `max_bytes`.
+
+    The declared size is not trusted: the bytes actually received are counted.
+
+    Args:
+        url: URL to fetch.
+        path: File to write. It may be left partial; the caller removes it.
+        max_bytes: Largest size accepted.
+
+    Raises:
+        _TooLargeError: The file is, or declares itself, larger than `max_bytes`.
+        requests.exceptions.RequestException: The request or transfer failed.
+        OSError: The file could not be written.
+    """
+    response = _get_following(url, stream=True)
+    try:
+        response.raise_for_status()
+        declared = response.headers.get("content-length", "")
+        if declared.isdigit() and int(declared) > max_bytes:
+            raise _TooLargeError(f"it declares {declared} bytes (limit {max_bytes})")
+        received = 0
+        with open(path, "wb") as file:
+            for data in response.iter_content(64 * 1024):
+                received += len(data)
+                if received > max_bytes:
+                    raise _TooLargeError(f"it is larger than {max_bytes} bytes")
+                file.write(data)
+    finally:
+        response.close()
+
+
+def _download_patch_list(url: str, output_path: Path, max_bytes: int) -> bool:
     """Download a file and keep it only when it is a real patch list.
 
     The data goes to a side file first, so an unreadable download never
@@ -488,19 +658,26 @@ def _download_patch_list(url: str, output_path: Path) -> bool:
     Args:
         url: URL to fetch.
         output_path: Final location of the patch list.
+        max_bytes: The download is cut off beyond this many received bytes.
 
     Returns:
         True when the file was a patch list and now sits at `output_path`.
-        False when the download failed or the file is not a patch list; the
-        reason is printed and `output_path` is untouched.
+        False when the download failed, was too large, or the file is not a
+        patch list; the reason is printed and `output_path` is untouched.
     """
     candidate_path = Path(f"{output_path}.candidate")
     try:
-        download_with_progress(url, candidate_path)
+        _download_bounded(url, candidate_path, max_bytes)
         _read_patch_list(candidate_path)
         os.replace(candidate_path, output_path)
     except _PatchListFormatError as error:
         print(f"    [!] Not a patch list, ignored: {error}")
+        return False
+    except _TooLargeError as error:
+        print(
+            f"    [!] Refused {url.rsplit('/', 1)[-1]} for its size: {error}. "
+            "It was not kept."
+        )
         return False
     except (requests.exceptions.RequestException, OSError) as error:
         print(f"    [!] Failed to download {url.rsplit('/', 1)[-1]}: {error}")
@@ -510,6 +687,39 @@ def _download_patch_list(url: str, output_path: Path) -> bool:
     return True
 
 
+def _asset_size(asset: dict) -> int | None:
+    """Return an asset's declared size in bytes, or None when it is not known.
+
+    Args:
+        asset: Asset object of a GitHub release.
+
+    Returns:
+        The `size` when it is a non-negative integer, else None.
+    """
+    size = asset.get("size")
+    if isinstance(size, int) and not isinstance(size, bool) and size >= 0:
+        return size
+    return None
+
+
+def _unnamed_json_assets(assets: list[dict]) -> list[dict]:
+    """Return the `.json` assets that are not named like a patch list.
+
+    Args:
+        assets: Asset objects of a GitHub release.
+
+    Returns:
+        The assets whose name ends in `.json` (any case) and does not match
+        `PATCH_LIST_ASSET_NAME`.
+    """
+    return [
+        a
+        for a in assets
+        if str(a.get("name", "")).lower().endswith(".json")
+        and not PATCH_LIST_ASSET_NAME.fullmatch(str(a["name"]))
+    ]
+
+
 def _json_assets_to_try(assets: list[dict], named: bool) -> list[dict]:
     """Pick the release `.json` assets worth trying as the patch list.
 
@@ -517,26 +727,100 @@ def _json_assets_to_try(assets: list[dict], named: bool) -> list[dict]:
         assets: Asset objects of a GitHub release.
         named: True for assets named like a patch list, best name first
             (`patches-list.json`, `patches.json`, then versioned names). False
-            for the other small `.json` assets, smallest first.
+            for the other `.json` assets of known size up to
+            `MAX_UNNAMED_LIST_BYTES`, smallest first.
 
     Returns:
-        The assets to try, in order. Large unnamed files are never included.
+        The assets to try, in order. Large unnamed files and unnamed files of
+        unknown size are never included; see `_oversized_json_assets`.
     """
-    json_assets = [a for a in assets if str(a.get("name", "")).endswith(".json")]
     if named:
         matching = [
-            a for a in json_assets if PATCH_LIST_ASSET_NAME.fullmatch(a["name"])
+            a
+            for a in assets
+            if str(a.get("name", "")).lower().endswith(".json")
+            and PATCH_LIST_ASSET_NAME.fullmatch(str(a["name"]))
         ]
         return sorted(
             matching, key=lambda a: a["name"].lower() not in JSON_FILENAME_CANDIDATES
         )
-    others = [
+    small = [
         a
-        for a in json_assets
-        if not PATCH_LIST_ASSET_NAME.fullmatch(a["name"])
-        and int(a.get("size") or 0) <= MAX_UNNAMED_LIST_BYTES
+        for a in _unnamed_json_assets(assets)
+        if (size := _asset_size(a)) is not None and size <= MAX_UNNAMED_LIST_BYTES
     ]
-    return sorted(others, key=lambda a: int(a.get("size") or 0))
+    return sorted(small, key=lambda a: _asset_size(a) or 0)
+
+
+def _oversized_json_assets(assets: list[dict]) -> list[dict]:
+    """Pick the unnamed `.json` assets that only the last-resort pass may try.
+
+    Args:
+        assets: Asset objects of a GitHub release.
+
+    Returns:
+        Unnamed `.json` assets that are over `MAX_UNNAMED_LIST_BYTES` or of
+        unknown size, smallest first, unknown sizes last.
+    """
+    large = [
+        a
+        for a in _unnamed_json_assets(assets)
+        if (size := _asset_size(a)) is None or size > MAX_UNNAMED_LIST_BYTES
+    ]
+    return sorted(large, key=lambda a: (_asset_size(a) is None, _asset_size(a) or 0))
+
+
+def _try_release_assets(
+    assets: list[dict],
+    tag: object,
+    output_path: Path,
+    max_bytes: int = MAX_NAMED_LIST_BYTES,
+) -> bool:
+    """Try release assets in order until one is a patch list.
+
+    Args:
+        assets: Candidate assets, best first.
+        tag: Tag of the release the assets belong to.
+        output_path: Final location of the patch list.
+        max_bytes: Byte limit for each download.
+
+    Returns:
+        True when a patch list was written to `output_path`.
+    """
+    for asset in assets:
+        url = _asset_url(asset, tag)
+        if url is None:
+            continue
+        print(f"    -> Downloading {asset['name']}...")
+        if _download_patch_list(url, output_path, max_bytes):
+            return True
+    return False
+
+
+def _try_oversized_assets(assets: list[dict], tag: object, output_path: Path) -> bool:
+    """Last resort: try large or unsized unnamed `.json` assets, bounded.
+
+    Args:
+        assets: Asset objects of a GitHub release.
+        tag: Tag of the release.
+        output_path: Final location of the patch list.
+
+    Returns:
+        True when a patch list was written to `output_path`.
+    """
+    candidates = []
+    for asset in _oversized_json_assets(assets):
+        size = _asset_size(asset)
+        if size is not None and size > MAX_OVERSIZED_LIST_BYTES:
+            print(
+                f"    [!] Skipped {asset['name']}: {size} bytes is over the "
+                f"{MAX_OVERSIZED_LIST_BYTES} byte limit for an unnamed list."
+            )
+            continue
+        reason = "too large for the first pass" if size else "its size is unknown"
+        print(f"    -> Last resort: {asset['name']} ({reason}), at most 2 MiB.")
+        candidates.append(asset)
+    return _try_release_assets(candidates, tag, output_path, MAX_OVERSIZED_LIST_BYTES)
 
 
 def _download_release_patch_list(
@@ -544,9 +828,10 @@ def _download_release_patch_list(
 ) -> bool:
     """Get a source's patch list for a release, keeping only a real one.
 
-    Order: release assets named like a patch list, small other `.json` assets,
-    then the list file in the repository at the release tag. A file that is not
-    a patch list (for example an SBOM) is skipped, never kept.
+    Order: release assets named like a patch list, the list file in the
+    repository at the release tag, small other `.json` assets, then, as a last
+    resort, large or unsized other `.json` assets (bounded download). A file
+    that is not a patch list (for example an SBOM) is skipped, never kept.
 
     Args:
         repo_path: GitHub 'owner/repo'.
@@ -557,60 +842,115 @@ def _download_release_patch_list(
         True when a patch list was written to `output_path`.
     """
     assets = release_data.get("assets", [])
-    for named in (True, False):
-        for asset in _json_assets_to_try(assets, named):
-            url = _asset_url(asset)
-            if url is None:
-                continue
-            print(f"    -> Downloading {asset['name']}...")
-            if _download_patch_list(url, output_path):
-                return True
     tag = release_data.get("tag_name")
-    print(f"    -> No patch list in the release assets. Fetching it from source ({tag})...")
-    return _try_download_json_candidates(repo_path, tag, output_path)
+    if _try_release_assets(_json_assets_to_try(assets, True), tag, output_path):
+        return True
+    print(f"    -> No named patch list asset. Fetching it from source ({tag})...")
+    if _try_download_json_candidates(repo_path, tag, output_path):
+        return True
+    small = _json_assets_to_try(assets, False)
+    if _try_release_assets(small, tag, output_path, MAX_UNNAMED_LIST_BYTES):
+        return True
+    return _try_oversized_assets(assets, tag, output_path)
 
 
 # A git ref safe to put in a raw.githubusercontent.com path: git also allows
-# `%`, `#`, `?` and `/` in tag names, and percent-decoding can make `..` segments.
+# `%`, `#` and `?` in tag names, and percent-decoding can make `..` segments.
+# One path segment; a tag may hold several, joined by `/` (`release/1.0`).
 _REF_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,99}")
-
-# https://github.com/<owner>/<repo>/releases/download/<tag>/<file>: the form of
-# every `browser_download_url` (it redirects to release-assets.githubusercontent.com,
-# which is reached only by following that redirect, never named by a release).
-_ASSET_PATH = re.compile(
-    r"/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/releases/download/[^/?#]+/[^/?#]+"
-)
 
 
 def _is_valid_ref(ref: object) -> bool:
-    """Tell whether a release tag or branch is safe inside a raw file URL.
+    """Tell whether a release tag or branch is safe inside a URL path.
 
     Args:
         ref: Candidate tag taken from a GitHub response.
 
     Returns:
-        True for 1-100 ASCII letters, digits, `.`, `_`, `+` or `-` that start
-        with a letter or digit and hold no `..`.
+        True for at most `MAX_REF_LENGTH` characters made of `/`-separated
+        segments, each 1-100 ASCII letters, digits, `.`, `_`, `+` or `-` that
+        start with a letter or digit and hold no `..`. So no empty segment, no
+        `.` or `..` segment, no `%`, `?`, `#`, backslash or space.
     """
-    if not isinstance(ref, str) or _REF_PATTERN.fullmatch(ref) is None:
+    if not isinstance(ref, str) or len(ref) > MAX_REF_LENGTH:
         return False
-    return ".." not in ref
+    return all(
+        _REF_PATTERN.fullmatch(segment) is not None and ".." not in segment
+        for segment in ref.split("/")
+    )
 
 
-def _is_release_asset_url(url: object) -> bool:
+def _quote_ref(ref: str) -> str:
+    """Quote a validated ref for a URL path, keeping `/` and `+` literal.
+
+    Args:
+        ref: A ref that passed `_is_valid_ref`.
+
+    Returns:
+        The ref as it is written in a raw file URL.
+    """
+    return quote(ref, safe="/+")
+
+
+# Characters `quote` encodes but that a URL may carry literally, and that GitHub
+# may leave as they are in an asset name. `+` is the one already seen in tags.
+_LITERAL_NAME_CHARS = frozenset("+@,=()!*'$&;:")
+
+
+def _name_matches(url_name: str, name: str) -> bool:
+    """Tell whether a URL's last segment is exactly the asset name, escaped.
+
+    Each character of the name may appear as `%XX` (uppercase, as `quote` writes
+    it) and, for letters, digits, `-._~` and `_LITERAL_NAME_CHARS`, also as
+    itself. Nothing is decoded: a `%` in the URL must start the escape of the
+    name's own character, so `%2E`, `%25` for a literal `%`, `/`, `?`, `#` and
+    backslash cannot stand for anything else.
+
+    Args:
+        url_name: The URL segment after the tag.
+        name: The asset's `name` from the release.
+
+    Returns:
+        True when the segment spells `name` in one of those ways.
+    """
+    position = 0
+    for char in name:
+        escaped = quote(char, safe="")
+        literal_ok = escaped == char or char in _LITERAL_NAME_CHARS
+        if literal_ok and url_name.startswith(char, position):
+            position += 1
+        elif url_name.startswith(escaped, position):
+            position += len(escaped)
+        else:
+            return False
+    return position == len(url_name)
+
+
+def _is_release_asset_url(url: object, tag: object, name: object) -> bool:
     """Tell whether a `browser_download_url` is a real GitHub release download.
+
+    The path must be exactly `/<owner>/<repo>/releases/download/<tag>/<name>`
+    built from the release's own tag and the asset's own name, with the slash
+    inside a tag written either literally or as `%2F` (GitHub's form is not
+    known for certain). Nothing else is accepted, so decoding tricks (`%2e%2e`,
+    `%252F`), extra segments, `?`, `#` and backslashes all fail.
 
     Args:
         url: Value taken from a GitHub release response.
+        tag: The release's `tag_name`.
+        name: The asset's `name`.
 
     Returns:
         True only for https on exactly github.com (no user info, port, query or
-        fragment) with a `/<owner>/<repo>/releases/download/<tag>/<file>` path
-        that has no dot segment, even after percent-decoding.
+        fragment), a valid owner/repo, a valid tag and a plain file name.
     """
     if not isinstance(url, str) or not url.isascii() or not url.isprintable():
         return False
     if " " in url or "\\" in url:
+        return False
+    if not isinstance(tag, str) or not _is_valid_ref(tag):
+        return False
+    if not isinstance(name, str) or name in {"", ".", ".."} or "/" in name:
         return False
     try:
         parts = urlsplit(url)
@@ -618,37 +958,64 @@ def _is_release_asset_url(url: object) -> bool:
         return False
     if parts.scheme != "https" or parts.netloc != "github.com":
         return False
-    if parts.query or parts.fragment or not _ASSET_PATH.fullmatch(parts.path):
+    if parts.query or parts.fragment:
         return False
-    return not {".", ".."} & set(unquote(parts.path).split("/"))
+    segments = parts.path.split("/", 3)
+    if len(segments) != 4 or segments[0] != "":
+        return False
+    if not is_valid_repo(f"{segments[1]}/{segments[2]}"):
+        return False
+    tag_forms = {quote(tag, safe=safe) for safe in ("/+", "+", "/", "")}
+    allowed = {f"releases/download/{t}/" for t in tag_forms}
+    prefix, _, url_name = segments[3].rpartition("/")
+    return f"{prefix}/" in allowed and _name_matches(url_name, name)
 
 
-def _asset_url(asset: dict) -> str | None:
+def _asset_url(asset: dict, tag: object) -> str | None:
     """Return the asset's download URL when it is valid, else None (reported).
 
     Args:
         asset: Asset object of a GitHub release.
+        tag: The release's `tag_name`.
 
     Returns:
         The `browser_download_url`, or None when it failed `_is_release_asset_url`.
     """
     url = asset.get("browser_download_url")
-    if _is_release_asset_url(url):
+    if _is_release_asset_url(url, tag, asset.get("name")):
         return str(url)
     print(f"    [!] Refusing the download URL of {_quoted(asset.get('name'))}.")
     return None
 
 
-def _try_download_json_candidates(repo_path, ref, output_path):
-    """Tries candidate JSON filenames from a repo ref via raw.githubusercontent.
-    Returns True on the first success; a file that is not a patch list is not
-    kept. A repository or ref that is not valid is refused without a request."""
-    if not is_valid_repo(repo_path) or not _is_valid_ref(ref):
+def _try_download_json_candidates(
+    repo_path: str, ref: object, output_path: Path | str
+) -> bool:
+    """Try the candidate list file names in a repo at a ref, via raw.githubusercontent.
+
+    A file that is not a patch list is not kept. A repository or ref that is
+    not valid is refused without a request.
+
+    Args:
+        repo_path: GitHub 'owner/repo'.
+        ref: Release tag or branch name. It may hold `/` (`release/1.0`).
+        output_path: Final location of the patch list.
+
+    Returns:
+        True on the first candidate that was a patch list and was written.
+    """
+    if not is_valid_repo(repo_path) or not isinstance(ref, str):
+        print(f"    [!] Not fetching from source: unusable ref {_quoted(ref)}.")
+        return False
+    if not _is_valid_ref(ref):
         print(f"    [!] Not fetching from source: unusable ref {_quoted(ref)}.")
         return False
     for filename in JSON_FILENAME_CANDIDATES:
-        raw_url = f"https://raw.githubusercontent.com/{repo_path}/{ref}/{filename}"
-        if _download_patch_list(raw_url, Path(output_path)):
+        raw_url = (
+            f"https://raw.githubusercontent.com/{repo_path}/{_quote_ref(ref)}/"
+            f"{filename}"
+        )
+        if _download_patch_list(raw_url, Path(output_path), MAX_NAMED_LIST_BYTES):
             return True
     return False
 
@@ -683,8 +1050,46 @@ def _patch_list_is_unreadable(repo_path: str, extensions_to_paths: dict) -> bool
     return False
 
 
-def check_and_download_release(repo_path, extensions_to_paths, force=False):
+def _download_release_asset(release_data: dict, ext: str, output_path: Path) -> bool:
+    """Download the release asset whose name ends in `ext`.
+
+    Args:
+        release_data: GitHub release object.
+        ext: Wanted name suffix, for example `.mpp`.
+        output_path: Where to write the file.
+
+    Returns:
+        True when the file was downloaded; False when there is no such asset,
+        its URL was refused or the download failed (reported).
+    """
+    tag = release_data.get("tag_name")
+    for asset in release_data.get("assets", []):
+        if not asset["name"].endswith(ext):
+            continue
+        url = _asset_url(asset, tag)
+        if url is None:
+            return False
+        print(f"    -> Downloading {asset['name']}...")
+        try:
+            download_with_progress(url, output_path)
+        except (requests.exceptions.RequestException, OSError) as error:
+            print(f"    [!] Failed to download {asset['name']}: {error}")
+            return False
+        return True
+    return False
+
+
+def check_and_download_release(
+    repo_path: str, extensions_to_paths: dict[str, Path], force: bool = False
+) -> bool:
     """Syncs a repo's latest release assets into the given local paths.
+
+    Files are downloaded next to their final path first and moved into place
+    only when every wanted file arrived, so a bundle and a list on disk always
+    belong to the same tag. When a new release has no patch list, nothing is
+    replaced and the old tag stays recorded, so the next sync tries again. The
+    exception is a stored list that is already unreadable, or an unchanged
+    tag: the stored list is then kept as it is.
 
     A patch list that is on disk but fails to load is downloaded again, even at
     an unchanged tag and inside the update-check throttle, and only that file is
@@ -723,8 +1128,13 @@ def check_and_download_release(repo_path, extensions_to_paths, force=False):
 
     # Throttle: skip the API call entirely if we checked recently and have files
     last_check = local_versions.get(f"{repo_path}#last_check")
+    # A move of new files into place that did not finish: fetch again, whatever
+    # the throttle says, so a bundle and a list of different tags are not kept.
+    incomplete_key = f"{repo_path}#incomplete"
+    incomplete = incomplete_key in local_versions
     if (
         not force
+        and not incomplete
         and not missing_files
         and not list_unreadable
         and last_check
@@ -764,7 +1174,12 @@ def check_and_download_release(repo_path, extensions_to_paths, force=False):
 
     latest_tag = release_data.get("tag_name")
 
-    if current_tag == latest_tag and not missing_files and not list_unreadable:
+    if (
+        current_tag == latest_tag
+        and not incomplete
+        and not missing_files
+        and not list_unreadable
+    ):
         print(f"[\u2713] {repo_path} is up to date ({current_tag}).")
         local_versions[f"{repo_path}#last_check"] = time.time()
         save_local_versions(local_versions)
@@ -773,42 +1188,56 @@ def check_and_download_release(repo_path, extensions_to_paths, force=False):
     repair_only = False
     if current_tag != latest_tag:
         print(f"[!] Update found for {repo_path}: {current_tag} -> {latest_tag}")
-    elif missing_files:
-        print(f"[!] Missing local files for {repo_path}. Re-downloading...")
+    elif incomplete or missing_files:
+        print(f"[!] Local files for {repo_path} are incomplete. Re-downloading...")
     else:
         print(f"[!] The patch list of {repo_path} is unreadable. Re-downloading it...")
         extensions_to_paths = {".json": extensions_to_paths[".json"]}
         repair_only = True
 
-    all_found = True
-    for ext, output_path in extensions_to_paths.items():
-        if ext == ".json":
-            found = _download_release_patch_list(repo_path, release_data, output_path)
-            if not found and output_path.exists():
-                # Keep what is there; a list that stays unreadable is reported below.
-                print(f"    [!] No readable patch list for {repo_path} in {latest_tag}.")
-                found = True
-        else:
-            found = False
-            for asset in release_data.get("assets", []):
-                if asset["name"].endswith(ext):
-                    url = _asset_url(asset)
-                    if url is None:
-                        break
-                    print(f"    -> Downloading {asset['name']}...")
-                    try:
-                        download_with_progress(url, output_path)
-                        found = True
-                    except Exception as e:
-                        print(f"    [!] Failed to download {asset['name']}: {e}")
-                    break
-
-        if not found:
-            print(f"    [!] Could not obtain {ext} for {repo_path}. Not marking as synced.")
-            all_found = False
-
-    if not all_found:
+    keep_stored_list = (
+        current_tag == latest_tag and not incomplete
+    ) or list_unreadable
+    # The list first: a release without a usable list must not cost a bundle
+    # download that is thrown away on every sync.
+    ordered = sorted(extensions_to_paths.items(), key=lambda item: item[0] != ".json")
+    staged: dict[Path, Path] = {}
+    try:
+        for ext, output_path in ordered:
+            staged_path = Path(f"{output_path}.staged")
+            staged_path.unlink(missing_ok=True)
+            if ext == ".json":
+                found = _download_release_patch_list(
+                    repo_path, release_data, staged_path
+                )
+            else:
+                found = _download_release_asset(release_data, ext, staged_path)
+            if found:
+                staged[staged_path] = output_path
+                continue
+            if ext == ".json" and keep_stored_list and output_path.exists():
+                # Nothing to pair with a new bundle that is worse than this
+                # list; a list that stays unreadable is reported below.
+                print(f"    [!] No readable patch list for {repo_path} in {latest_tag}")
+                continue
+            print(f"    [!] Could not obtain {ext} for {repo_path}.")
+            print("        Not marking as synced.")
+            return False
+        if staged:
+            # Written before the first move and removed after the last: if the
+            # process dies or a move fails in between, the next sync starts over.
+            local_versions[incomplete_key] = latest_tag
+            save_local_versions(local_versions)
+            for staged_path, output_path in staged.items():
+                os.replace(staged_path, output_path)
+            del local_versions[incomplete_key]
+            save_local_versions(local_versions)
+    except OSError as error:
+        logger.error("Could not move the files of %s into place: %s", repo_path, error)
         return False
+    finally:
+        for staged_path in staged:
+            staged_path.unlink(missing_ok=True)
 
     still_unreadable = _patch_list_is_unreadable(repo_path, extensions_to_paths)
     if still_unreadable:
@@ -868,7 +1297,15 @@ def normalize_repo(raw):
 
 
 def _quoted(value: object, limit: int = 60) -> str:
-    """Return a short, single-line, quoted form of any config value for messages."""
+    """Return a short, single-line, quoted form of any config value for messages.
+
+    Args:
+        value: Any value, for example from the config file or a GitHub response.
+        limit: Most characters of the text kept.
+
+    Returns:
+        The `repr` of the first `limit` characters, so it holds no line break.
+    """
     text = value if isinstance(value, str) else repr(value)
     return repr(text[:limit])
 
@@ -1017,8 +1454,10 @@ def build_combined_version(
 
     The string is `<app version>-<primary patch tag>-<hash>`. The primary tag is
     the version of the Morphe base source if it was used, else of the first
-    used source. The hash covers every used source version and the patch
-    selection, so it changes whenever one of them does and never otherwise.
+    used source. It becomes part of the APK file name, so every character
+    outside letters, digits and `._+-` (a `/` in `release/1.0`) becomes `-`.
+    The hash covers every used source version and the patch selection, so it
+    changes whenever one of them does and never otherwise.
 
     Args:
         app_version: Version of the unpatched app.
@@ -1045,7 +1484,8 @@ def build_combined_version(
         sort_keys=True,
     )
     digest = hashlib.sha256(digest_input.encode()).hexdigest()[:8]
-    return f"{app_version}-{primary_tag}-{digest}"
+    file_safe_tag = re.sub(r"[^A-Za-z0-9._+-]", "-", str(primary_tag))
+    return f"{app_version}-{file_safe_tag}-{digest}"
 
 
 def is_build_current(
@@ -1104,8 +1544,19 @@ def save_app_result(app_id: str, **fields: object) -> None:
     update_config(apply)
 
 
+# Held for the duration of every tool or source sync (the background sync, the
+# build's own sync, and adding a source), so two syncs never write the same files
+# or spend the GitHub rate limit at once. Never held together with the config
+# lock across a network call: `update_config` is only called after the downloads.
+SYNC_LOCK = threading.Lock()
+
+
 def update_tools(config, quiet=False, force=False):
-    """Syncs tool jars and active patch sources from GitHub.
+    """Syncs tool jars and active patch sources from GitHub, one sync at a time.
+
+    Waits for a sync that is already running (for example the build's sync waits
+    for a requested one) rather than skipping, so a build never goes ahead with
+    half-written files.
 
     Args:
         config: App config to read repos and sources from; versions are written
@@ -1123,10 +1574,55 @@ def update_tools(config, quiet=False, force=False):
         GitHubTokenRejectedError: GitHub rejected the saved token. Every later
             call would fail the same way, so the rest were skipped (as above).
     """
+    with SYNC_LOCK:
+        return _update_tools_locked(config, quiet, force)
+
+
+# Temp names a download leaves behind when the process dies mid-way.
+_STALE_PATTERNS = ("*.part", "*.staged", "*.candidate")
+
+
+def remove_stale_download_files() -> int:
+    """Delete download leftovers in the bin directory.
+
+    Only call it with `SYNC_LOCK` held: every download writes its temp file
+    under that lock, so nothing here can belong to a download in flight.
+
+    Returns:
+        How many files were removed.
+    """
+    removed = 0
+    for pattern in _STALE_PATTERNS:
+        for stale in (DATA_DIR / "bin").glob(pattern):
+            try:
+                stale.unlink()
+            except OSError as error:
+                logger.error("Could not remove %s: %s", stale.name, error)
+                continue
+            removed += 1
+    return removed
+
+
+def _update_tools_locked(config: dict, quiet: bool, force: bool) -> bool:
+    """Run one sync; `SYNC_LOCK` is held by the caller.
+
+    Args:
+        config: See `update_tools`.
+        quiet: See `update_tools`.
+        force: See `update_tools`.
+
+    Returns:
+        True if any file was downloaded.
+
+    Raises:
+        GitHubRateLimitError: See `update_tools`.
+        GitHubTokenRejectedError: See `update_tools`.
+    """
     if not quiet:
         print("--- Checking for Tool Updates ---")
     bin_dir = DATA_DIR / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
+    remove_stale_download_files()
 
     repos = config["repositories"]
     tools = config["tools"]
@@ -1226,7 +1722,8 @@ class _PatchListFormatError(Exception):
 def _read_patch_list(json_path: Path) -> list[dict[str, object]]:
     """Read and validate a patch list file.
 
-    Accepts a top-level list of patches or an object with a `patches` list.
+    Accepts a top-level list of patches or an object with a `patches` list. At
+    least one patch must have a text `name`; an empty list is not a patch list.
 
     Args:
         json_path: File to read.
@@ -1254,6 +1751,8 @@ def _read_patch_list(json_path: Path) -> list[dict[str, object]]:
         raise _PatchListFormatError("an entry is not a JSON object")
     if not all(isinstance(p.get("name"), str | None) for p in patches):
         raise _PatchListFormatError("a patch name is not text")
+    if not any(isinstance(patch.get("name"), str) for patch in patches):
+        raise _PatchListFormatError("no patch has a name")
     return patches
 
 
@@ -2126,8 +2625,12 @@ def get_all_available_apps(config):
             except:
                 continue
 
-        app_names_map = data.get("appNames", {})
+        app_names_map = data.get("appNames") if isinstance(data, dict) else None
+        if not isinstance(app_names_map, dict):
+            app_names_map = {}
         patches_list = data.get("patches", []) if isinstance(data, dict) else data
+        if not isinstance(patches_list, list):
+            continue
         for patch in patches_list:
             if not isinstance(patch, dict):
                 continue
@@ -2155,6 +2658,8 @@ def get_all_available_apps(config):
                 if not pkg_id: continue
                 pkg_id = str(pkg_id)
                 translated_name = entry_names.get(pkg_id) or app_names_map.get(pkg_id)
+                if translated_name is not None and not isinstance(translated_name, str):
+                    translated_name = None  # a name that is not text is ignored
                 # If we don't have a name yet, or we found a translated one, set it
                 if pkg_id not in apps_data or translated_name:
                     apps_data[pkg_id] = translated_name or pkg_id

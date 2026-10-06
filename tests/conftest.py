@@ -7,7 +7,7 @@ import pytest
 import yaml
 from starlette.staticfiles import StaticFiles
 
-from src import apkmirror_downloader, config_store, main, patcher
+from src import apkmirror_downloader, config_store, main, patcher, secrets_store
 
 APP_A = {
     "id": "com.a",
@@ -38,6 +38,12 @@ def isolated_data_dir(tmp_path, monkeypatch):
     for module in (config_store, patcher, main):
         monkeypatch.setattr(module, "DATA_DIR", tmp_path)
     monkeypatch.setattr(main, "LOG_PATH", tmp_path / "bin" / "build.log")
+    # Claims taken by a test that fakes the task must not leak into the next test.
+    monkeypatch.setattr(main, "TOOLS_UPDATING", False)
+    monkeypatch.setattr(main, "_ACTIVITY_COUNT", 0)
+    # Values the secret store remembered for masking belong to one test only.
+    for name, empty in (("_current", {}), ("_retired", ()), ("_known", ())):
+        monkeypatch.setattr(secrets_store, name, empty, raising=False)
     # Both paths are bound at import, so DATA_DIR alone does not move them.
     for name in ("VERSIONS_FILE", "VERSION_CACHE_FILE"):
         real_path = getattr(patcher, name)

@@ -2,7 +2,9 @@
 
 import json
 import logging
+import tempfile
 import time
+from pathlib import Path
 from typing import ClassVar
 
 import pytest
@@ -73,9 +75,10 @@ def test_dialog_route_reports_a_patch_name_that_is_not_text(data_dir, name):
 
 
 def test_missing_or_null_patch_name_is_still_accepted(data_dir):
-    write_list(json.dumps({"patches": [{"compatiblePackages": {}}, {"name": None}]}))
+    entries = [{"compatiblePackages": {}}, {"name": None}, {"name": "Named"}]
+    write_list(json.dumps({"patches": entries}))
 
-    assert len(patcher.load_patch_list(REPO)) == 2
+    assert len(patcher.load_patch_list(REPO)) == 3
 
 
 # --- the remedy named in the message must be true ----------------------------
@@ -83,6 +86,7 @@ def test_missing_or_null_patch_name_is_still_accepted(data_dir):
 
 class Release:
     """Minimal GitHub release lookup response."""
+    is_redirect = False
 
     status_code = 200
     headers: ClassVar[dict[str, str]] = {}
@@ -95,9 +99,48 @@ class Release:
             "tag_name": "v1",
             "assets": [
                 {"name": "p.mpp", "browser_download_url": f"{ASSET_BASE}/p.mpp"},
-                {"name": "p.json", "browser_download_url": f"{ASSET_BASE}/p.json"},
+                {
+                    "name": "p.json",
+                    "size": 500,
+                    "browser_download_url": f"{ASSET_BASE}/p.json",
+                },
             ],
         }
+
+
+class BodyResponse:
+    """A streamed 200 answer holding the bytes the test's download fake wrote."""
+
+    is_redirect = False
+    status_code = 200
+
+    def __init__(self, body: bytes) -> None:
+        self.body = body
+        self.headers = {"content-length": str(len(body))}
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def iter_content(self, size: int):
+        yield self.body
+
+    def close(self) -> None:
+        return None
+
+
+def get_via_download_fake(url: str, *args: object, **kwargs: object):
+    """Stand-in for `requests.get`: the release lookup, else the download fake.
+
+    The patch list is now fetched with a byte limit through `requests.get`, so the
+    tests' own `download_with_progress` fakes (which decide what a URL serves, and
+    record it) are consulted here, and their bytes are streamed back.
+    """
+    if url.startswith("https://api.github.com/"):
+        return Release()
+    with tempfile.TemporaryDirectory() as scratch:
+        target = Path(scratch) / "body"
+        patcher.download_with_progress(url, target)
+        return BodyResponse(target.read_bytes())
 
 
 RAW_V1 = [
@@ -121,7 +164,7 @@ def synced_source(data_dir, monkeypatch):
         downloads.append(url)
         path.write_text(json.dumps(VALID))
 
-    monkeypatch.setattr(patcher.requests, "get", lambda *a, **k: Release())
+    monkeypatch.setattr(patcher.requests, "get", get_via_download_fake)
     monkeypatch.setattr(patcher, "download_with_progress", fake_download)
     return paths, downloads
 
@@ -132,7 +175,7 @@ def test_sync_at_the_same_tag_repairs_a_corrupt_list(synced_source):
     changed = patcher.check_and_download_release(REPO, paths, force=True)
 
     assert changed is True
-    assert downloads == [f"{ASSET_BASE}/p.json"]
+    assert downloads == [RAW_V1[0]]
     assert patcher.load_patch_list(REPO) == VALID["patches"]
 
 
@@ -143,7 +186,7 @@ def test_unthrottled_repair_does_not_wait_for_the_throttle(synced_source):
     changed = patcher.check_and_download_release(REPO, paths, force=False)
 
     assert changed is True
-    assert downloads == [f"{ASSET_BASE}/p.json"]
+    assert downloads == [RAW_V1[0]]
 
 
 def test_healthy_source_stays_throttled_and_makes_no_network_call(
@@ -195,7 +238,7 @@ def test_list_still_unreadable_after_download_is_bounded_and_reported(
     changed = patcher.check_and_download_release(REPO, paths, force=True)
 
     assert changed is False
-    assert downloads == [f"{ASSET_BASE}/p.json", *RAW_V1]
+    assert downloads == [*RAW_V1, f"{ASSET_BASE}/p.json"]
     assert "still unreadable" in capsys.readouterr().out
     assert patcher.load_local_versions() == {REPO: "v1"}
     with pytest.raises(patcher.PatchListError):
@@ -242,13 +285,14 @@ def test_new_release_with_a_broken_list_still_counts_as_an_update(
     changed = patcher.check_and_download_release(REPO, paths, force=True)
 
     assert changed is True
-    assert downloads == [f"{ASSET_BASE}/p.mpp", f"{ASSET_BASE}/p.json", *RAW_V1]
+    assert downloads == [*RAW_V1, f"{ASSET_BASE}/p.json", f"{ASSET_BASE}/p.mpp"]
     assert "still unreadable" in capsys.readouterr().out
     assert patcher.load_local_versions()[REPO] == "v1"
 
 
 class NoReleases:
     """GitHub answer for a repository that has no releases."""
+    is_redirect = False
 
     status_code = 404
     headers: ClassVar[dict[str, str]] = {}
@@ -304,7 +348,7 @@ def test_sync_downloads_the_list_again_once_the_file_is_deleted(synced_source):
     changed = patcher.check_and_download_release(REPO, paths, force=False)
 
     assert changed is True
-    assert f"{ASSET_BASE}/p.json" in downloads
+    assert RAW_V1[0] in downloads
     assert patcher.load_patch_list(REPO) == VALID["patches"]
 
 

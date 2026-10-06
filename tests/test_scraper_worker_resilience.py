@@ -245,7 +245,12 @@ def test_tools_status_reports_available_browser(monkeypatch):
     status = main.get_tools_status()
     worker.shutdown()
 
-    assert status["browser"] == {"state": "available", "error": None, "retry_in": None}
+    assert status["browser"] == {
+        "state": "available",
+        "error": None,
+        "retry_in": None,
+        "busy_since": None,
+    }
 
 
 def test_worker_state_is_starting_before_the_first_launch_finishes():
@@ -309,48 +314,64 @@ def test_task_queued_behind_stop_is_answered():
     assert isinstance(error, main.ScraperUnavailableError)
 
 
-def test_shutdown_finishing_between_the_stopped_check_and_the_put_is_answered():
+def test_shutdown_requested_while_a_task_is_being_queued_waits_for_the_queueing():
     worker = start_worker(FakeLauncher(), FakeClock())
     real_put = worker.task_queue.put
-    hooked: list[bool] = []
+    stopper = threading.Thread(target=worker.shutdown)
+    stopper_blocked: list[bool] = []
 
-    def put_after_a_shutdown_attempt(item: object) -> None:
-        if item is not None and not hooked:
-            hooked.append(True)
-            stopper = threading.Thread(target=worker.shutdown)
+    def put_while_shutdown_is_requested(item: object) -> None:
+        # Runs inside execute's critical section: shutdown needs the same lock,
+        # so it must still be waiting after a generous pause.
+        if item is not None and not stopper_blocked:
             stopper.start()
-            stopper.join(0.5)  # unlocked design: shutdown and drain finish here
-            worker.join(0.5)
+            stopper.join(0.2)
+            stopper_blocked.append(stopper.is_alive())
         real_put(item)  # type: ignore[arg-type]
 
-    worker.task_queue.put = put_after_a_shutdown_attempt  # type: ignore[method-assign]
+    setattr(worker.task_queue, "put", put_while_shutdown_is_requested)
 
     outcome, value = call_with_deadline(lambda: worker.execute(run_task))
-
-    assert outcome == "done"
-    assert value == "ran" or isinstance(value, main.ScraperUnavailableError)
-
-
-def _race_once() -> list[str]:
-    worker = start_worker(FakeLauncher(), FakeClock())
-    results: list[tuple[str, object]] = []
-
-    def call() -> None:
-        results.append(call_with_deadline(lambda: worker.execute(run_task), WAIT))
-
-    callers = [threading.Thread(target=call) for _ in range(3)]
-    for caller in callers:
-        caller.start()
-    worker.shutdown()
-    for caller in callers:
-        caller.join(WAIT * 2)
+    stopper.join(WAIT)
     worker.join(WAIT)
-    return [outcome for outcome, _ in results]
+
+    assert stopper_blocked == [True]
+    assert (outcome, value) == ("done", "ran")  # queued before STOP, so it runs
+    assert not stopper.is_alive() and not worker.is_alive()
 
 
-def test_execute_racing_shutdown_never_blocks_a_caller():
-    for _ in range(30):
-        assert _race_once() == ["done"] * 3
+def test_callers_queued_behind_a_running_task_are_all_answered_by_shutdown():
+    worker = start_worker(FakeLauncher(), FakeClock())
+    entered, release = threading.Event(), threading.Event()
+
+    def long_task(scraper: object) -> str:
+        entered.set()
+        assert release.wait(WAIT)
+        return "done"
+
+    running, running_results = _start(worker, long_task)
+    assert entered.wait(WAIT)
+    waiting = [call_in_thread(worker) for _ in range(3)]
+    deadline = time.monotonic() + WAIT
+    while worker.task_queue.qsize() < 3 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert worker.task_queue.qsize() == 3
+
+    worker.shutdown()  # STOP queues behind the three callers' tasks
+    release.set()
+    running.join(WAIT)
+    for thread, _ in waiting:
+        thread.join(WAIT)
+    worker.join(WAIT)
+
+    assert running_results == ["done"]
+    assert [results for _, results in waiting] == [["ran"]] * 3
+    assert not worker.is_alive()
+
+
+def call_in_thread(worker: main.ScraperWorker) -> tuple[threading.Thread, list[object]]:
+    """Start `worker.execute(run_task)` in a thread; the list gets its result."""
+    return _start(worker, run_task)
 
 
 def test_task_raising_system_exit_answers_the_caller_and_keeps_the_worker():
@@ -368,14 +389,22 @@ def test_task_raising_system_exit_answers_the_caller_and_keeps_the_worker():
     worker.shutdown()
 
 
-def test_worker_thread_dying_unexpectedly_does_not_strand_callers():
+def test_worker_thread_dying_unexpectedly_does_not_strand_callers(monkeypatch):
+    crashes: list[BaseException | None] = []
+    # Taking over the hook records the deliberate crash; pytest's own hook would
+    # report it as an unhandled thread exception and hide a real one in noise.
+    monkeypatch.setattr(
+        threading, "excepthook", lambda args: crashes.append(args.exc_value)
+    )
     worker = start_worker(FakeLauncher(), FakeClock())
     worker.task_queue.put("not a task")  # makes the loop itself fail
 
     outcome, value = call_with_deadline(lambda: worker.execute(run_task))
+    worker.join(WAIT)
 
     assert outcome == "done"
     assert isinstance(value, main.ScraperUnavailableError)
+    assert len(crashes) == 1 and isinstance(crashes[0], AttributeError)
 
 
 # --- item 4: shutdown order, safety, truthful state --------------------------------
@@ -407,7 +436,7 @@ class SpyScheduler:
             raise self.error
 
 
-def test_shutdown_event_tells_the_worker_first_and_does_not_wait_for_jobs(
+def test_shutdown_event_stops_the_worker_first_and_does_not_wait_for_scheduler_jobs(
     monkeypatch,
 ):
     calls: list[str] = []
@@ -579,7 +608,12 @@ def test_error_is_cleared_after_a_successful_relaunch():
     clock.now += 61
     worker.execute(run_task)
 
-    assert worker.status() == {"state": "available", "error": None, "retry_in": None}
+    assert worker.status() == {
+        "state": "available",
+        "error": None,
+        "retry_in": None,
+        "busy_since": None,
+    }
     worker.shutdown()
 
 
