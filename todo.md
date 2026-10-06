@@ -17,21 +17,52 @@ Current working checklist. The full list lives in `plan.md`.
 - First build after deploying: every app is rebuilt once and gets a new version
   string, so Obtainium offers one update per app.
 
+## State 2026-10-06: review and fix round done and committed
+
+- Gates: 1293 tests pass plus one expected failure;
+  `ruff check src tests` 60; `mypy src tests` 10.
+- Still nothing run against a real browser, real
+  `morphe-cli`, a live server, a reverse proxy or Docker.
+
+Done 2026-10-06 (details in `decisions.md`):
+
+- [x] Independent review of the unreviewed work: security, token and patch
+      list, worker and guards. No critical security finding; one high regression
+      in the patch-list sync
+- [x] Lane 1, patch-list sync: staged pair, stricter patch-list check, repo list
+      before unnamed assets, tags with `/`, byte limits
+- [x] Lane 2, worker bookkeeping: build and sync claimed at request time,
+      updates generation, unique temp files, `busy_since`
+- [x] Lane 3, security lows: secret memory, no request input in errors,
+      loopback port, `Sec-Fetch-Site`, server URL rules, token state
+- [x] Review of the three lanes (security and code): two stuck-claim defects and
+      several low findings
+- [x] Follow-up round for those findings
+
+Open after this round:
+
+- [ ] The follow-up round has had no independent review (20 small fixes in
+      `main.py`, `patcher.py`, `request_guards.py`, `secrets_store.py`); the
+      owner decided 2026-10-06 not to review it
+- [ ] Merge into `main` (owner decided: merge after the fix round)
+- [ ] Template: show `github_token_rejected`, `github_token_warning`,
+      `busy_since`, "sync already running"; "starting" shows as a red dot
+- [ ] `include_patches` and the app name are not validated and reach an error
+      text that is returned masked (a guessed secret can still be confirmed there)
+- [ ] App versions taken from a patch list enter file names unsanitised (not
+      exploitable as written)
+- [ ] `Sec-Fetch-Site` is not sent on plain `http://<LAN IP>`; cross-site GETs
+      to `/api/ui/` are not refused there
+- [ ] A cron build that arrives during a manual build is skipped until the next
+      tick (now logged as a warning)
+- [ ] Unverified: how GitHub writes a `/` and other special characters of a tag
+      or asset name in `browser_download_url`
+- [ ] With the Settings UI (step 4): Apprise notification URLs as secrets;
+      "permissions cannot be verified" for a fine-grained token
+- [ ] Not now: builds of pinned versions and local APKs without the browser
+
 ## Next session, in this order
 
-- [ ] Merge `secrets-guards-worker` into `main`? (owner's call)
-- [ ] Review the work that has had no independent review, before anything else:
-      - GitHub token step (code review and security review): `github_api_get`,
-        401 handling, redirect and `.netrc` rules, URL rules for tags and assets
-      - Fix round on the redaction (log hook, remembered values, environment
-        secrets removed at startup, bad and colliding sources)
-      - Patch-list selection from release assets
-      - Review fixes to the scraper worker and to the request guards (step 1e)
-- [ ] Decide: show "permissions cannot be verified" for a fine-grained token?
-      (only classic tokens expose their scopes; fine-grained tokens get no
-      warning today)
-- [ ] Decide: release tags containing `/` are refused as a ref for the raw
-      patch-list URL; keep or allow?
 - [ ] The token-permissions warning is in `tools_status` only
       (`github_token_warning`); the UI does not show it yet (do with step 4)
 - [ ] Try a real token: authenticated sync, the rate limit rising to 5,000, a

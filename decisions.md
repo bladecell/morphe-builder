@@ -455,3 +455,74 @@ Decided by the user after the security review of the hardening step.
   Files are not renamed.
 - Redaction is global: one hook on all log records and one `print` replacement
   in `patcher.py`. It matches exact values only.
+
+## 2026-10-06: Release sync after the independent review
+
+Decided by the user after three independent reviews of the branch.
+
+- The bundle and the patch list of a release are staged and moved into place
+  only when both arrived. A new release without a usable list leaves the old
+  pair and the old recorded tag, and is retried. Reason: the token step had made
+  that case record the new tag next to the old list.
+- The list is fetched before the bundle. A `<repo>#incomplete` marker in
+  `versions.json` covers the two moves; while it exists the next sync ignores the
+  throttle and fetches again. The recorded tag is not touched, so version
+  strings do not change.
+- A patch list needs at least one entry with a text name. A stored list without
+  one counts as unreadable and is repaired on the next sync.
+- Candidate order: named assets, the repo list at the release tag, unnamed
+  `.json` assets up to 256 KiB, then unnamed assets up to 2 MiB smallest first.
+  Every patch-list download is limited on bytes received (8 MiB for named assets
+  and repo lists).
+- Release tags may contain `/`. Each segment is validated on its own, and an
+  asset URL must equal the one built from the release's tag and the asset name.
+  The tag is sanitised before it enters the APK file name; the hash still uses
+  the raw tag, so names of existing builds are unchanged.
+- No GitHub request uses `~/.netrc`, on any redirect hop. Redirects to plain
+  http are refused.
+
+## 2026-10-06: One build and one sync at a time, claimed at request time
+
+- A build is claimed when it is requested and released only by its owner. A
+  second request answers "Build already in progress". The manual job never
+  counts as missed, and the cron setup removes only its own two jobs. Reason:
+  the flag used to be raised when the worker started, so a queued build could be
+  queued twice and one build could clear the flag of another.
+- One tool and source sync at a time (`patcher.SYNC_LOCK`). A second Sync
+  Sources request starts nothing. Adding a source during a sync is refused with
+  409, because a request should not wait behind a sync of several minutes. A
+  build waits for the running sync, so it never builds from half-written files.
+- A refresh of the updates view that started before a build finished is not
+  stamped as fresh (generation counter).
+- The worker status carries `busy_since` and a "starting" state. The watchdog
+  itself stays open.
+- Shutdown is unchanged: the process ends when the running build ends. Making
+  blocked callers return early would abandon a build half way.
+- A revoked or expired token still stops every sync; it is shown as a lasting
+  `github_token_rejected` field in the tools status. No fallback to requests
+  without the token.
+- Not now: builds of pinned versions and local APKs without the browser.
+
+## 2026-10-06: Guard and secret rules after the fourth review
+
+- `Sec-Fetch-Site: cross-site` is refused on every state-changing request, and on
+  GET only under `/api/ui/`. Reason: `/view`, `/download` and `/api/apps` are
+  opened by links from other sites and apps. Limit: browsers send the header
+  only over https and on localhost, so plain `http://<LAN IP>` gets no benefit.
+- A loopback server URL counts as an Origin only when its port equals the port
+  of the `Host` header.
+- The server URL is validated when it changes (`http(s)://host[:port]` plus an
+  optional path prefix). An unchanged stored value never blocks a save.
+- When `ALLOWED_HOSTS` lists at least one full origin, the server URL is ignored
+  by the Host and Origin rules. Reason: any client on the network can change the
+  server URL. Bare names do not switch it off: a bare name allows a `Host` only,
+  so an install that names its proxy's `Host` there still needs the server URL
+  for the `Origin` of its own page, and would lose every write otherwise.
+- An empty server URL can be saved and means unset.
+- A secret value is masked only once it is in effect (file, environment, or a
+  successful write). Values in effect are never dropped; replaced values are
+  kept up to 32. A refused or failed write adds nothing.
+- Error texts and the build log no longer contain request input. Reason: masked
+  output showed whether the input was a known secret.
+- Later, with the Settings UI: Apprise notification URLs handled as secrets, and
+  "permissions cannot be verified" for fine-grained tokens.

@@ -167,7 +167,8 @@ with a token the limit is 5,000 per hour.
 - [x] Never log, print or return the token (global redaction, 2026-10-05)
 - [x] Report a rejected token (401) clearly instead of as a generic sync failure
 - [x] pytest tests: header sent when set, absent when unset, 401 reported
-- [ ] Independent code and security review of the token step
+- [x] Independent code and security review of the token step (done 2026-10-06;
+      findings fixed, see section 8)
 - [ ] Show only "token set / not set" in the UI (secrets step 4, section 8)
 - [ ] Show the token-permissions warning in the UI
 - [ ] Document the variable in `README.md` and pass it through in the Docker setup
@@ -219,7 +220,13 @@ branch `secrets-guards-worker`.
 - [x] Before step 3: repo name rule, environment secrets validated and removed
       from the process environment, global redaction, Java without the secrets
 - [x] Step 3: GitHub token (section 5)
-- [ ] Review everything listed as not reviewed in `todo.md`
+- [x] Review everything listed as not reviewed in `todo.md` (done 2026-10-06:
+      three reviews, three fix lanes, a second review, a follow-up fix round;
+      the follow-up round is not reviewed, nothing committed yet)
+- [x] Slash tags, staged release pair, one build and one sync at a time, guard
+      and secret fixes from the reviews (2026-10-06)
+- [x] Server URL stays a trust anchor until `ALLOWED_HOSTS` lists a full origin;
+      an empty server URL can be saved (decided 2026-10-06)
 - [ ] Pin or vendor Tailwind and Alpine before a secret can be typed into the page
 - [ ] Step 4: Settings UI for both secrets, with the `environment_invalid` state
       and the token-permissions warning
