@@ -198,6 +198,7 @@ returns `(True, [repos used])`.
 | Settings | `POST /api/ui/save_settings`, `POST /api/ui/test_notification` | Saving reschedules cron |
 | Obtainium | `GET /view/{package_id}`, `GET /api/apps`, `GET /api/apps/{obtainium_id}`, `GET /download/{package_name}` | `/view` accepts package id or `obtainium_id`. `/download` takes an exact filename or a package id and serves the newest APK of exactly that package, or 404. Unknown ids on `/api/apps/{id}` give 404 |
 | Static | `/icons` | `DATA_DIR/apks/icons` |
+| Static | `/static` | `src/static`: `app.css` (URL carries a content hash) and the vendored Alpine.js |
 
 No authentication on any route; CORS allows all origins.
 
