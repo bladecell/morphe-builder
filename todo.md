@@ -17,14 +17,15 @@ Current working checklist. The full list lives in `plan.md`.
 - First build after deploying: every app is rebuilt once and gets a new version
   string, so Obtainium offers one update per app.
 
-## State 2026-10-06: local page assets on branch `local-static-assets`
+## State 2026-10-06: local page assets, merged into `main`
 
 - The admin page loads nothing from a third party: `src/static/app.css` is
   built with the Tailwind 3.4.17 standalone CLI (`uv run python
   scripts/build_css.py`) and committed; Alpine 3.17.4 is vendored.
-- Gates on the branch: 1408 tests pass plus one expected failure;
+- Gates on `main`: 1408 tests pass plus one expected failure;
   `ruff check src tests scripts` 60; `mypy src tests scripts` 10.
-- Independently reviewed; the review findings are fixed. Not merged.
+- Independently reviewed; the review findings are fixed. Merged into `main`
+  (merge commit `8832363`), not pushed.
 - [ ] Browser check that the page looks as before (same Tailwind version and a
       class-coverage test are the only evidence so far)
 - [ ] The linux-arm64 and macOS Tailwind binaries are pinned by hash but were
