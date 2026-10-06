@@ -21,6 +21,7 @@ Current working checklist. The full list lives in `plan.md`.
 
 - Gates: 1293 tests pass plus one expected failure;
   `ruff check src tests` 60; `mypy src tests` 10.
+- `secrets-guards-worker` is merged into `main`; `main` is not pushed.
 - Still nothing run against a real browser, real
   `morphe-cli`, a live server, a reverse proxy or Docker.
 
@@ -44,7 +45,7 @@ Open after this round:
 - [ ] The follow-up round has had no independent review (20 small fixes in
       `main.py`, `patcher.py`, `request_guards.py`, `secrets_store.py`); the
       owner decided 2026-10-06 not to review it
-- [ ] Merge into `main` (owner decided: merge after the fix round)
+- [x] Merged into `main` 2026-10-06 (merge commit `253c462`); not pushed
 - [ ] Template: show `github_token_rejected`, `github_token_warning`,
       `busy_since`, "sync already running"; "starting" shows as a red dot
 - [ ] `include_patches` and the app name are not validated and reach an error
