@@ -48,8 +48,39 @@ DEFAULT_CONFIG = {
 _CONFIG_LOCK = threading.RLock()
 
 
+def write_file_atomic(path: Path, text: str, mode: int | None = None) -> None:
+    """Replace the file at `path` with `text` so readers never see a partial file.
+
+    Args:
+        path: Destination file; its directory is created if missing.
+        text: Full new file contents.
+        mode: Permission bits for the result. When None, an existing file keeps
+            its mode and a new file gets 0644.
+
+    Raises:
+        OSError: The temporary file could not be written or moved into place.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.stem}-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
+            tmp_file.write(text)
+            tmp_file.flush()
+            os.fsync(tmp_file.fileno())
+        if mode is not None:
+            os.chmod(tmp_name, mode)
+        elif path.exists():
+            shutil.copymode(path, tmp_name)
+        else:
+            os.chmod(tmp_name, 0o644)
+        os.replace(tmp_name, path)
+    except BaseException:
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
+
+
 def _write_atomic(text: str) -> None:
-    """Replace config.yaml with `text` so readers never see a partial file.
+    """Replace config.yaml with `text` atomically.
 
     Args:
         text: Full new file contents.
@@ -57,22 +88,7 @@ def _write_atomic(text: str) -> None:
     Raises:
         OSError: The temporary file could not be written or moved into place.
     """
-    config_path = DATA_DIR / "config.yaml"
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(dir=config_path.parent, prefix=".config-")
-    try:
-        with os.fdopen(fd, "w") as tmp_file:
-            tmp_file.write(text)
-            tmp_file.flush()
-            os.fsync(tmp_file.fileno())
-        if config_path.exists():
-            shutil.copymode(config_path, tmp_name)
-        else:
-            os.chmod(tmp_name, 0o644)
-        os.replace(tmp_name, config_path)
-    except BaseException:
-        Path(tmp_name).unlink(missing_ok=True)
-        raise
+    write_file_atomic(DATA_DIR / "config.yaml", text)
 
 
 def save_config(config_data: dict) -> None:

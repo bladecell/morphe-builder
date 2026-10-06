@@ -12,6 +12,7 @@ RESET_TEXT = "2030-03-17 17:46 UTC"
 
 
 class FakeResponse:
+    is_redirect = False
     def __init__(self, status_code, headers=None):
         self.status_code = status_code
         self.headers = headers or {}

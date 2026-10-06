@@ -315,22 +315,17 @@ def test_add_source_refuses_duplicate_that_appeared_during_sync(data_dir, slow_s
     assert [s["name"] for s in read_config(data_dir)["sources"]] == ["S", "other"]
 
 
-def test_source_updates_writes_the_currently_installed_version(data_dir, monkeypatch):
-    versions_file = data_dir / "bin" / "versions.json"
-    versions_file.parent.mkdir()
-    versions_file.write_text('{"own/src": "v1"}')
-    monkeypatch.setattr(patcher, "VERSIONS_FILE", versions_file)
-    monkeypatch.setattr(main, "SOURCE_UPDATE_CACHE", {"timestamp": 0, "results": {}})
+def test_source_updates_route_is_gone_so_nothing_writes_source_versions_from_a_get(
+    data_dir,
+):
+    from fastapi.testclient import TestClient
 
-    def github_while_a_sync_installs_v2(*args, **kwargs):
-        versions_file.write_text('{"own/src": "v2"}')
-        raise main.requests.exceptions.ConnectionError("offline")
+    before = (data_dir / "config.yaml").read_bytes()
 
-    monkeypatch.setattr(main.requests, "get", github_while_a_sync_installs_v2)
+    response = TestClient(main.app).get("/api/ui/source_updates")
 
-    main.check_source_updates()
-
-    assert read_config(data_dir)["sources"][0]["version"] == "v2"
+    assert response.status_code == 404
+    assert (data_dir / "config.yaml").read_bytes() == before
 
 
 # --- patch selection triggers a rebuild ---------------------------------------

@@ -30,6 +30,7 @@ RUN mkdir -p /data
 
 # Pre-initialize cloakbrowser binaries to prevent runtime delays/errors
 RUN uv run python -c "from cloakbrowser.download import ensure_binary; ensure_binary()"
+ENV CLOAKBROWSER_AUTO_UPDATE=false
 
 # Expose the dashboard port
 EXPOSE 8000

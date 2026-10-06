@@ -1,11 +1,13 @@
 """Shared fixtures for the pipeline and config tests."""
 
+import socket
 from pathlib import Path
 
 import pytest
 import yaml
+from starlette.staticfiles import StaticFiles
 
-from src import config_store, main, patcher
+from src import apkmirror_downloader, config_store, main, patcher, secrets_store
 
 APP_A = {
     "id": "com.a",
@@ -35,7 +37,66 @@ def isolated_data_dir(tmp_path, monkeypatch):
     """Keep every test out of the real data directory."""
     for module in (config_store, patcher, main):
         monkeypatch.setattr(module, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "LOG_PATH", tmp_path / "bin" / "build.log")
+    # Claims taken by a test that fakes the task must not leak into the next test.
+    monkeypatch.setattr(main, "TOOLS_UPDATING", False)
+    monkeypatch.setattr(main, "_ACTIVITY_COUNT", 0)
+    # Values the secret store remembered for masking belong to one test only.
+    for name, empty in (("_current", {}), ("_retired", ()), ("_known", ())):
+        monkeypatch.setattr(secrets_store, name, empty, raising=False)
+    # Both paths are bound at import, so DATA_DIR alone does not move them.
+    for name in ("VERSIONS_FILE", "VERSION_CACHE_FILE"):
+        real_path = getattr(patcher, name)
+        monkeypatch.setattr(patcher, name, tmp_path / "bin" / real_path.name)
+    icons_dir = tmp_path / "apks" / "icons"
+    icons_mount = next(r for r in main.app.routes if getattr(r, "name", "") == "icons")
+    monkeypatch.setattr(
+        icons_mount, "app", StaticFiles(directory=str(icons_dir), check_dir=False)
+    )
+    # The test client sends Host: testserver; production rules stay unchanged.
+    monkeypatch.setenv("ALLOWED_HOSTS", "testserver")
+    for secret_name in ("GITHUB_TOKEN", "CLOAKBROWSER_LICENSE_KEY"):
+        monkeypatch.delenv(secret_name, raising=False)
     return tmp_path
+
+
+@pytest.fixture(autouse=True)
+def no_real_browser_or_network(monkeypatch):
+    """Fail any test that launches the real browser or opens a network socket.
+
+    The attempt raises inside the code under test (which may swallow it), and
+    the fixture fails the test at teardown, so it cannot pass by accident. A
+    test that triggers the guard on purpose empties the yielded list.
+    """
+    attempts: list[str] = []
+
+    def blocked_launch(*args, **kwargs):
+        attempts.append("browser launch")
+        raise RuntimeError("tests must not launch a real browser")
+
+    real_connect = socket.socket.connect
+    real_connect_ex = socket.socket.connect_ex
+
+    def is_local_ipc(sock, address) -> bool:
+        return sock.family == socket.AF_UNIX
+
+    def blocked_connect(self, address):
+        if is_local_ipc(self, address):
+            return real_connect(self, address)
+        attempts.append(f"socket connect {address!r}")
+        raise OSError("tests must not open network connections")
+
+    def blocked_connect_ex(self, address):
+        if is_local_ipc(self, address):
+            return real_connect_ex(self, address)
+        attempts.append(f"socket connect_ex {address!r}")
+        raise OSError("tests must not open network connections")
+
+    monkeypatch.setattr(apkmirror_downloader, "launch", blocked_launch)
+    monkeypatch.setattr(socket.socket, "connect", blocked_connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", blocked_connect_ex)
+    yield attempts
+    assert not attempts, f"real browser or network use in a test: {attempts}"
 
 
 @pytest.fixture

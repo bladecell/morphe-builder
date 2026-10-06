@@ -124,7 +124,7 @@ Returns `(versions, None, None)`. Priority:
 
 1. Pinned `version` on the app config. No network.
 2. Newest version recommended by patch sources. Only sources that provide a selected
-   patch, plus the base source (`_is_base_repo`: `MorpheApp/morphe-patches`), are
+   patch, plus the base source (`is_base_repo`: `MorpheApp/morphe-patches`), are
    considered, in config order; their version sets are intersected, falling back to
    the non-base provider if the intersection is empty.
    With no patches selected, all sources are merged.
