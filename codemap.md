@@ -27,11 +27,15 @@ For design rationale see [architecture.md](architecture.md) and
 |-----------|------------------------|--------------|
 | `src/` | Backend: FastAPI routes and scheduling (`main.py`), locked atomic config I/O (`config_store.py`), sync, version selection, download and patch pipeline (`patcher.py`), APKMirror browser scraper (`apkmirror_downloader.py`). | [View Map](src/codemap.md) |
 | `src/templates/` | Jinja2 views: Alpine.js single-page admin UI and the Obtainium HTML page. | [View Map](src/templates/codemap.md) |
+| `src/static/` | Served at `/static`: the generated stylesheet `app.css` and the vendored Alpine.js file. | none |
 
 Not mapped:
 
 - `tests/`: pytest suite. `conftest.py` points `DATA_DIR` at a temp directory for
   every test.
+- `scripts/build_css.py`: builds `src/static/app.css` with the pinned Tailwind
+  standalone CLI (downloaded into `.cache/`, hash-checked). `tailwind/` holds its
+  config, input CSS and the digest of the build inputs.
 - `test.py` (root): not a test. A standalone `rnet`-based APKMirror scraper that
   predates `src/apkmirror_downloader.py`. Nothing imports it and `rnet` is not a
   declared dependency.

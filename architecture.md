@@ -15,7 +15,7 @@ Morphe patch bundles, and serves the result to Obtainium.
 | Config store | `src/config_store.py` | All `config.yaml` I/O: lock, atomic write, `update_config` |
 | Pipeline | `src/patcher.py` | Tool and source sync, version selection, APK download, patching |
 | Scraper | `src/apkmirror_downloader.py` | Drives a stealth Chromium (cloakbrowser) through APKMirror |
-| UI | `src/templates/index.html` | Single page, Alpine.js + Tailwind from CDN, three tabs |
+| UI | `src/templates/index.html` | Single page, three tabs; vendored Alpine.js and a prebuilt Tailwind stylesheet from `src/static/` |
 | Obtainium page | `src/templates/obtainium.html` | Minimal HTML page Obtainium parses for version and link |
 
 External tools, downloaded at runtime: `morphe-cli.jar` (patcher) and `APKEditor.jar`

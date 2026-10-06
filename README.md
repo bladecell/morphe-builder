@@ -61,6 +61,39 @@ docker run -d \
    uv run uvicorn src.main:app --host 0.0.0.0 --port 8000
    ```
 
+## Development
+
+### Page styles and scripts
+
+The admin page loads nothing from a third party. Its stylesheet,
+`src/static/app.css`, is built ahead of time with the Tailwind CSS 3.4.17
+standalone CLI and committed. Alpine.js 3.17.4 is vendored as
+`src/static/alpine-3.17.4.min.js`. Licences are in `THIRD_PARTY_NOTICES`.
+
+After changing `src/templates/*.html`, `tailwind/tailwind.config.js` or
+`tailwind/input.css`, rebuild the stylesheet:
+
+```bash
+uv run python scripts/build_css.py
+```
+
+Commit `src/static/app.css` and `tailwind/inputs.sha256` together with the
+change. The tests fail with a hint to run this command when the stylesheet is
+out of date.
+
+The first run downloads the Tailwind binary for your platform into
+`.cache/tailwind/` (gitignored) and checks it against the SHA-256 pinned in
+`scripts/build_css.py`; a file that does not match is not run. Linux and macOS
+on x64 and arm64 are supported. Node.js is not needed, and the Docker image
+needs no build step because it copies `src/static/`.
+
+To upgrade Tailwind, change `TAILWIND_VERSION` and the hashes in
+`scripts/build_css.py` from the release's `sha256sums.txt`, then rebuild. To
+upgrade Alpine, take `dist/cdn.min.js` from the npm package, check it against
+the registry's integrity value, rename it with the new version, and update the
+tag in `src/templates/index.html`, the hash in `tests/test_static_assets.py`
+and `THIRD_PARTY_NOTICES`.
+
 ## Configuration
 
 Settings are managed via `config.yaml` in the root directory or through the Web UI's Settings tab.

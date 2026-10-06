@@ -526,3 +526,27 @@ Decided by the user after three independent reviews of the branch.
   output showed whether the input was a known secret.
 - Later, with the Settings UI: Apprise notification URLs handled as secrets, and
   "permissions cannot be verified" for fine-grained tokens.
+
+## 2026-10-06: The page loads nothing from a third party
+
+Decided by the user: build the stylesheet ahead of time instead of pinning the
+CDNs or vendoring the in-browser Tailwind script.
+
+- Tailwind 3.4.17, the version the CDN served. Reason: Tailwind 4 changes the
+  look of this page (button cursor, blur, shadows, corners, placeholder colour).
+  A move to 4 is its own change with a visual check.
+- The standalone Tailwind binary runs the build, downloaded by
+  `scripts/build_css.py` into a gitignored cache and run only when its SHA-256
+  matches the pinned value. Reason: no Node toolchain in the project; the
+  `pytailwindcss` wrapper neither pins nor verifies the binary.
+- The generated `src/static/app.css` is committed. Reason: running from source
+  and the tests need no extra tooling, and the Docker image needs no build
+  stage. A recorded digest of the build inputs (templates, config, input CSS,
+  Tailwind version, CLI arguments) makes a test fail when the stylesheet is out
+  of date; a second test rebuilds and compares when the binary is cached.
+- Alpine 3.17.4 is vendored with the version in the file name, checked against
+  the npm registry's integrity value and jsDelivr's hash.
+- The stylesheet URL carries a hash of the file's content, because the app
+  sends no cache header for static files.
+- A missing stylesheet is logged and the page still renders, unstyled.
+- Licences are in `THIRD_PARTY_NOTICES`.

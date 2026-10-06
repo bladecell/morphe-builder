@@ -17,6 +17,22 @@ Current working checklist. The full list lives in `plan.md`.
 - First build after deploying: every app is rebuilt once and gets a new version
   string, so Obtainium offers one update per app.
 
+## State 2026-10-06: local page assets on branch `local-static-assets`
+
+- The admin page loads nothing from a third party: `src/static/app.css` is
+  built with the Tailwind 3.4.17 standalone CLI (`uv run python
+  scripts/build_css.py`) and committed; Alpine 3.17.4 is vendored.
+- Gates on the branch: 1408 tests pass plus one expected failure;
+  `ruff check src tests scripts` 60; `mypy src tests scripts` 10.
+- Independently reviewed; the review findings are fixed. Not merged.
+- [ ] Browser check that the page looks as before (same Tailwind version and a
+      class-coverage test are the only evidence so far)
+- [ ] The linux-arm64 and macOS Tailwind binaries are pinned by hash but were
+      never downloaded or run
+- [ ] The page uses absolute paths everywhere (`/static`, `/icons`,
+      `/api/ui`), so it does not work under a reverse-proxy path prefix
+- [ ] `.claude/` is untracked and not gitignored
+
 ## State 2026-10-06: review and fix round done and committed
 
 - Gates: 1293 tests pass plus one expected failure;
@@ -68,9 +84,6 @@ Open after this round:
       (`github_token_warning`); the UI does not show it yet (do with step 4)
 - [ ] Try a real token: authenticated sync, the rate limit rising to 5,000, a
       wrong token giving the fixed 401 text on the Discovery tab
-- [ ] Before the Settings UI: pin Tailwind and Alpine with integrity hashes or
-      vendor them. They load from a CDN with a floating version and would see a
-      secret as it is typed
 - [ ] Secrets step 4: Settings UI for both secrets. Must show the
       `environment_invalid` state and the token-permissions warning
 - [ ] Secrets step 5: licence key passed to the browser explicitly
