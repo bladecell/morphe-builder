@@ -27,7 +27,17 @@ def test_status_when_nothing_is_set(client):
     response = client.get("/api/ui/secrets")
 
     assert response.status_code == 200
-    assert response.json() == {"github-token": UNSET, "cloakbrowser-license-key": UNSET}
+    assert response.json() == {
+        "github-token": UNSET,
+        "cloakbrowser-license-key": UNSET,
+        "apprise-urls": {
+            "set": False,
+            "count": 0,
+            "source": None,
+            "legacy_available": False,
+            "migration_state": "none",
+        },
+    }
 
 
 def test_put_then_delete_round_trip(client):

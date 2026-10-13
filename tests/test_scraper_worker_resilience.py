@@ -250,6 +250,7 @@ def test_tools_status_reports_available_browser(monkeypatch):
         "error": None,
         "retry_in": None,
         "busy_since": None,
+        "license_key_rejected": False,
     }
 
 
@@ -613,6 +614,7 @@ def test_error_is_cleared_after_a_successful_relaunch():
         "error": None,
         "retry_in": None,
         "busy_since": None,
+        "license_key_rejected": False,
     }
     worker.shutdown()
 

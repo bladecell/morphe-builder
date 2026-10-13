@@ -14,7 +14,8 @@
         ::-webkit-scrollbar-thumb:hover { background: #475569; }
     </style>
 </head>
-<body class="bg-slate-950 text-slate-200 font-sans antialiased" x-data="morphe">
+<body class="bg-slate-950 text-slate-200 font-sans antialiased" x-data="morphe"
+      @keydown.escape.window="closeActiveDialog()" @keydown.tab.window="trapDialogFocus($event)">
 
     <script>
         document.addEventListener('alpine:init', () => {
@@ -27,16 +28,26 @@
                 pipelineApps: {{ config.apps | tojson | safe }},
                 sources: {{ config.sources | tojson | safe }},
                 metadata: {{ metadata | tojson | safe }},
-                settings: {{ (config.settings if config.settings else {"server_url": "", "cron_schedule": "0 0 * * *", "notification_urls": []}) | tojson | safe }},
+                settings: {{ (config.settings if config.settings else {"server_url": "", "cron_schedule": "0 0 * * *"}) | tojson | safe }},
                 updates: {},
                 lastRun: '{{ metadata.last_run if metadata and metadata.last_run else "Never" }}',
                 selectedApps: [],
                 showModal: false,
                 showUploadModal: false,
+                dialogOpener: null,
                 isEditing: false,
                 selectedPkg: null,
                 selectedAppName: '',
                 uploadVersion: '',
+                uploadError: null,
+                buildError: null,
+                patchError: null,
+                patchCatalogRequestId: 0,
+                sourceError: null,
+                sourceErrors: {},
+                appErrors: {},
+                notificationMessage: null,
+                newSourceRepo: '',
                 availablePatches: [],
                 loadingPatches: false,
                 buildLogs: '',
@@ -44,30 +55,170 @@
                 toolsUpdating: false,
                 syncError: null,
                 refreshing: false,
-                newNotificationUrl: '',
+                appriseStatus: {set: false, count: 0, source: null, legacy_available: false, migration_state: 'none'},
+                appriseLoaded: false,
+                appriseDraft: [],
+                appriseInput: '',
+                appriseBusy: false,
+                appriseMessage: null,
                 testingNotifications: false,
+                syncNotice: null,
+                syncRefused: null,
+                githubTokenWarning: null,
+                githubTokenRejected: null,
+                githubTokenPermissions: null,
+                serverClockOffset: 0,
+                stuckAfterSeconds: 600,
+                plainHttp: location.protocol === 'http:' && !['localhost', '127.0.0.1', '[::1]'].includes(location.hostname),
+                secretFields: [
+                    {
+                        slug: 'github-token',
+                        label: 'GitHub token',
+                        env: 'GITHUB_TOKEN',
+                        hint: 'Without a token GitHub allows 60 requests per hour; with one, 5,000. Use a token with no permissions. Saving or removing it starts a sync when none is running; the result appears here.',
+                        saved: {
+                            queued: 'Saved. The token is being checked by a sync now.',
+                            'already-running': 'Saved. A sync is already running; the next sync will check the token.',
+                            'not-needed': 'Saved. No change.',
+                            unavailable: 'Saved, but no sync could be started. Use Sync Sources.',
+                            none: 'Saved.'
+                        },
+                        removed: {
+                            queued: 'Removed. A sync is running without the token.',
+                            'already-running': 'Removed. A sync is already running; the next sync will run without the token.',
+                            'not-needed': 'Removed. No change.',
+                            unavailable: 'Removed, but no sync could be started. Use Sync Sources.',
+                            none: 'Removed.'
+                        }
+                    },
+                    {
+                        slug: 'cloakbrowser-license-key',
+                        label: 'Cloakbrowser licence key',
+                        env: 'CLOAKBROWSER_LICENSE_KEY',
+                        hint: 'The browser reads a changed key before its next scraper task. Saving or removing this key does not start a task or validate it immediately.',
+                        saved: {none: 'Saved. The browser will use the new key before its next task.'},
+                        removed: {none: 'Removed. The browser will use the updated setting before its next task.'}
+                    }
+                ],
+                secrets: {},
+                secretsLoaded: false,
+                secretsLoadError: null,
+                secretInput: {'github-token': '', 'cloakbrowser-license-key': ''},
+                secretBusy: {},
+                secretMessage: {},
 
+                patchSources: [],
                 patchTabs: [],
                 activePatchTab: '',
+                patchSelection: {stored: [], resolved: {}, status: 'empty', unresolved: [], error: null},
+                unresolvedLegacyPatches: [],
+                patchSaving: false,
 
-                togglePatch(patch) {
-                    // Only one source other than the base source can be selected at a time
-                    if (patch.selected && !patch.is_base) {
-                        const hasConflictingSource = this.availablePatches.some(p => 
-                            p.selected && 
-                            !p.is_base &&
-                            p.source !== patch.source
-                        );
-                        
-                        if (hasConflictingSource) {
-                            // Deselect all patches from other non-Morphe sources
-                            this.availablePatches.forEach(p => {
-                                if (!p.is_base && p.source !== patch.source) {
-                                    p.selected = false;
-                                }
-                            });
-                        }
+                patchTabKey(repo) {
+                    return typeof repo === 'string' ? repo.toLowerCase() : '';
+                },
+
+                patchTabId(repo) {
+                    return 'patch-tab-' + Array.from(this.patchTabKey(repo), char => char.codePointAt(0).toString(16)).join('-');
+                },
+
+                patchPanelId(repo) {
+                    return 'patch-panel-' + Array.from(this.patchTabKey(repo), char => char.codePointAt(0).toString(16)).join('-');
+                },
+
+                selectedPatchCount(repo) {
+                    const key = this.patchTabKey(repo);
+                    return this.availablePatches.filter(p => this.patchTabKey(p.repo) === key && p.selected).length;
+                },
+
+                patchesForRepo(repo) {
+                    const key = this.patchTabKey(repo);
+                    return this.availablePatches.filter(p => this.patchTabKey(p.repo) === key);
+                },
+
+                focusPatchTab(repo, direction) {
+                    if (!this.patchTabs.length) return;
+                    const current = this.patchTabs.findIndex(tab => tab.key === this.patchTabKey(repo));
+                    const next = (current + direction + this.patchTabs.length) % this.patchTabs.length;
+                    const tab = this.patchTabs[next];
+                    this.activePatchTab = tab.key;
+                    this.$nextTick(() => document.getElementById(this.patchTabId(tab.repo))?.focus());
+                },
+
+                handlePatchTabKey(event, repo) {
+                    if (event.key === 'ArrowRight' || event.key === 'ArrowDown') {
+                        event.preventDefault();
+                        this.focusPatchTab(repo, 1);
+                    } else if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') {
+                        event.preventDefault();
+                        this.focusPatchTab(repo, -1);
+                    } else if (event.key === 'Home' || event.key === 'End') {
+                        event.preventDefault();
+                        const tab = event.key === 'Home' ? this.patchTabs[0] : this.patchTabs[this.patchTabs.length - 1];
+                        this.activePatchTab = tab.key;
+                        this.$nextTick(() => document.getElementById(this.patchTabId(tab.repo))?.focus());
                     }
+                },
+
+                initializePatchCatalog(data, isNew) {
+                    if (!data || !Array.isArray(data.sources) || !data.selection || typeof data.selection !== 'object') {
+                        throw new Error('The server returned an invalid patch catalog.');
+                    }
+                    this.patchSources = data.sources;
+                    this.patchSelection = data.selection;
+                    this.unresolvedLegacyPatches = Array.isArray(data.selection.unresolved)
+                        ? data.selection.unresolved.filter(item => item && item.repo == null && typeof item.name === 'string').map((item, index) => ({...item, draftId: index}))
+                        : [];
+                    const resolved = new Map();
+                    if (data.selection.resolved && typeof data.selection.resolved === 'object' && !Array.isArray(data.selection.resolved)) {
+                        Object.entries(data.selection.resolved).forEach(([repo, names]) => {
+                            if (Array.isArray(names)) resolved.set(this.patchTabKey(repo), new Set(names.map(name => String(name).toLowerCase())));
+                        });
+                    }
+                    this.availablePatches = [];
+                    this.patchTabs = [];
+                    const seenRepos = new Set();
+                    const seenPatchKeys = new Set();
+                    data.sources.forEach(source => {
+                        if (!source || typeof source.repo !== 'string') return;
+                        const key = this.patchTabKey(source.repo);
+                        if (!seenRepos.has(key)) {
+                            seenRepos.add(key);
+                            this.patchTabs.push({key, repo: source.repo, source: source.source || source.repo, status: source.status || 'invalid', is_base: source.is_base === true});
+                        } else if (source.status === 'conflict') {
+                            const existingTab = this.patchTabs.find(tab => tab.key === key);
+                            if (existingTab) existingTab.status = 'conflict';
+                        }
+                        if (!Array.isArray(source.patches)) return;
+                        source.patches.forEach(patch => {
+                            if (!patch || typeof patch.name !== 'string') return;
+                            const patchKey = `${key}::${patch.name.toLowerCase()}`;
+                            if (seenPatchKeys.has(patchKey)) return;
+                            seenPatchKeys.add(patchKey);
+                            const backendSelected = patch.selected === true || (resolved.get(key)?.has(patch.name.toLowerCase()) ?? false);
+                            const unresolved = Array.isArray(data.selection.unresolved) && data.selection.unresolved.some(item =>
+                                item && typeof item.repo === 'string'
+                                && this.patchTabKey(item.repo) === key
+                                && typeof item.name === 'string'
+                                && item.name.toLowerCase() === patch.name.toLowerCase()
+                                && item.reason === 'patch_unavailable'
+                            );
+                            const selected = isNew
+                                ? source.status === 'available' && patch.enabled_by_default === true
+                                : backendSelected;
+                            this.availablePatches.push({
+                                ...patch,
+                                repo: source.repo,
+                                source: source.source || source.repo,
+                                source_status: source.status || 'invalid',
+                                status: unresolved ? 'patch_unavailable' : patch.status,
+                                selected,
+                                patchKey
+                            });
+                        });
+                    });
+                    const firstAvailable = this.patchTabs.find(tab => tab.status === 'available');
+                    this.activePatchTab = (firstAvailable || this.patchTabs[0])?.key || '';
                 },
 
                 diagnostics: {java: true, scraper: true},
@@ -84,6 +235,16 @@
                     this.checkBuildStatus();
                     this.checkToolsStatus();
                     this.checkUpdates();
+                    this.loadSecrets();
+                    this.$watch('activeTab', tab => {
+                        if (tab === 'settings') this.loadSecrets();
+                        else {
+                            this.secretFields.forEach(f => { this.secretInput[f.slug] = ''; this.secretMessage[f.slug] = null; });
+                            this.appriseInput = '';
+                            this.appriseDraft = [];
+                            this.appriseMessage = null;
+                        }
+                    });
                     setInterval(() => {
                         this.checkBuildStatus();
                         if (this.building || this.showLogs) {
@@ -119,10 +280,21 @@
                 async checkToolsStatus() {
                     try {
                         const response = await fetch('/api/ui/tools_status');
+                        if (!response.ok) {
+                            console.error('Tools status refused: HTTP ' + response.status);
+                            return;
+                        }
                         const data = await response.json();
                         const wasUpdating = this.toolsUpdating;
                         this.toolsUpdating = data.updating;
                         this.syncError = data.sync_error;
+                        if (!data.updating) this.syncNotice = null;
+                        this.githubTokenWarning = data.github_token_warning || null;
+                        this.githubTokenRejected = data.github_token_rejected || null;
+                        this.githubTokenPermissions = data.github_token_permissions || null;
+                        if (typeof data.server_time === 'number') {
+                            this.serverClockOffset = data.server_time * 1000 - Date.now();
+                        }
                         if (data.browser) this.browser = data.browser;
                         if (data.diagnostics) {
                             this.diagnostics = data.diagnostics;
@@ -179,98 +351,199 @@
                     if (this.building) return;
                     this.building = true;
                     this.buildMessage = 'Starting...';
-                    
+                    this.buildError = null;
                     const payload = {
                         package_ids: this.selectedApps.length > 0 ? this.selectedApps : null
                     };
 
-                    await fetch('/api/ui/trigger_build', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify(payload)
+                    try {
+                        const response = await fetch('/api/ui/trigger_build', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify(payload)
+                        });
+                        if (!response.ok) {
+                            this.buildError = await this.responseDetail(
+                                response, 'Could not start the build.'
+                            );
+                            this.building = false;
+                        }
+                    } catch (e) {
+                        console.error('Failed to start build', e);
+                        this.buildError = 'Could not reach the server.';
+                        this.building = false;
+                    }
+                    await this.checkBuildStatus();
+                },
+
+                async responseDetail(response, fallback) {
+                    try {
+                        const data = await response.json();
+                        if (typeof data?.detail === 'string' && data.detail) return data.detail;
+                        if (typeof data?.message === 'string' && data.message) return data.message;
+                    } catch (e) {}
+                    return response.status ? `HTTP ${response.status}` : fallback;
+                },
+
+                focusableDialogElements(dialog) {
+                    if (!dialog) return [];
+                    return [...dialog.querySelectorAll(
+                        'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+                    )].filter(element => element.getClientRects().length > 0);
+                },
+
+                openDialog(type, opener) {
+                    this.showModal = type === 'patch';
+                    this.showUploadModal = type === 'upload';
+                    this.dialogOpener = opener;
+                    this.$nextTick(() => {
+                        const ref = type === 'patch' ? 'patchDialog' : 'uploadDialog';
+                        this.$refs[ref]?.focus();
                     });
                 },
 
-                async openAddModal(app) {
-                    this.isEditing = false;
-                    this.selectedPkg = app.pkg;
-                    this.selectedAppName = app.name + 'Patched';
-                    this.showModal = true;
-                    this.loadingPatches = true;
-                    this.availablePatches = [];
-                    
-                    try {
-                        const response = await fetch(`/api/ui/patches/${app.pkg}`);
-                        if (!response.ok) {
-                            const error = await response.json().catch(() => ({}));
-                            this.showModal = false;
-                            alert(error.detail || 'Failed to load the patches.');
-                            return;
-                        }
-                        const data = await response.json();
-                        
-                        // Initialize tabs first to know what we have
-                        this.patchTabs = [...new Set(data.map(p => p.source))].sort();
-                        const baseSources = new Set(data.filter(p => p.is_base).map(p => p.source));
-                        const thirdPartySources = this.patchTabs.filter(s => !baseSources.has(s));
-                        const leadSource = thirdPartySources.length > 0 ? thirdPartySources[0] : null;
+                openUploadDialog(packageId, opener) {
+                    this.selectedPkg = packageId;
+                    this.uploadVersion = '';
+                    this.uploadError = null;
+                    this.openDialog('upload', opener);
+                },
 
-                        this.availablePatches = data.map(p => {
-                            let selected = p.enabled_by_default;
-                            // POLICY: On first load, only allow defaults from Morphe AND the first third-party source
-                            if (selected && !p.is_base && p.source !== leadSource) {
-                                selected = false;
-                            }
-                            return {...p, selected: selected};
-                        });
-                        
-                        if (this.patchTabs.length > 0) this.activePatchTab = this.patchTabs[0];
-                    } catch (e) {
-                        console.error('Failed to fetch patches', e);
-                    } finally {
+                closeDialog(type) {
+                    if (type === 'patch') {
+                        this.patchCatalogRequestId += 1;
                         this.loadingPatches = false;
+                        this.showModal = false;
+                    }
+                    else this.showUploadModal = false;
+                    const opener = this.dialogOpener;
+                    this.dialogOpener = null;
+                    this.$nextTick(() => {
+                        if (opener?.isConnected) opener.focus();
+                    });
+                },
+
+                closeActiveDialog() {
+                    if (this.showUploadModal) this.closeDialog('upload');
+                    else if (this.showModal) this.closeDialog('patch');
+                },
+
+                trapDialogFocus(event) {
+                    const dialog = this.showUploadModal
+                        ? this.$refs.uploadDialog
+                        : this.showModal ? this.$refs.patchDialog : null;
+                    if (!dialog) return;
+                    const focusable = this.focusableDialogElements(dialog);
+                    if (focusable.length === 0) {
+                        event.preventDefault();
+                        dialog.focus();
+                        return;
+                    }
+                    const first = focusable[0];
+                    const last = focusable[focusable.length - 1];
+                    const active = document.activeElement;
+                    if (active === dialog) {
+                        event.preventDefault();
+                        (event.shiftKey ? last : first).focus();
+                    } else if (event.shiftKey && (active === first || !dialog.contains(active))) {
+                        event.preventDefault();
+                        last.focus();
+                    } else if (!event.shiftKey && (active === last || !dialog.contains(active))) {
+                        event.preventDefault();
+                        first.focus();
                     }
                 },
 
-                async openEditModal(app) {
-                    if (!app) return;
-                    this.isEditing = true;
-                    this.selectedPkg = app.id;
-                    this.selectedAppName = app.name;
-                    this.showModal = true;
+                ownsPatchCatalogRequest(requestId, packageId) {
+                    return this.patchCatalogRequestId === requestId
+                        && this.showModal
+                        && this.selectedPkg === packageId;
+                },
+
+                async openAddModal(app, opener) {
+                    const requestId = ++this.patchCatalogRequestId;
+                    this.isEditing = false;
+                    this.selectedPkg = app.pkg;
+                    this.selectedAppName = app.name + 'Patched';
+                    this.openDialog('patch', opener);
+                    this.patchError = null;
                     this.loadingPatches = true;
                     this.availablePatches = [];
-
+                    this.patchSources = [];
+                    this.patchTabs = [];
+                    this.patchSelection = {stored: [], resolved: {}, status: 'empty', unresolved: [], error: null};
+                    this.unresolvedLegacyPatches = [];
+                    
                     try {
-                        const response = await fetch(`/api/ui/patches/${app.id}`);
+                        const response = await fetch(`/api/ui/patches/${app.pkg}?format=grouped`);
+                        if (!this.ownsPatchCatalogRequest(requestId, app.pkg)) return;
                         if (!response.ok) {
-                            const error = await response.json().catch(() => ({}));
-                            this.showModal = false;
-                            alert(error.detail || 'Failed to load the patches.');
+                            const error = await this.responseDetail(response, 'Failed to load the patches.');
+                            if (this.ownsPatchCatalogRequest(requestId, app.pkg)) this.patchError = error;
                             return;
                         }
                         const data = await response.json();
-                        const currentPatches = app.include_patches || [];
-                        
-                        // Initialize tabs
-                        this.patchTabs = [...new Set(data.map(p => p.source))].sort();
-
-                        this.availablePatches = data.map(p => ({
-                            ...p,
-                            selected: currentPatches.includes(p.name)
-                        }));
-
-                        if (this.patchTabs.length > 0) this.activePatchTab = this.patchTabs[0];
+                        if (!this.ownsPatchCatalogRequest(requestId, app.pkg)) return;
+                        this.initializePatchCatalog(data, true);
                     } catch (e) {
-
+                        if (!this.ownsPatchCatalogRequest(requestId, app.pkg)) return;
                         console.error('Failed to fetch patches', e);
+                        this.patchError = typeof e?.message === 'string' && e.message.startsWith('The server returned')
+                            ? e.message
+                            : 'Could not reach the server.';
                     } finally {
-                        this.loadingPatches = false;
+                        if (this.ownsPatchCatalogRequest(requestId, app.pkg)) this.loadingPatches = false;
+                    }
+                },
+
+                async openEditModal(app, opener) {
+                    if (!app) return;
+                    const requestId = ++this.patchCatalogRequestId;
+                    this.isEditing = true;
+                    this.selectedPkg = app.id;
+                    this.selectedAppName = app.name;
+                    this.openDialog('patch', opener);
+                    this.patchError = null;
+                    this.loadingPatches = true;
+                    this.availablePatches = [];
+                    this.patchSources = [];
+                    this.patchTabs = [];
+                    this.patchSelection = {stored: [], resolved: {}, status: 'empty', unresolved: [], error: null};
+                    this.unresolvedLegacyPatches = [];
+
+                    try {
+                        const response = await fetch(`/api/ui/patches/${app.id}?format=grouped`);
+                        if (!this.ownsPatchCatalogRequest(requestId, app.id)) return;
+                        if (!response.ok) {
+                            const error = await this.responseDetail(response, 'Failed to load the patches.');
+                            if (this.ownsPatchCatalogRequest(requestId, app.id)) this.patchError = error;
+                            return;
+                        }
+                        const data = await response.json();
+                        if (!this.ownsPatchCatalogRequest(requestId, app.id)) return;
+                        this.initializePatchCatalog(data, false);
+                    } catch (e) {
+                        if (!this.ownsPatchCatalogRequest(requestId, app.id)) return;
+                        console.error('Failed to fetch patches', e);
+                        this.patchError = typeof e?.message === 'string' && e.message.startsWith('The server returned')
+                            ? e.message
+                            : 'Could not reach the server.';
+                    } finally {
+                        if (this.ownsPatchCatalogRequest(requestId, app.id)) this.loadingPatches = false;
                     }
                 },
 
                 async saveApp() {
-                    const include_patches = this.availablePatches.filter(p => p.selected).map(p => p.name);
+                    if (this.loadingPatches || this.patchSaving || this.unresolvedLegacyPatches.length) return;
+                    const include_patches = {};
+                    this.availablePatches.filter(p => p.selected).forEach(patch => {
+                        if (!Array.isArray(include_patches[patch.repo])) include_patches[patch.repo] = [];
+                        if (!include_patches[patch.repo].some(name => name.toLowerCase() === patch.name.toLowerCase())) {
+                            include_patches[patch.repo].push(patch.name);
+                        }
+                    });
+                    this.patchError = null;
+                    this.patchSaving = true;
                     try {
                         const response = await fetch('/api/ui/add_app', {
                             method: 'POST',
@@ -282,13 +555,15 @@
                             })
                         });
                         if (!response.ok) {
-                            const error = await response.json().catch(() => ({}));
-                            alert(error.detail || 'Saving the app failed.');
+                            this.patchError = await this.responseDetail(response, 'Saving the app failed.');
                             return;
                         }
                     } catch (e) {
-                        alert('Saving the app failed: ' + e);
+                        console.error('Failed to save app', e);
+                        this.patchError = 'Could not reach the server.';
                         return;
+                    } finally {
+                        this.patchSaving = false;
                     }
                     location.reload();
                 },
@@ -298,7 +573,7 @@
                         alert('Please provide a version and select a file.');
                         return;
                     }
-                    
+                    this.uploadError = null;
                     const formData = new FormData();
                     formData.append('package_id', this.selectedPkg);
                     formData.append('version_str', this.uploadVersion);
@@ -309,86 +584,423 @@
                             method: 'POST',
                             body: formData
                         });
-                        const data = await response.json();
-                        alert(data.message);
-                        this.showUploadModal = false;
+                        const data = await response.json().catch(() => ({}));
+                        if (!response.ok) {
+                            this.uploadError = typeof data.detail === 'string' && data.detail
+                                ? data.detail
+                                : `Upload failed (HTTP ${response.status}).`;
+                            return;
+                        }
+                        alert(data.message || 'APK uploaded successfully.');
+                        this.closeDialog('upload');
                         this.checkUpdates();
                     } catch (e) {
                         console.error('Upload failed', e);
-                        alert('Upload failed');
+                        this.uploadError = 'The server could not be reached. Check your connection and try again.';
                     }
                 },
 
                 async addSource() {
-                    const repo = prompt('Enter GitHub repository (e.g. User/repo):');
-                    if (!repo) return;
+                    const enteredRepo = prompt(
+                        'Enter GitHub repository (e.g. User/repo):', this.newSourceRepo
+                    );
+                    if (enteredRepo === null) return;
+                    this.newSourceRepo = enteredRepo.trim();
+                    if (!this.newSourceRepo) return;
+                    this.sourceError = null;
 
                     try {
                         const res = await fetch('/api/ui/add_source', {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ repo })
+                            body: JSON.stringify({ repo: this.newSourceRepo })
                         });
                         if (!res.ok) {
-                            const data = await res.json();
-                            alert(data.detail || 'Failed to add source');
+                            this.sourceError = await this.responseDetail(res, 'Failed to add source.');
                             return;
                         }
+                        this.newSourceRepo = '';
                         try { sessionStorage.setItem('activeTab', 'discovery'); } catch (e) {}
                         location.reload();
                     } catch (e) {
                         console.error('Failed to add source', e);
-                        alert('Failed to add source');
+                        this.sourceError = 'Could not reach the server.';
                     }
                 },
 
                 async toggleSource(source) {
+                    this.sourceErrors[source.repo] = null;
                     try {
-                        await fetch('/api/ui/toggle_source', {
+                        const response = await fetch('/api/ui/toggle_source', {
                             method: 'POST',
                             headers: {'Content-Type': 'application/json'},
                             body: JSON.stringify({ repo: source.repo })
                         });
+                        if (!response.ok) {
+                            this.sourceErrors[source.repo] = await this.responseDetail(
+                                response, 'Failed to update source.'
+                            );
+                            return;
+                        }
                         source.active = !source.active;
                         this.refreshDiscovery();
                     } catch (e) {
                         console.error('Toggle failed', e);
+                        this.sourceErrors[source.repo] = 'Could not reach the server.';
                     }
                 },
 
                 async deleteSource(source) {
                     if(!confirm(`Remove source ${source.name}?`)) return;
-                    await fetch('/api/ui/delete_source', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({ repo: source.repo })
-                    });
-                    this.sources = this.sources.filter(s => s.repo !== source.repo);
-                    this.refreshDiscovery();
+                    this.sourceErrors[source.repo] = null;
+                    try {
+                        const response = await fetch('/api/ui/delete_source', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({ repo: source.repo })
+                        });
+                        if (!response.ok) {
+                            this.sourceErrors[source.repo] = await this.responseDetail(
+                                response, 'Failed to remove source.'
+                            );
+                            return;
+                        }
+                        this.sources = this.sources.filter(s => s.repo !== source.repo);
+                        this.refreshDiscovery();
+                    } catch (e) {
+                        console.error('Delete source failed', e);
+                        this.sourceErrors[source.repo] = 'Could not reach the server.';
+                    }
+                },
+
+                async deleteApp(app, packageId) {
+                    if (!confirm(`Remove ${app.name}?`)) return;
+                    this.appErrors[packageId] = null;
+                    try {
+                        const response = await fetch('/api/ui/delete_app', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({package_id: packageId})
+                        });
+                        if (!response.ok) {
+                            this.appErrors[packageId] = await this.responseDetail(
+                                response, 'Failed to remove app.'
+                            );
+                            return;
+                        }
+                        try { sessionStorage.setItem('activeTab', 'pipeline'); } catch (e) {}
+                        location.reload();
+                    } catch (e) {
+                        console.error('Delete app failed', e);
+                        this.appErrors[packageId] = 'Could not reach the server.';
+                    }
                 },
 
                 async refreshDiscovery(sync = false) {
                     this.refreshing = true;
+                    if (sync) this.syncRefused = null;
                     try {
                         const response = await (sync
                             ? fetch('/api/ui/discovery/sync', {method: 'POST'})
                             : fetch('/api/ui/discovery'));
-                        const data = await response.json();
+                        let data = null;
+                        try { data = await response.json(); } catch (e) {}
+                        if (!response.ok || !data || !Array.isArray(data.apps)) {
+                            const detail = (data && typeof data.detail === 'string' && data.detail) || 'HTTP ' + response.status;
+                            if (sync) this.syncRefused = detail;
+                            else console.error('Discovery list refused: ' + detail);
+                            return;
+                        }
+                        if (data.sync === 'already running') this.syncNotice = 'A sync is already running.';
                         this.discoveryApps = data.apps;
                         if (sync) {
                             setTimeout(() => this.refreshDiscovery(false), 3000);
                         }
                     } catch (e) {
+                        if (sync) this.syncRefused = 'Could not reach the server.';
                         console.error('Failed to refresh discovery list', e);
                     } finally {
                         this.refreshing = false;
                     }
                 },
 
+                get scraperTone() {
+                    const state = this.browser.state;
+                    if (state === 'starting' || state === 'stopping') return 'amber';
+                    if (this.browser.state === 'available' && this.diagnostics.scraper) return 'emerald';
+                    return 'red';
+                },
+
+                get scraperTextClass() {
+                    return {emerald: 'text-emerald-500', amber: 'text-amber-500', red: 'text-red-500'}[this.scraperTone];
+                },
+
+                get scraperDotClass() {
+                    return {
+                        emerald: 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.4)]',
+                        amber: 'bg-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.4)]',
+                        red: 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.4)]'
+                    }[this.scraperTone];
+                },
+
+                secretBadgeClass(slug) {
+                    return {
+                        file: 'bg-emerald-500/10 text-emerald-500 border-emerald-500/20',
+                        environment: 'bg-indigo-500/10 text-indigo-400 border-indigo-500/20',
+                        environment_invalid: 'bg-red-500/10 text-red-400 border-red-500/20'
+                    }[this.secretState(slug)] || 'bg-slate-800 text-slate-500 border-slate-700';
+                },
+
+                secretMessageClass(slug) {
+                    const kind = this.secretMessage[slug] && this.secretMessage[slug].kind;
+                    return 'px-4 py-3 border rounded-xl text-[11px] font-bold ' + (kind === 'error'
+                        ? 'bg-red-500/10 border-red-500/20 text-red-400'
+                        : 'bg-emerald-500/10 border-emerald-500/20 text-emerald-400');
+                },
+
+                get busySeconds() {
+                    const since = this.browser.busy_since;
+                    if (typeof since !== 'number') return null;
+                    return Math.max(0, Math.floor((Date.now() + this.serverClockOffset) / 1000 - since));
+                },
+
+                get busyStuck() {
+                    return this.busySeconds !== null && this.busySeconds > this.stuckAfterSeconds;
+                },
+
+                get scraperTitle() {
+                    const b = this.browser;
+                    let text = 'Browser ' + b.state;
+                    if (b.error) text += ': ' + b.error;
+                    if (typeof b.retry_in === 'number') text += '; retry in ' + Math.ceil(b.retry_in) + ' s';
+                    if (this.busySeconds !== null) text += '; task running for ' + Math.floor(this.busySeconds / 60) + ' min';
+                    return text;
+                },
+
+                async request(method, url, body) {
+                    let response;
+                    try {
+                        response = await fetch(url, {
+                            method,
+                            headers: body === undefined ? {} : {'Content-Type': 'application/json'},
+                            body: body === undefined ? undefined : JSON.stringify(body)
+                        });
+                    } catch (e) {
+                        return {ok: false, status: 0, data: null, detail: 'Could not reach the server.'};
+                    }
+                    let data = null;
+                    try { data = await response.json(); } catch (e) {}
+                    const detail = response.ok ? null : ((data && typeof data.detail === 'string' && data.detail) || 'HTTP ' + response.status);
+                    return {ok: response.ok, status: response.status, data, detail, sync: response.headers.get('X-Sync')};
+                },
+
+                secretError(detail) {
+                    if (detail === 'Invalid secret value') {
+                        return detail + '. Use 8 to 512 characters: letters, digits and . _ + / = : @ - (no spaces).';
+                    }
+                    return detail;
+                },
+
+                secretOutcome(field, action, sync) {
+                    return field[action][sync] || field[action].none;
+                },
+
+                secretState(slug) {
+                    if (!this.secretsLoaded) return 'loading';
+                    const status = this.secrets[slug] || {};
+                    if (status.source === 'environment_invalid') return 'environment_invalid';
+                    if (status.source === 'environment') return 'environment';
+                    return status.set ? 'file' : 'unset';
+                },
+
+                secretStatusValid(data) {
+                    if (!data || typeof data !== 'object' || Array.isArray(data)) return false;
+                    const secretStatusesValid = this.secretFields.every(field => {
+                        if (!Object.prototype.hasOwnProperty.call(data, field.slug)) return false;
+                        const status = data[field.slug];
+                        if (!status || typeof status !== 'object' || Array.isArray(status) || typeof status.set !== 'boolean') return false;
+                        const validSources = [null, 'file', 'environment', 'environment_invalid'];
+                        if (!validSources.includes(status.source)) return false;
+                        return status.set === (status.source === 'file' || status.source === 'environment');
+                    });
+                    return secretStatusesValid && this.appriseStatusValid(data['apprise-urls']);
+                },
+
+                appriseStatusValid(status) {
+                    if (!status || typeof status !== 'object' || Array.isArray(status)) return false;
+                    const sources = [null, 'file', 'environment', 'environment_invalid', 'file_invalid', 'legacy'];
+                    const migrationStates = ['none', 'pending', 'conflict', 'retry'];
+                    return typeof status.set === 'boolean'
+                        && Number.isSafeInteger(status.count) && status.count >= 0
+                        && sources.includes(status.source)
+                        && typeof status.legacy_available === 'boolean'
+                        && migrationStates.includes(status.migration_state)
+                        && status.set === (['file', 'environment', 'legacy'].includes(status.source) && status.count > 0);
+                },
+
+                get appriseLocked() {
+                    return !this.appriseLoaded || ['environment', 'environment_invalid'].includes(this.appriseStatus.source);
+                },
+
+                async loadSecrets() {
+                    const result = await this.request('GET', '/api/ui/secrets');
+                    if (!result.ok) {
+                        this.secretsLoadError = this.secretError(result.detail);
+                        return;
+                    }
+                    if (!this.secretStatusValid(result.data)) {
+                        this.secretsLoadError = 'The server returned an invalid secret status.';
+                        return;
+                    }
+                    this.secrets = result.data;
+                    this.appriseStatus = result.data['apprise-urls'];
+                    this.appriseLoaded = true;
+                    this.secretsLoaded = true;
+                    this.secretsLoadError = null;
+                },
+
+                addAppriseDestination() {
+                    const value = this.appriseInput;
+                    if (!value || this.appriseBusy || this.appriseLocked) return;
+                    if (this.appriseDraft.length >= 16 || new TextEncoder().encode(value).length > 2048) {
+                        this.appriseMessage = {kind: 'error', text: 'Use at most 16 destinations, each no longer than 2048 bytes.'};
+                        return;
+                    }
+                    this.appriseDraft.push(value);
+                    this.appriseInput = '';
+                    this.appriseMessage = null;
+                },
+
+                appriseError(detail) {
+                    return typeof detail === 'string' && detail ? detail : 'Could not update notification destinations.';
+                },
+
+                feedbackClass(message) {
+                    return message && message.kind === 'error' ? 'text-red-400' : 'text-emerald-400';
+                },
+
+                async finishAppriseFailure(result) {
+                    if (result.status === 409) {
+                        this.appriseInput = '';
+                        this.appriseDraft = [];
+                        await this.loadSecrets();
+                    }
+                    this.appriseMessage = {kind: 'error', text: this.appriseError(result.detail)};
+                },
+
+                async saveAppriseUrls() {
+                    if (!this.appriseDraft.length || this.appriseBusy || this.appriseLocked) return;
+                    this.appriseBusy = true;
+                    this.appriseMessage = null;
+                    const result = await this.request('PUT', '/api/ui/secrets/apprise-urls', {value: this.appriseDraft});
+                    this.appriseBusy = false;
+                    if (!result.ok) {
+                        await this.finishAppriseFailure(result);
+                        return;
+                    }
+                    if (!this.secretStatusValid(result.data)) {
+                        this.appriseMessage = {kind: 'error', text: 'The server returned an invalid secret status.'};
+                        return;
+                    }
+                    this.secrets = result.data;
+                    this.appriseStatus = result.data['apprise-urls'];
+                    this.appriseInput = '';
+                    this.appriseDraft = [];
+                    this.appriseMessage = {kind: 'ok', text: `Saved ${this.appriseStatus.count} notification destinations. The previous list was replaced.`};
+                },
+
+                async clearAppriseUrls() {
+                    if (this.appriseBusy || this.appriseLocked || !confirm('Remove all saved and legacy notification destinations? This cannot be undone.')) return;
+                    this.appriseBusy = true;
+                    this.appriseMessage = null;
+                    const result = await this.request('DELETE', '/api/ui/secrets/apprise-urls');
+                    this.appriseBusy = false;
+                    if (!result.ok) {
+                        await this.finishAppriseFailure(result);
+                        return;
+                    }
+                    if (!this.secretStatusValid(result.data)) {
+                        this.appriseMessage = {kind: 'error', text: 'The server returned an invalid secret status.'};
+                        return;
+                    }
+                    this.secrets = result.data;
+                    this.appriseStatus = result.data['apprise-urls'];
+                    this.appriseInput = '';
+                    this.appriseDraft = [];
+                    this.appriseMessage = {kind: 'ok', text: 'Removed all notification destinations.'};
+                },
+
+                async migrateAppriseUrls() {
+                    if (this.appriseBusy || this.appriseLocked || !['pending', 'retry'].includes(this.appriseStatus.migration_state)) return;
+                    const action = this.appriseStatus.migration_state === 'retry' ? 'Retry cleanup of' : 'Import';
+                    if (!confirm(`${action} ${this.appriseStatus.count} legacy notification destinations? Their values will not be shown.`)) return;
+                    this.appriseBusy = true;
+                    this.appriseMessage = null;
+                    const result = await this.request('POST', '/api/ui/secrets/apprise-urls/migration');
+                    this.appriseBusy = false;
+                    if (!result.ok) {
+                        await this.finishAppriseFailure(result);
+                        return;
+                    }
+                    if (!this.secretStatusValid(result.data)) {
+                        this.appriseMessage = {kind: 'error', text: 'The server returned an invalid secret status.'};
+                        return;
+                    }
+                    this.secrets = result.data;
+                    this.appriseStatus = result.data['apprise-urls'];
+                    this.appriseMessage = {kind: 'ok', text: 'Legacy notification destinations imported.'};
+                },
+
+                async saveSecret(slug) {
+                    const value = this.secretInput[slug];
+                    if (!value || this.secretBusy[slug]) return;
+                    this.secretBusy[slug] = true;
+                    this.secretMessage[slug] = null;
+                    const result = await this.request('PUT', `/api/ui/secrets/${slug}`, {value});
+                    this.secretBusy[slug] = false;
+                    if (result.ok) {
+                        if (!this.secretStatusValid(result.data)) {
+                            this.secretMessage[slug] = {kind: 'error', text: 'The server returned an invalid secret status.'};
+                            return;
+                        }
+                        this.secrets = result.data;
+                        this.secretInput[slug] = '';
+                        this.secretMessage[slug] = {kind: 'ok', text: this.secretOutcome(this.secretFields.find(f => f.slug === slug), 'saved', result.sync)};
+                        this.checkToolsStatus();
+                        return;
+                    }
+                    if (result.status === 409) {
+                        this.secretInput[slug] = '';
+                        await this.loadSecrets();
+                    }
+                    this.secretMessage[slug] = {kind: 'error', text: this.secretError(result.detail)};
+                },
+
+                async clearSecret(slug) {
+                    const field = this.secretFields.find(f => f.slug === slug);
+                    if (this.secretBusy[slug] || !confirm(`Remove the stored ${field.label}?`)) return;
+                    this.secretBusy[slug] = true;
+                    this.secretMessage[slug] = null;
+                    const result = await this.request('DELETE', `/api/ui/secrets/${slug}`);
+                    this.secretBusy[slug] = false;
+                    if (result.ok) {
+                        if (!this.secretStatusValid(result.data)) {
+                            this.secretMessage[slug] = {kind: 'error', text: 'The server returned an invalid secret status.'};
+                            return;
+                        }
+                        this.secrets = result.data;
+                        this.secretMessage[slug] = {kind: 'ok', text: this.secretOutcome(field, 'removed', result.sync)};
+                        this.checkToolsStatus();
+                        return;
+                    }
+                    if (result.status === 409) {
+                        this.secretInput[slug] = '';
+                        await this.loadSecrets();
+                    }
+                    this.secretMessage[slug] = {kind: 'error', text: this.secretError(result.detail)};
+                },
+
                 async saveSettings() {
-                    // Ensure notification_urls exists
-                    if (!this.settings.notification_urls) this.settings.notification_urls = [];
-                    
                     try {
                         const response = await fetch('/api/ui/save_settings', {
                             method: 'POST',
@@ -408,28 +1020,14 @@
                 },
 
                 async testNotifications() {
-                    if (this.settings.notification_urls.length === 0) {
-                        alert('Add at least one URL first.');
-                        return;
-                    }
+                    if (!this.appriseStatus.set || this.testingNotifications) return;
                     this.testingNotifications = true;
-                    try {
-                        const response = await fetch('/api/ui/test_notification', {
-                            method: 'POST',
-                            headers: {'Content-Type': 'application/json'},
-                            body: JSON.stringify(this.settings)
-                        });
-                        const data = await response.json();
-                        if (data.status === 'success') {
-                            alert('Test notification sent!');
-                        } else {
-                            alert('Failed to send test notification.');
-                        }
-                    } catch (e) {
-                        console.error('Test failed', e);
-                    } finally {
-                        this.testingNotifications = false;
-                    }
+                    this.notificationMessage = null;
+                    const result = await this.request('POST', '/api/ui/test_notification');
+                    this.testingNotifications = false;
+                    this.notificationMessage = result.ok && result.data?.status === 'success'
+                        ? {kind: 'ok', text: 'Test notification sent.'}
+                        : {kind: 'error', text: result.ok ? 'Failed to send test notification.' : this.appriseError(result.detail)};
                 },
 
                 addToObtainium(id) {
@@ -445,19 +1043,22 @@
 
 
     <!-- Upload Modal -->
-    <div x-cloak x-show="showUploadModal" class="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm">
-        <div @click.away="showUploadModal = false" class="bg-slate-900 border border-slate-800 w-full max-w-lg rounded-3xl shadow-2xl overflow-hidden flex flex-col">
+    <div x-cloak x-show="showUploadModal" class="fixed inset-0 z-[110] flex w-screen min-h-screen items-center justify-center p-4 bg-slate-950/80">
+        <div @click.away="closeDialog('upload')" x-ref="uploadDialog" role="dialog" aria-modal="true" aria-labelledby="upload-dialog-title" tabindex="-1" class="glass-surface bg-slate-900 border border-slate-800 w-full max-w-lg rounded-lg shadow-2xl overflow-hidden flex flex-col">
             <div class="p-8 border-b border-slate-800 flex justify-between items-center">
                 <div>
-                    <h2 class="text-2xl font-bold text-white">Upload Manual APK</h2>
+                    <h2 id="upload-dialog-title" class="text-2xl font-bold text-white">Upload Manual APK</h2>
                     <p class="text-slate-500 text-sm mt-1" x-text="selectedPkg"></p>
                 </div>
-                <button @click="showUploadModal = false" class="text-slate-500 hover:text-white transition-colors">
+                <button @click="closeDialog('upload')" class="text-slate-500 hover:text-white transition-colors" aria-label="Close upload dialog">
                     <svg xmlns="http://www.w3.org/2000/svg" class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" /></svg>
                 </button>
             </div>
 
             <div class="p-8 space-y-6">
+                <p x-show="uploadError" x-cloak role="alert" class="px-4 py-3 border border-red-500/20 rounded-lg bg-red-500/10 text-red-400 text-sm">
+                    <span x-text="uploadError"></span>
+                </p>
                 <div class="space-y-2">
                     <label class="text-xs font-bold text-slate-500 uppercase tracking-widest">Version Name</label>
                     <input type="text" x-model="uploadVersion" placeholder="e.g. 1.2.3" class="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-white focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500 outline-none transition-all">
@@ -471,109 +1072,117 @@
             </div>
 
             <div class="p-8 bg-slate-950/50 border-t border-slate-800 flex gap-4">
-                <button @click="showUploadModal = false" class="flex-1 px-6 py-3 rounded-xl font-bold text-slate-400 hover:bg-slate-800 transition-all">Cancel</button>
+                <button @click="closeDialog('upload')" class="flex-1 px-6 py-3 rounded-xl font-bold text-slate-400 hover:bg-slate-800 transition-all">Cancel</button>
                 <button @click="uploadApk" class="flex-1 px-6 py-3 rounded-xl font-bold bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg shadow-emerald-600/20 transition-all">Upload APK</button>
             </div>
         </div>
     </div>
 
     <!-- Modal Overlay -->
-    <div x-cloak x-show="showModal" class="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm">
-        <div @click.away="showModal = false" class="bg-slate-900 border border-slate-800 w-full max-w-2xl rounded-3xl shadow-2xl overflow-hidden flex flex-col max-h-[90vh]">
+    <div x-cloak x-show="showModal" class="fixed inset-0 z-[100] flex w-screen min-h-screen items-center justify-center p-4 bg-slate-950/80">
+        <div @click.away="closeDialog('patch')" x-ref="patchDialog" role="dialog" aria-modal="true" aria-labelledby="patch-dialog-title" tabindex="-1" class="glass-surface bg-slate-900 border border-slate-800 w-full max-w-2xl rounded-lg shadow-2xl overflow-hidden flex flex-col max-h-[90vh]">
             <div class="p-8 border-b border-slate-800 flex justify-between items-center">
                 <div>
-                    <h2 class="text-2xl font-bold text-white" x-text="isEditing ? 'Edit Configuration' : 'Configure Patch'"></h2>
+                    <h2 id="patch-dialog-title" class="text-2xl font-bold text-white" x-text="isEditing ? 'Edit Configuration' : 'Configure Patch'"></h2>
                     <p class="text-slate-500 text-sm mt-1" x-text="selectedPkg"></p>
                 </div>
-                <button @click="showModal = false" class="text-slate-500 hover:text-white transition-colors">
+                <button @click="closeDialog('patch')" class="text-slate-500 hover:text-white transition-colors" aria-label="Close patch dialog">
                     <svg xmlns="http://www.w3.org/2000/svg" class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" /></svg>
                 </button>
             </div>
 
-            <div class="p-8 overflow-y-auto space-y-6">
+            <div class="p-5 sm:p-8 overflow-y-auto space-y-6">
                 <div class="space-y-2">
-                    <label class="text-xs font-bold text-slate-500 uppercase tracking-widest">App Name</label>
-                    <input type="text" x-model="selectedAppName" class="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-white focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500 outline-none transition-all">
+                    <label for="patch-app-name" class="text-xs font-bold text-slate-500 uppercase tracking-widest">App Name</label>
+                    <input id="patch-app-name" type="text" x-model="selectedAppName" class="w-full min-h-11 bg-slate-950 border border-slate-800 rounded-lg px-4 py-3 text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400 transition-all">
                 </div>
 
                 <div class="space-y-4">
-                    <div class="flex items-center justify-between">
-                        <label class="text-xs font-bold text-slate-500 uppercase tracking-widest">Available Patches</label>
-                        <div class="flex items-center gap-3">
-                            <button 
-                                @click="availablePatches.filter(p => p.source === activePatchTab).forEach(p => { p.selected = p.enabled_by_default; if(p.selected) togglePatch(p); })"
-                                class="text-[10px] font-bold text-emerald-400 hover:text-emerald-300 transition-colors uppercase tracking-tight">
-                                Recommended
-                            </button>
-                            <span class="w-px h-2 bg-slate-800"></span>
-                            <button 
-                                @click="availablePatches.filter(p => p.source === activePatchTab).forEach(p => { p.selected = true; togglePatch(p); })"
-                                class="text-[10px] font-bold text-indigo-400 hover:text-indigo-300 transition-colors uppercase tracking-tight">
-                                Select Tab
-                            </button>
-                            <span class="w-px h-2 bg-slate-800"></span>
-                            <button 
-                                @click="availablePatches.filter(p => p.source === activePatchTab).forEach(p => p.selected = false)"
-                                class="text-[10px] font-bold text-slate-500 hover:text-slate-400 transition-colors uppercase tracking-tight">
-                                Clear Tab
-                            </button>
-                            <span class="w-px h-2 bg-slate-800"></span>
-                            <span class="text-[10px] text-slate-600 font-medium" x-text="`${availablePatches.filter(p => p.selected).length} Selected`"></span>
-                        </div>
-                        </div>
+                    <div class="flex items-center justify-between gap-3">
+                        <h3 class="text-xs font-bold text-slate-300 uppercase tracking-widest">Patch sources</h3>
+                        <span class="text-xs text-slate-400" x-text="`${availablePatches.filter(p => p.selected).length} selected`"></span>
+                    </div>
 
                         <!-- Patch Source Tabs -->
-                        <div x-show="!loadingPatches && patchTabs.length > 1" class="flex flex-wrap gap-2 mb-4">
-                        <template x-for="tab in patchTabs" :key="tab">
-                            <button 
-                                @click="activePatchTab = tab"
-                                :class="activePatchTab === tab ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/20' : 'bg-slate-950 text-slate-400 hover:text-slate-200 border border-slate-800'"
-                                class="px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-wider transition-all"
-                                x-text="tab">
+                    <div x-show="!loadingPatches && patchTabs.length" role="tablist" aria-label="Patch sources" class="flex flex-wrap gap-2">
+                        <template x-for="tab in patchTabs" :key="tab.key">
+                            <button type="button" role="tab" :id="patchTabId(tab.repo)" :data-repo="tab.repo" :aria-controls="patchPanelId(tab.repo)" :aria-selected="activePatchTab === tab.key" :tabindex="activePatchTab === tab.key ? 0 : -1" @click="activePatchTab = tab.key" @keydown="handlePatchTabKey($event, tab.repo)" :class="activePatchTab === tab.key ? 'bg-blue-700 text-white border-blue-500' : 'bg-slate-950 text-slate-300 hover:text-white border-slate-700'" class="min-h-11 max-w-full px-3 py-2 border rounded-lg text-left text-xs font-semibold focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400">
+                                <span class="block" x-text="tab.source"></span>
+                                <span class="block break-all font-normal text-[10px] opacity-80" x-text="`${tab.repo} · ${selectedPatchCount(tab.repo)} selected`"></span>
                             </button>
                         </template>
-                        </div>
+                    </div>
 
-                        <div x-show="loadingPatches" class="py-12 flex flex-col items-center justify-center gap-4 text-slate-500">
-                        <svg class="animate-spin h-8 w-8 text-indigo-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
-                        <p class="text-sm font-medium animate-pulse">Analyzing package compatibility...</p>
-                        </div>
+                        <p x-show="loadingPatches" role="status" class="py-8 text-center text-sm text-slate-300">Loading patch sources and saved selections...</p>
+                        <p x-show="!loadingPatches && !patchTabs.length" role="status" class="py-8 text-center text-sm text-slate-400">No patch sources are configured for this app.</p>
 
-                        <div x-show="!loadingPatches" class="space-y-2">
-                        <template x-for="patch in availablePatches" :key="patch.name">
-                            <label x-show="patch.source === activePatchTab" class="flex items-start gap-4 p-4 bg-slate-950 border border-slate-800 rounded-2xl cursor-pointer hover:border-indigo-500/50 transition-all group">
-                                <input type="checkbox" x-model="patch.selected" @change="togglePatch(patch)" class="mt-1 w-5 h-5 rounded border-slate-700 bg-slate-800 text-indigo-600 focus:ring-indigo-500/50">
-                                <div class="flex-1">
-                                    <div class="flex items-center gap-2">
-                                        <span class="font-bold text-slate-200 group-hover:text-indigo-400 transition-colors" x-text="patch.name"></span>
-                                        <template x-if="patch.enabled_by_default">
-                                            <span class="text-[8px] bg-indigo-500/10 text-indigo-400 px-1.5 py-0.5 rounded border border-indigo-500/20 uppercase font-black">Default</span>
-                                        </template>
-                                    </div>
-                                    <p class="text-xs text-slate-500 mt-1" x-text="patch.description"></p>
+
+                    <template x-if="Array.isArray(patchSelection.stored) && isEditing && unresolvedLegacyPatches.length === 0">
+                        <p class="text-xs text-slate-400" role="status">This app uses a legacy patch list. Provider choices below come from the backend resolver. Saving explicitly converts this selection to source-keyed format.</p>
+                    </template>
+                    <template x-if="patchSelection.error">
+                        <p class="px-3 py-2 border border-amber-700/60 rounded-lg bg-amber-950/40 text-amber-200 text-sm" role="status" x-text="patchSelection.error.message || 'Some saved selections need review.'"></p>
+                    </template>
+                    <template x-if="unresolvedLegacyPatches.length">
+                        <div class="space-y-2 border border-amber-700/60 rounded-lg bg-amber-950/30 p-3" aria-label="Unresolved legacy selections">
+                            <p class="text-sm text-amber-200">These legacy names have no resolved provider. Choose a replacement above, then explicitly remove each unresolved entry before saving.</p>
+                            <template x-for="item in unresolvedLegacyPatches" :key="item.draftId">
+                                <div class="flex flex-wrap items-center justify-between gap-2 text-sm text-slate-200">
+                                    <span x-text="item.name"></span>
+                                    <button type="button" @click="unresolvedLegacyPatches = unresolvedLegacyPatches.filter(entry => entry.draftId !== item.draftId)" class="min-h-11 px-3 text-amber-200 underline decoration-amber-700 underline-offset-4 rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400">Remove unresolved selection</button>
                                 </div>
-                            </label>
-                        </template>
+                            </template>
+                        </div>
+                    </template>
 
-                        <template x-if="!loadingPatches && availablePatches.length === 0">
-                            <p class="text-center py-8 text-slate-600 italic text-sm">No patches found for this package.</p>
-                        </template>
+                    <template x-for="tab in patchTabs" :key="'panel-' + tab.key">
+                        <section x-show="activePatchTab === tab.key" role="tabpanel" tabindex="0" :id="patchPanelId(tab.repo)" :aria-labelledby="patchTabId(tab.repo)" class="space-y-3 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400">
+                            <div x-show="tab.status !== 'available'" class="p-3 border border-amber-700/60 rounded-lg bg-amber-950/30 text-sm text-amber-200" role="status">
+                                <span class="font-semibold" x-text="tab.status"></span>
+                                <span x-text="tab.status === 'inactive' ? ': saved selections are retained but this source is disabled.' : tab.status === 'deleted' ? ': saved selections are retained until you remove them.' : tab.status === 'unreadable' ? ': this source list could not be read; other sources remain selectable.' : tab.status === 'missing' ? ': source files are missing; saved selections are retained.' : tab.status === 'ambiguous' ? ': some patch names are ambiguous within this source.' : tab.status === 'conflict' ? ': this source conflicts with another configured source.' : ': this source is not currently available.'"></span>
+                            </div>
+                            <div class="flex flex-wrap gap-2">
+                                <button type="button" @click="patchesForRepo(tab.repo).filter(p => p.source_status === 'available' && p.status !== 'patch_unavailable').forEach(p => p.selected = p.enabled_by_default === true)" :disabled="tab.status !== 'available'" class="min-h-11 px-3 text-xs font-semibold text-blue-300 hover:text-blue-200 disabled:opacity-50 rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400">Recommended</button>
+                                <button type="button" @click="patchesForRepo(tab.repo).filter(p => p.source_status === 'available' && p.status !== 'patch_unavailable').forEach(p => p.selected = true)" :disabled="tab.status !== 'available'" class="min-h-11 px-3 text-xs font-semibold text-blue-300 hover:text-blue-200 disabled:opacity-50 rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400">Select source</button>
+                                <button type="button" @click="patchesForRepo(tab.repo).forEach(p => p.selected = false)" class="min-h-11 px-3 text-xs font-semibold text-slate-300 hover:text-white rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400">Clear source</button>
+                            </div>
+                            <template x-for="patch in patchesForRepo(tab.repo)" :key="patch.patchKey">
+                                <label class="flex items-start gap-3 p-3 bg-slate-950 border border-slate-800 rounded-lg cursor-pointer hover:border-blue-500/60 transition-colors">
+                                    <input type="checkbox" :aria-label="`Select ${patch.name} from ${patch.repo}`" x-model="patch.selected" :disabled="patch.source_status !== 'available' && !patch.selected" class="mt-1 min-w-5 min-h-5 rounded border-slate-600 bg-slate-800 text-blue-600 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400">
+                                    <span class="min-w-0 flex-1">
+                                        <span class="flex flex-wrap items-center gap-2 font-semibold text-slate-100">
+                                            <span x-text="patch.name"></span>
+                                            <span x-show="patch.enabled_by_default" class="text-[10px] text-blue-300">Recommended</span>
+                                            <span x-show="patch.selected && (patch.source_status !== 'available' || patch.status === 'patch_unavailable')" class="text-[10px] text-amber-200" x-text="patch.status === 'patch_unavailable' ? 'Unavailable upstream, retained' : `Selected, source ${patch.source_status}`"></span>
+                                        </span>
+                                        <span class="block mt-1 text-xs text-slate-400" x-text="patch.description"></span>
+                                        <span class="block break-all mt-1 text-[10px] text-slate-500" x-text="patch.repo"></span>
+                                    </span>
+                                </label>
+                            </template>
+                            <p x-show="patchesForRepo(tab.repo).length === 0" class="py-5 text-sm text-slate-400">No compatible patch entries are available from this source.</p>
+                        </section>
+                    </template>
+                    <div x-show="patchTabs.length" class="flex flex-wrap gap-2">
+                        <button type="button" @click="availablePatches.filter(p => p.source_status === 'available' && p.status !== 'patch_unavailable').forEach(p => p.selected = p.enabled_by_default === true)" class="min-h-11 px-3 text-xs font-semibold text-blue-300 hover:text-blue-200 rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400">Recommended across available sources</button>
+                        <button type="button" @click="availablePatches.filter(p => p.source_status === 'available' && p.status !== 'patch_unavailable').forEach(p => p.selected = true)" class="min-h-11 px-3 text-xs font-semibold text-blue-300 hover:text-blue-200 rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400">Select all available</button>
                     </div>
                 </div>
             </div>
 
-            <div class="p-8 bg-slate-950/50 border-t border-slate-800 flex gap-4">
-                <button @click="showModal = false" class="flex-1 px-6 py-3 rounded-xl font-bold text-slate-400 hover:bg-slate-800 transition-all">Cancel</button>
-                <button @click="saveApp" class="flex-1 px-6 py-3 rounded-xl font-bold bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg shadow-indigo-600/20 transition-all">Save Configuration</button>
+            <p x-show="patchError" x-cloak role="alert" class="mx-8 mb-4 px-4 py-3 border border-red-500/20 rounded-lg bg-red-500/10 text-red-400 text-sm" x-text="patchError"></p>
+            <div class="p-5 sm:p-8 bg-slate-950/50 border-t border-slate-800 flex flex-col-reverse sm:flex-row gap-3">
+                <button type="button" @click="closeDialog('patch')" class="min-h-11 flex-1 px-6 py-3 rounded-lg font-semibold text-slate-300 hover:bg-slate-800 transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400">Cancel</button>
+                <button type="button" @click="saveApp" :disabled="loadingPatches || patchSaving || unresolvedLegacyPatches.length > 0" class="min-h-11 flex-1 px-6 py-3 rounded-lg font-semibold bg-blue-700 hover:bg-blue-600 disabled:opacity-50 text-white transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400" x-text="patchSaving ? 'Saving...' : 'Save Configuration'"></button>
             </div>
         </div>
     </div>
 
-    <header class="sticky top-0 z-50 w-full border-b border-slate-800 bg-slate-950/80 backdrop-blur-md">
-        <div class="container mx-auto px-6 h-16 flex items-center justify-between">
-            <div class="flex items-center gap-8">
+    <header class="glass-surface sticky top-0 z-50 w-full border-b border-slate-800 bg-slate-950/80">
+        <div class="container mx-auto px-4 py-2 flex flex-col gap-2 md:h-16 md:flex-row md:items-center md:justify-between md:px-6 md:py-0">
+            <div class="flex w-full flex-wrap items-center justify-between gap-2">
                 <div class="flex items-center gap-3">
-                    <div class="w-10 h-10 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-xl flex items-center justify-center shadow-lg shadow-indigo-500/20">
+                    <div class="w-10 h-10 bg-indigo-600 rounded-lg flex items-center justify-center">
                         <svg xmlns="http://www.w3.org/2000/svg" class="w-6 h-6 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5">
                             <path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" />
                         </svg>
@@ -605,22 +1214,17 @@
                     <button 
                         @click="activeTab = 'settings'"
                         :class="activeTab === 'settings' ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/20' : 'text-slate-400 hover:text-slate-200'"
-                        class="px-4 py-1.5 rounded-lg text-xs font-bold transition-all">
+                        class="px-4 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-2">
                         Settings
+                        <template x-if="githubTokenRejected || githubTokenWarning">
+                            <span class="inline-flex rounded-full h-2 w-2" :class="githubTokenRejected ? 'bg-red-500' : 'bg-amber-500'">
+                                <span class="sr-only">GitHub token needs attention</span>
+                            </span>
+                        </template>
                     </button>
                 </nav>
             </div>
             
-            <div class="flex items-center gap-4">
-                <div class="flex items-center gap-2 px-3 py-1 bg-slate-900 rounded-full border border-slate-800">
-                    <span class="text-[9px] font-black uppercase tracking-widest" :class="diagnostics.java ? 'text-emerald-500' : 'text-red-500'">Java</span>
-                    <div class="w-1.5 h-1.5 rounded-full" :class="diagnostics.java ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.4)]' : 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.4)]'"></div>
-                </div>
-                <div :title="browser.error ? `Browser ${browser.state}: ${browser.error}` : `Browser ${browser.state}`" class="flex items-center gap-2 px-3 py-1 bg-slate-900 rounded-full border border-slate-800">
-                    <span class="text-[9px] font-black uppercase tracking-widest" :class="(diagnostics.scraper && browser.state === 'available') ? 'text-emerald-500' : 'text-red-500'">Scraper</span>
-                    <div class="w-1.5 h-1.5 rounded-full" :class="(diagnostics.scraper && browser.state === 'available') ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.4)]' : 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.4)]'"></div>
-                </div>
-            </div>
         </div>
     </header>
 
@@ -639,14 +1243,22 @@
                             </div>
                         </template>
                     </div>
-                    <template x-if="syncError">
+                    <template x-if="syncError && syncError !== githubTokenRejected">
                         <div class="px-4 py-3 bg-red-500/10 border border-red-500/20 rounded-xl text-[11px] font-bold text-red-400">
                             Sync failed: <span x-text="syncError"></span>
                         </div>
                     </template>
+                    <template x-if="syncRefused">
+                        <div class="px-4 py-3 bg-red-500/10 border border-red-500/20 rounded-xl text-[11px] font-bold text-red-400">
+                            Sync not started: <span x-text="syncRefused"></span>
+                        </div>
+                    </template>
+                    <template x-if="syncNotice">
+                        <div class="px-4 py-3 bg-slate-800 border border-slate-700 rounded-xl text-[11px] font-bold text-slate-300" x-text="syncNotice"></div>
+                    </template>
                     <div class="p-6 bg-slate-900 border border-slate-800 rounded-2xl space-y-4">
                         <template x-for="source in sources" :key="source.repo">
-                            <div class="flex items-center justify-between p-3 bg-slate-950 rounded-xl border border-slate-800 group relative overflow-hidden">
+                            <div class="flex flex-wrap items-center justify-between p-3 bg-slate-950 rounded-xl border border-slate-800 group relative overflow-hidden">
                                 <div class="flex flex-col">
                                     <div class="flex items-center gap-2">
                                         <span class="text-xs font-bold text-white" x-text="source.name"></span>
@@ -670,8 +1282,10 @@
                                         <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
                                     </button>
                                 </div>
+                                <p x-show="sourceErrors[source.repo]" x-cloak role="alert" class="basis-full px-3 py-2 text-sm text-red-400" x-text="sourceErrors[source.repo]"></p>
                             </div>
                         </template>
+                        <p x-show="sourceError" x-cloak role="alert" class="px-3 py-2 text-sm text-red-400" x-text="sourceError"></p>
                         <button @click="addSource()" class="w-full py-3 border-2 border-dashed border-slate-800 rounded-xl text-slate-600 hover:text-slate-400 hover:border-slate-700 text-xs font-bold transition-all">+ Add Custom Source</button>
                     </div>
                 </div>
@@ -721,7 +1335,7 @@
                                     </div>
                                     
                                     <button 
-                                        @click="openAddModal(app)"
+                            @click="openAddModal(app, $event.currentTarget)"
                                         class="px-5 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest bg-slate-800 hover:bg-white text-slate-400 hover:text-slate-950 transition-all border border-slate-700 hover:border-white shadow-sm">
                                         Configure
                                     </button>
@@ -767,6 +1381,7 @@
                     <div x-show="lastRun !== 'Never'" class="text-[10px] text-slate-500 font-bold uppercase tracking-widest px-2">
                         Last Run: <span class="text-slate-400" x-text="lastRun"></span>
                     </div>
+                    <p x-show="buildError" x-cloak role="alert" class="max-w-sm text-right text-sm text-red-400" x-text="buildError"></p>
                 </div>
             </div>
 
@@ -774,13 +1389,15 @@
                 {% for app in config.apps %}
                 <div 
                     :class="selectedApps.includes('{{ app.id }}') ? 'border-indigo-500 bg-indigo-500/5 ring-1 ring-indigo-500/20' : 'border-slate-800 bg-slate-900'"
-                    class="p-6 border rounded-3xl hover:border-slate-700 transition-all group shadow-sm relative overflow-hidden">
-                    <div class="absolute top-0 right-0 p-4 flex gap-1 transition-opacity">
+                    class="p-4 sm:p-6 border rounded-lg hover:border-slate-700 transition-colors group shadow-sm">
+                    <div class="flex flex-col gap-4">
+                    <div role="group" aria-label="App actions" class="order-2 flex flex-wrap items-center justify-center gap-2">
                         <button 
                             @click="addToObtainium('{{ app.id }}')"
                             :disabled="updates['{{ app.id }}'] && !updates['{{ app.id }}'].file_exists"
                             :class="updates['{{ app.id }}'] && !updates['{{ app.id }}'].file_exists ? 'bg-slate-800 text-slate-700 cursor-not-allowed' : 'bg-slate-800 hover:bg-emerald-600 text-slate-400 hover:text-white'"
-                            class="p-2 rounded-lg transition-all"
+                            class="inline-flex min-w-11 min-h-11 items-center justify-center p-2 rounded-lg transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400"
+                            aria-label="Add to Obtainium (App API)"
                             title="Add to Obtainium (App API)">
                             <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" /></svg>
                         </button>
@@ -789,41 +1406,37 @@
                             target="_blank"
                             :disabled="updates['{{ app.id }}'] && !updates['{{ app.id }}'].file_exists"
                             :class="updates['{{ app.id }}'] && !updates['{{ app.id }}'].file_exists ? 'bg-slate-800 text-slate-700 cursor-not-allowed pointer-events-none' : 'bg-slate-800 hover:bg-indigo-600 text-slate-400 hover:text-white'"
-                            class="p-2 rounded-lg transition-all"
+                            class="inline-flex min-w-11 min-h-11 items-center justify-center p-2 rounded-lg transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400"
+                            aria-label="Open Download Page"
                             title="Open Download Page">
                             <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" /></svg>
                         </a>
                         <button 
-                            @click="selectedPkg = '{{ app.id }}'; uploadVersion = ''; showUploadModal = true;"
-                            class="bg-slate-800 hover:bg-amber-600 p-2 rounded-lg text-slate-400 hover:text-white transition-all"
+                            @click="openUploadDialog('{{ app.id }}', $event.currentTarget)"
+                            class="inline-flex min-w-11 min-h-11 items-center justify-center bg-slate-800 hover:bg-amber-600 p-2 rounded-lg text-slate-400 hover:text-white transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400"
+                            aria-label="Upload Manual APK"
                             title="Upload Manual APK">
                             <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" /></svg>
                         </button>
                         <button 
-                            @click="openEditModal(pipelineApps[{{ loop.index0 }}])"
-                            class="bg-slate-800 hover:bg-indigo-600 p-2 rounded-lg text-slate-400 hover:text-white transition-all"
+                            @click="openEditModal(pipelineApps[{{ loop.index0 }}], $event.currentTarget)"
+                            class="inline-flex min-w-11 min-h-11 items-center justify-center bg-slate-800 hover:bg-indigo-600 p-2 rounded-lg text-slate-400 hover:text-white transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400"
+                            aria-label="Edit Configuration"
                             title="Edit Configuration">
                             <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" /></svg>
                         </button>
                         <button 
-                            @click="if(confirm('Remove ' + pipelineApps[{{ loop.index0 }}].name + '?')) { fetch('/api/ui/delete_app', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ package_id: '{{ app.id }}' })}).then(() => location.reload()); }"
-                            class="bg-slate-800 hover:bg-red-600 p-2 rounded-lg text-slate-400 hover:text-white transition-all"
+                            @click="deleteApp(pipelineApps[{{ loop.index0 }}], '{{ app.id }}')"
+                            class="inline-flex min-w-11 min-h-11 items-center justify-center bg-slate-800 hover:bg-red-600 p-2 rounded-lg text-slate-400 hover:text-white transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400"
+                            aria-label="Remove App"
                             title="Remove App">
                             <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
                         </button>
                     </div>
 
-                    <!-- Selection Toggle -->
-                    <div class="absolute bottom-6 right-6">
-                        <label class="relative inline-flex items-center cursor-pointer group">
-                            <input type="checkbox" value="{{ app.id }}" x-model="selectedApps" class="sr-only peer">
-                            <div class="w-9 h-5 bg-slate-800 rounded-full peer peer-checked:after:translate-x-full rtl:peer-checked:after:-translate-x-full after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-slate-500 peer-checked:after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-indigo-600 border border-slate-700 peer-checked:border-indigo-400"></div>
-                            <span class="ml-3 text-[10px] font-bold text-slate-500 uppercase tracking-tighter group-hover:text-slate-400 transition-colors" x-text="selectedApps.includes('{{ app.id }}') ? 'Selected' : 'Select'"></span>
-                        </label>
-                    </div>
-
-                    <div class="space-y-4">
-                        <div class="w-12 h-12 bg-slate-800 rounded-2xl flex items-center justify-center text-indigo-400 font-bold text-xl overflow-hidden shadow-inner border border-slate-800">
+                    <div class="contents">
+                        <div class="order-1 flex min-w-0 items-start gap-3">
+                        <div class="w-12 h-12 shrink-0 bg-slate-800 rounded-lg flex items-center justify-center text-indigo-400 font-bold text-xl overflow-hidden border border-slate-700">
                             <template x-if="updates['{{ app.id }}'] && !updates['{{ app.id }}'].icon_exists">
                                 <span x-text="(metadata['{{ app.id }}'] ? metadata['{{ app.id }}'].real_name : pipelineApps[{{ loop.index0 }}].name)[0]"></span>
                             </template>
@@ -832,15 +1445,17 @@
                                  class="w-full h-full object-cover"
                                  x-show="updates['{{ app.id }}'] && updates['{{ app.id }}'].icon_exists">
                         </div>
-                        <div class="relative">
-                            <h3 class="font-bold text-lg text-white group-hover:text-indigo-400 transition-colors" x-text="metadata['{{ app.id }}'] ? metadata['{{ app.id }}'].real_name : pipelineApps[{{ loop.index0 }}].name"></h3>
-                            <code class="text-[10px] text-slate-500 block mt-1">{{ app.id }}</code>
-                            
-                            <div class="mt-3">
+                        <div class="min-w-0 flex-1 pt-0.5">
+                            <h3 class="font-bold text-lg text-white group-hover:text-indigo-400 transition-colors break-words" x-text="metadata['{{ app.id }}'] ? metadata['{{ app.id }}'].real_name : pipelineApps[{{ loop.index0 }}].name"></h3>
+                            <code class="text-[10px] text-slate-500 block mt-1 break-all">{{ app.id }}</code>
+                        </div>
+                        </div>
+
+                        <div class="order-3 min-w-0 flex-1 space-y-2">
                                 <template x-if="updates['{{ app.id }}'] && updates['{{ app.id }}'].has_update">
                                     <div class="flex items-center gap-2">
-                                        <span class="animate-pulse flex h-2 w-2 rounded-full bg-amber-500"></span>
-                                        <span class="text-[10px] font-black text-amber-500 uppercase tracking-tighter" x-text="updates['{{ app.id }}'].current === 'None' ? 'New App: v' + updates['{{ app.id }}'].latest : 'Update Available: v' + updates['{{ app.id }}'].latest"></span>
+                                        <span class="flex h-2 w-2 shrink-0 rounded-full bg-amber-500"></span>
+                                        <span class="text-xs font-semibold text-amber-300 break-words" x-text="updates['{{ app.id }}'].current === 'None' ? 'New App: v' + updates['{{ app.id }}'].latest : 'Update Available: v' + updates['{{ app.id }}'].latest"></span>
                                     </div>
                                 </template>
                                 <template x-if="updates['{{ app.id }}'] && !updates['{{ app.id }}'].has_update">
@@ -848,19 +1463,26 @@
                                         <div class="flex h-3 w-3 items-center justify-center rounded-full bg-emerald-500/20 text-emerald-500">
                                             <svg xmlns="http://www.w3.org/2000/svg" class="h-2 w-2" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd" /></svg>
                                         </div>
-                                        <span class="text-[10px] font-bold text-emerald-500 uppercase tracking-tighter">Up to date</span>
+                                        <span class="text-xs font-medium text-slate-300">Up to date</span>
                                     </div>
                                 </template>
                                 <template x-if="updates['{{ app.id }}'] && updates['{{ app.id }}'].status === 'Error' && updates['{{ app.id }}'].error">
-                                    <p class="mt-2 text-[10px] text-red-400 break-words" x-text="updates['{{ app.id }}'].error"></p>
+                                    <p class="text-xs text-red-300 break-words" x-text="updates['{{ app.id }}'].error"></p>
                                 </template>
-                            </div>
                         </div>
-                        <div class="flex flex-wrap gap-2">
-                            <span class="text-[9px] font-bold uppercase tracking-widest bg-slate-800 text-slate-400 px-2 py-1 rounded-lg">
+
+                        <div class="order-4 flex flex-col gap-3 border-t border-slate-800 pt-3 sm:flex-row sm:items-end sm:justify-between">
+                            <span class="inline-flex text-xs font-medium text-slate-300 bg-slate-800 px-2 py-1 rounded">
                                 {{ app.include_patches | length if app.include_patches else 0 }} Patches
                             </span>
+                            <label class="min-h-11 shrink-0 inline-flex items-center gap-3 px-2 cursor-pointer rounded focus-within:outline focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-blue-400">
+                                <input type="checkbox" value="{{ app.id }}" aria-label="Select app for build" x-model="selectedApps" class="sr-only peer">
+                                <span aria-hidden="true" class="relative w-9 h-5 shrink-0 bg-slate-800 rounded-full peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-slate-500 peer-checked:after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-indigo-600 border border-slate-700 peer-checked:border-indigo-400"></span>
+                                <span class="text-xs font-semibold text-slate-300" x-text="selectedApps.includes('{{ app.id }}') ? 'Selected for build' : 'Select app for build'"></span>
+                            </label>
                         </div>
+                    </div>
+                    <p x-show="appErrors['{{ app.id }}']" x-cloak role="alert" class="mt-3 text-sm text-red-400" x-text="appErrors['{{ app.id }}']"></p>
                     </div>
                 </div>
                 {% endfor %}
@@ -888,6 +1510,97 @@
 
         <!-- Tab 3: Settings -->
         <div x-show="activeTab === 'settings'" x-cloak class="max-w-2xl mx-auto space-y-8">
+            <!-- Secrets card -->
+            <div class="bg-slate-900 border border-slate-800 rounded-3xl overflow-hidden shadow-2xl">
+                <div class="p-8 border-b border-slate-800">
+                    <h2 class="text-xl font-bold text-white">Secrets</h2>
+                    <p class="text-slate-500 text-sm mt-1">Stored on the server. A saved value is never shown again.</p>
+                </div>
+                <div class="p-8 space-y-6">
+                    <template x-if="plainHttp">
+                        <div class="px-4 py-3 bg-amber-500/10 border border-amber-500/20 rounded-xl text-[11px] font-bold text-amber-400">
+                            This page is served over plain HTTP, so a value you save crosses the network unencrypted.
+                        </div>
+                    </template>
+                    <template x-if="secretsLoadError">
+                        <div class="flex items-center justify-between gap-3 px-4 py-3 bg-red-500/10 border border-red-500/20 rounded-xl text-[11px] font-bold text-red-400" role="alert">
+                            <span x-text="'Could not load the secret status: ' + secretsLoadError"></span>
+                            <button @click="loadSecrets()" class="px-3 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg text-xs font-bold transition-all">Retry</button>
+                        </div>
+                    </template>
+                    <template x-for="field in secretFields" :key="field.slug">
+                        <div class="space-y-3">
+                            <div class="flex items-center justify-between">
+                                <h3 class="text-xs font-bold text-slate-500 uppercase tracking-widest" x-text="field.label"></h3>
+                                <span class="px-2 py-0.5 rounded text-[9px] font-bold border"
+                                    :class="secretBadgeClass(field.slug)"
+                                    x-text="secretState(field.slug) === 'file' ? 'Saved' : secretState(field.slug) === 'environment' ? 'Set by environment' : secretState(field.slug) === 'environment_invalid' ? 'Environment value invalid' : secretState(field.slug) === 'unset' ? 'Not set' : 'Loading...'"></span>
+                            </div>
+                            <template x-if="secretState(field.slug) === 'loading'">
+                                <p class="text-[10px] text-slate-600">Loading the status...</p>
+                            </template>
+                            <template x-if="secretState(field.slug) === 'environment'">
+                                <p class="text-[10px] text-slate-500">Set by the environment variable <code x-text="field.env"></code>. Change it where the app is started; it cannot be changed here.</p>
+                            </template>
+                            <template x-if="secretState(field.slug) === 'environment_invalid'">
+                                <p class="text-[10px] text-red-400">The environment variable <code x-text="field.env"></code> is set but its value is not valid, so it is ignored. Fix or remove it and restart the app.</p>
+                            </template>
+                            <div class="space-y-2" x-show="secretState(field.slug) === 'unset' || secretState(field.slug) === 'file'">
+                                    <label :for="'secret-' + field.slug" class="sr-only" x-text="(secretState(field.slug) === 'file' ? 'New value for ' : 'Value for ') + field.label"></label>
+                                    <div class="flex gap-3">
+                                        <input
+                                            type="password"
+                                            :id="'secret-' + field.slug"
+                                            x-model="secretInput[field.slug]"
+                                            :autocomplete="field.slug === 'cloakbrowser-license-key' ? 'off' : 'new-password'"
+                                            spellcheck="false"
+                                            autocapitalize="off"
+                                            autocorrect="off"
+                                            :aria-describedby="'secret-hint-' + field.slug + ' secret-msg-' + field.slug"
+                                            :placeholder="secretState(field.slug) === 'file' ? 'Enter a new value to replace the stored one' : 'Paste the value'"
+                                            @keydown.enter="saveSecret(field.slug)"
+                                            class="flex-1 min-w-0 bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-white focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500 outline-none transition-all font-mono text-sm">
+                                        <button
+                                            @click="saveSecret(field.slug)"
+                                            :disabled="secretBusy[field.slug] || !secretInput[field.slug]"
+                                            class="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold transition-all disabled:opacity-50 disabled:cursor-not-allowed focus:ring-2 focus:ring-indigo-500/50 outline-none"
+                                            x-text="secretBusy[field.slug] ? 'Saving...' : (secretState(field.slug) === 'file' ? 'Replace' : 'Save')"></button>
+                                        <button
+                                            x-show="secretState(field.slug) === 'file'"
+                                            @click="clearSecret(field.slug)"
+                                            :disabled="secretBusy[field.slug]"
+                                            class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl text-xs font-bold transition-all disabled:opacity-50 disabled:cursor-not-allowed focus:ring-2 focus:ring-indigo-500/50 outline-none">Clear</button>
+                                    </div>
+                                    <p :id="'secret-hint-' + field.slug" class="text-[10px] text-slate-600" x-text="field.hint"></p>
+                            </div>
+                            <p :id="'secret-msg-' + field.slug" role="alert"
+                                x-show="secretMessage[field.slug]"
+                                :class="secretMessageClass(field.slug)"
+                                x-text="secretMessage[field.slug] && secretMessage[field.slug].text"></p>
+                            <template x-if="field.slug === 'github-token' && (secretState(field.slug) === 'file' || secretState(field.slug) === 'environment')">
+                                <div class="space-y-2">
+                                    <p x-show="githubTokenRejected" class="px-4 py-3 bg-red-500/10 border border-red-500/20 rounded-xl text-[11px] font-bold text-red-400" x-text="githubTokenRejected"></p>
+                                    <p x-show="githubTokenWarning && !githubTokenRejected" class="px-4 py-3 bg-amber-500/10 border border-amber-500/20 rounded-xl text-[11px] font-bold text-amber-400" x-text="githubTokenWarning"></p>
+                                    <template x-if="!githubTokenRejected && githubTokenPermissions">
+                                        <p class="text-[10px] text-slate-500">
+                                            <span x-show="githubTokenPermissions === 'none'">The last check found no permissions on this token.</span>
+                                            <span x-show="githubTokenPermissions === 'present'">The last check found permissions on this token.</span>
+                                            <span x-show="githubTokenPermissions === 'unverifiable'">This kind of token does not report its permissions, so they cannot be checked here.</span>
+                                            <span x-show="githubTokenPermissions === 'unchecked'">Permissions are shown after the next sync.</span>
+                                            <span x-show="!['none', 'present', 'unverifiable', 'unchecked'].includes(githubTokenPermissions)">Permission status: <span x-text="githubTokenPermissions"></span>.</span>
+                                        </p>
+                                    </template>
+                                </div>
+                            </template>
+                            <template x-if="field.slug === 'cloakbrowser-license-key' && (secretState(field.slug) === 'file' || secretState(field.slug) === 'environment')">
+                                <p x-show="browser && browser.license_key_rejected" class="px-4 py-3 bg-red-500/10 border border-red-500/20 rounded-xl text-[11px] font-bold text-red-400" x-text="'The last browser result rejected the configured key. Later tasks use keyless mode until the configured key changes; a changed key is read before the next scraper task.'"></p>
+                            </template>
+                        </div>
+                    </template>
+                </div>
+            </div>
+
+            <!-- System settings card -->
             <div class="bg-slate-900 border border-slate-800 rounded-3xl overflow-hidden shadow-2xl">
                 <div class="p-8 border-b border-slate-800">
                     <h2 class="text-xl font-bold text-white">System Settings</h2>
@@ -916,40 +1629,61 @@
                             <label class="text-xs font-bold text-slate-500 uppercase tracking-widest">Apprise Notifications</label>
                             <a href="https://github.com/caronc/apprise/wiki" target="_blank" class="text-[10px] text-indigo-400 hover:text-indigo-300 transition-colors font-bold uppercase tracking-tight">Setup Guide</a>
                         </div>
-                        
-                        <div class="space-y-3">
-                            <template x-for="(url, index) in settings.notification_urls" :key="index">
-                                <div class="flex items-center gap-3 p-3 bg-slate-950 rounded-xl border border-slate-800">
-                                    <span class="flex-1 text-xs font-mono text-slate-400 truncate" x-text="url"></span>
-                                    <button @click="settings.notification_urls.splice(index, 1)" class="p-1 text-slate-600 hover:text-red-500 transition-colors">
-                                        <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
-                                    </button>
-                                </div>
-                            </template>
-                            
-                            <div class="flex gap-3">
-                                <input 
-                                    type="text" 
-                                    x-model="newNotificationUrl" 
-                                    placeholder="discord://webhook_id/webhook_token" 
-                                    class="flex-1 bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-white focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500 outline-none transition-all font-mono text-xs"
-                                    @keydown.enter="if(newNotificationUrl) { if(!settings.notification_urls) settings.notification_urls = []; settings.notification_urls.push(newNotificationUrl); newNotificationUrl = ''; }"
-                                >
-                                <button 
-                                    @click="if(newNotificationUrl) { if(!settings.notification_urls) settings.notification_urls = []; settings.notification_urls.push(newNotificationUrl); newNotificationUrl = ''; }"
-                                    class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl text-xs font-bold transition-all">
-                                    Add
-                                </button>
-                            </div>
+
+                        <div class="flex flex-wrap items-center gap-2 text-xs text-slate-300" role="status">
+                            <span x-show="appriseLoaded"><span x-text="appriseStatus.count"></span> destination<span x-show="appriseStatus.count !== 1">s</span></span>
+                            <span x-show="!appriseLoaded">Loading notification status...</span>
+                            <span x-show="appriseLoaded" class="text-slate-500" x-text="appriseStatus.source === 'environment' ? 'Set by environment' : appriseStatus.source === 'environment_invalid' ? 'Environment value invalid' : appriseStatus.source === 'file_invalid' ? 'Stored value invalid' : appriseStatus.source === 'legacy' ? 'Legacy settings' : appriseStatus.source === 'file' ? 'Stored on server' : 'Not set'"></span>
                         </div>
-                        <p class="text-[10px] text-slate-600">Supports Discord, Telegram, Gotify, Slack, and <a href="https://github.com/caronc/apprise/wiki" target="_blank" class="text-indigo-400 underline">many more</a>.</p>
+                        <p class="text-[10px] text-slate-500">Destination values are never shown again. Saving replaces the complete list. Add every destination you want to keep before saving.</p>
+                        <template x-if="appriseStatus.source === 'environment' || appriseStatus.source === 'environment_invalid'">
+                            <p class="text-xs text-amber-400" role="status" x-text="appriseStatus.source === 'environment_invalid' ? 'APPRISE_URLS is set but invalid. It blocks file and legacy fallback; fix it where the app is started.' : 'APPRISE_URLS is supplied by the environment and cannot be changed here.'"></p>
+                        </template>
+                        <template x-if="appriseStatus.source === 'file_invalid'">
+                            <p class="text-xs text-red-400" role="status">The stored APPRISE_URLS value is invalid. Replace or clear it to restore notification settings.</p>
+                        </template>
+                        <template x-if="appriseStatus.migration_state === 'pending'">
+                            <div class="space-y-2">
+                                <p class="text-xs text-amber-300">Legacy destinations are still in general settings. Import them to move them into write-only secret storage.</p>
+                                <button @click="migrateAppriseUrls()" :disabled="appriseBusy || appriseLocked" class="min-h-11 px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-100 rounded-lg text-xs font-bold disabled:opacity-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400">Import legacy destinations</button>
+                            </div>
+                        </template>
+                        <template x-if="appriseStatus.migration_state === 'retry'">
+                            <div class="space-y-2">
+                                <p class="text-xs text-amber-300">The destinations were stored, but removing the old settings entry did not finish.</p>
+                                <button @click="migrateAppriseUrls()" :disabled="appriseBusy || appriseLocked" class="min-h-11 px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-100 rounded-lg text-xs font-bold disabled:opacity-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400">Retry legacy cleanup</button>
+                            </div>
+                        </template>
+                        <template x-if="appriseStatus.migration_state === 'conflict'">
+                            <p class="text-xs text-red-400" role="status">Legacy destinations conflict with the stored or environment-owned list. Resolve the owner before importing; saving a replacement or clearing destinations removes the legacy entry.</p>
+                        </template>
+
+                        <div class="flex flex-col sm:flex-row gap-3">
+                            <label for="apprise-url-input" class="sr-only">Notification destination URL</label>
+                            <input id="apprise-url-input" type="password" x-model="appriseInput" autocomplete="off" spellcheck="false" autocapitalize="off" autocorrect="off" maxlength="2048" placeholder="Paste one destination URL" @keydown.enter.prevent="addAppriseDestination()" :disabled="appriseLocked || appriseBusy" class="flex-1 min-w-0 bg-slate-950 border border-slate-700 rounded-lg px-4 py-3 text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400 disabled:opacity-50 text-sm">
+                            <button @click="addAppriseDestination()" :disabled="appriseLocked || appriseBusy || !appriseInput" class="min-h-11 px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-100 rounded-lg text-xs font-bold disabled:opacity-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400">Add destination</button>
+                        </div>
+                        <ol x-show="appriseDraft.length" class="space-y-2" aria-label="Destinations staged for replacement">
+                            <template x-for="(url, index) in appriseDraft" :key="index">
+                                <li class="flex items-center justify-between gap-3 p-3 bg-slate-950 rounded-lg border border-slate-800 text-xs text-slate-300">
+                                    <span>Destination <span x-text="index + 1"></span></span>
+                                    <button @click="appriseDraft.splice(index, 1)" :aria-label="'Remove destination ' + (index + 1)" :disabled="appriseBusy" class="min-h-11 px-3 text-slate-300 hover:text-red-300 rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400 disabled:opacity-50">Remove</button>
+                                </li>
+                            </template>
+                        </ol>
+                        <p x-show="appriseMessage" role="alert" class="text-xs" :class="feedbackClass(appriseMessage)" x-text="appriseMessage && appriseMessage.text"></p>
+                        <div class="flex flex-wrap gap-3">
+                            <button @click="saveAppriseUrls()" :disabled="appriseBusy || appriseLocked || !appriseDraft.length" class="min-h-11 px-5 py-2 bg-blue-700 hover:bg-blue-600 text-white rounded-lg text-xs font-bold disabled:opacity-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400" x-text="appriseBusy ? 'Saving...' : 'Save destinations'"></button>
+                            <button x-show="appriseStatus.set || appriseStatus.legacy_available || appriseStatus.source === 'file_invalid'" @click="clearAppriseUrls()" :disabled="appriseBusy || appriseLocked" class="min-h-11 px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg text-xs font-bold disabled:opacity-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400">Clear all destinations</button>
+                        </div>
+                        <p x-show="notificationMessage" role="alert" class="text-sm" :class="feedbackClass(notificationMessage)" x-text="notificationMessage && notificationMessage.text"></p>
                     </div>
                 </div>
 
-                <div class="p-8 bg-slate-950/50 border-t border-slate-800 flex justify-between items-center">
-                    <button 
-                        @click="testNotifications()" 
-                        :disabled="testingNotifications || !settings.notification_urls || settings.notification_urls.length === 0"
+                <div class="p-8 bg-slate-950/50 border-t border-slate-800 flex flex-wrap justify-between items-center gap-4">
+                    <button
+                        @click="testNotifications()"
+                        :disabled="testingNotifications || !appriseStatus.set"
                         class="px-6 py-3 rounded-xl font-bold text-slate-400 hover:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed transition-all text-sm">
                         <span x-text="testingNotifications ? 'Sending...' : 'Test Notifications'"></span>
                     </button>

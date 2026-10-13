@@ -104,8 +104,7 @@ def test_zero_applied_fails_the_app_and_keeps_old_apk(data_dir, monkeypatch):
 
     app = get_app(data_dir)
     assert app["status"] == "Failed"
-    assert "A: no patch was applied" in app["error"]
-    assert "Applying 0 patches" in app["error"]
+    assert app["error"] == "Selected patches were not applied"
     assert old.read_text() == "old"
 
 
@@ -125,3 +124,147 @@ def test_unreadable_patch_list_shows_true_cause_and_keeps_old_apk(
     assert "own/src" in app["error"]
     assert "unreadable" in app["error"]
     assert old.read_text() == "old"
+
+
+def test_hush_build_patches_the_same_private_snapshot_it_validated(
+    data_dir, monkeypatch
+):
+    from src import config_store
+
+    patcher.DATA_DIR = data_dir
+    hush_paths = patcher.get_source_paths("SysAdminDoc/HushFacebook")
+    hush_paths[".mpp"].parent.mkdir(parents=True, exist_ok=True)
+    hush_paths[".mpp"].write_bytes(b"bundle")
+    hush_paths[".json"].write_text(
+        json.dumps(
+            {
+                "patches": [
+                    {
+                        "name": "Hide ads",
+                        "compatiblePackages": {"com.facebook.katana": []},
+                    }
+                ]
+            }
+        )
+    )
+
+    def configure_hush(config):
+        config["sources"] = [{"repo": "SysAdminDoc/HushFacebook", "active": True}]
+        config["apps"] = [
+            {
+                "id": "com.facebook.katana",
+                "name": "Facebook",
+                "include_patches": {"SysAdminDoc/HushFacebook": ["Hide ads"]},
+            }
+        ]
+
+    config_store.update_config(configure_hush)
+    raw_path = data_dir / "apks" / "raw" / "com.facebook.katana-1.0.apk"
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    raw_path.write_bytes(b"sdk30 original")
+    seen: list[tuple[bytes, Path]] = []
+
+    def inspect(_java, path):
+        artifact = Path(path)
+        contents = artifact.read_bytes()
+        if contents == b"sdk30 original":
+            raw_path.write_bytes(b"sdk28 concurrent upload")
+        return 30 if contents == b"sdk30 original" else 28
+
+    def patch(app, tools, raw, out, config):
+        seen.append((Path(raw).read_bytes(), Path(raw)))
+        Path(out).write_bytes(b"patched")
+        return True, ["SysAdminDoc/HushFacebook"]
+
+    monkeypatch.setattr(patcher, "_read_minimum_sdk", inspect)
+    monkeypatch.setattr(patcher, "patch_app", patch)
+    monkeypatch.setattr(patcher, "update_tools", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(
+        patcher,
+        "get_patch_versions",
+        lambda _config: {"SysAdminDoc/HushFacebook": "v1"},
+    )
+    monkeypatch.setattr(
+        patcher,
+        "get_supported_versions",
+        lambda *_args, **_kwargs: (["1.0"], None, None),
+    )
+
+    patcher.run_pipeline(["com.facebook.katana"], quiet=True, scraper=object())
+
+    assert len(seen) == 1
+    assert seen[0][0] == b"sdk30 original"
+    assert seen[0][1] != raw_path
+    assert not seen[0][1].exists()
+    assert raw_path.read_bytes() == b"sdk28 concurrent upload"
+
+
+def test_uninspectable_cached_hush_apk_fails_without_redownload_or_deletion(
+    data_dir, monkeypatch
+):
+    from src import config_store
+
+    hush_paths = patcher.get_source_paths("SysAdminDoc/HushFacebook")
+    hush_paths[".mpp"].parent.mkdir(parents=True, exist_ok=True)
+    hush_paths[".mpp"].write_bytes(b"bundle")
+    hush_paths[".json"].write_text(
+        json.dumps(
+            {
+                "patches": [
+                    {
+                        "name": "Hide ads",
+                        "compatiblePackages": {"com.facebook.katana": []},
+                    }
+                ]
+            }
+        )
+    )
+    config_store.update_config(
+        lambda config: (
+            config.update(
+                sources=[{"repo": "SysAdminDoc/HushFacebook", "active": True}]
+            ),
+            config.update(
+                apps=[
+                    {
+                        "id": "com.facebook.katana",
+                        "name": "Facebook",
+                        "include_patches": {"SysAdminDoc/HushFacebook": ["Hide ads"]},
+                    }
+                ]
+            ),
+        )
+    )
+    raw_path = data_dir / "apks" / "raw" / "com.facebook.katana-1.0.apk"
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    raw_path.write_bytes(b"cached APK")
+    old_patched = data_dir / "apks" / "patched" / "com.facebook.katana-old.apk"
+    old_patched.parent.mkdir(parents=True, exist_ok=True)
+    old_patched.write_bytes(b"previous patched APK")
+    downloads = []
+
+    def fail_inspection(*_args):
+        raise patcher.AndroidVariantInspectionError("inspector unavailable")
+
+    monkeypatch.setattr(patcher, "_read_minimum_sdk", fail_inspection)
+    monkeypatch.setattr(
+        patcher, "download_apk", lambda *_args, **_kwargs: downloads.append(True)
+    )
+    monkeypatch.setattr(patcher, "update_tools", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(
+        patcher,
+        "get_patch_versions",
+        lambda _config: {"SysAdminDoc/HushFacebook": "v1"},
+    )
+    monkeypatch.setattr(
+        patcher,
+        "get_supported_versions",
+        lambda *_args, **_kwargs: (["1.0"], None, None),
+    )
+
+    patcher.run_pipeline(["com.facebook.katana"], quiet=True, scraper=object())
+
+    assert downloads == []
+    assert raw_path.read_bytes() == b"cached APK"
+    assert old_patched.read_bytes() == b"previous patched APK"
+    assert list((data_dir / "apks" / ".building").iterdir()) == []

@@ -223,6 +223,35 @@ def test_stylesheet_url_changes_when_the_file_bytes_change(tmp_path, monkeypatch
     assert third == first
 
 
+def test_admin_ui_keeps_glass_to_header_and_dialog_surfaces():
+    html = INDEX.read_text()
+    stylesheet = STYLESHEET.read_text()
+
+    assert html.count('class="glass-surface ') == 3
+    assert "backdrop-blur" not in html
+    assert "purple" not in html and "pink" not in html
+    assert "glass-surface" in stylesheet
+    assert "@supports not ((-webkit-backdrop-filter:blur(1px)) or" in stylesheet
+    assert "@media (prefers-reduced-motion:reduce)" in stylesheet
+    assert ":focus-visible{outline:2px" in stylesheet
+
+
+def test_admin_ui_style_tokens_keep_controls_tappable_and_radii_compact():
+    stylesheet = STYLESHEET.read_text()
+
+    assert "--tap-target:44px" in stylesheet
+    assert "min-height:var(--tap-target)" in stylesheet
+    assert "a.p-2{align-items:center;display:inline-flex;justify-content:center" in stylesheet
+    assert "input,select,textarea{border-color:#74839a}" in stylesheet
+    assert "border-radius:8px" in stylesheet
+    assert "font-size:2.25rem" in stylesheet
+    assert "@media (max-width:767px)" in stylesheet
+    assert "transition-duration:.2s" in stylesheet
+    assert ".max-w-7xl{max-width:80rem}" in stylesheet
+    assert ".text-slate-500{color:#b0bfd3}" in stylesheet
+    assert ".text-slate-600{color:#9aadc5}" in stylesheet
+
+
 def test_templates_render_without_a_request_or_extra_context():
     template = main.templates.get_template("index.html")
 
@@ -663,7 +692,6 @@ NOT_CLASS_LITERALS = {
     "discovery": "tab name compared with activeTab",
     "pipeline": "tab name compared with activeTab",
     "settings": "tab name compared with activeTab",
-    "available": "browser.state value",
     "{{ app.id }}": "Jinja package id used as an object key",
 }
 # Class tokens that legitimately have no CSS rule of their own. Keep each justified.
@@ -693,8 +721,13 @@ NO_RULE_TOKENS: dict[str, str] = {
 # - Strings in a <script> block (for example `cls: 'x'`) and JS-built class names
 #   (`'bg-' + colour`). They are indistinguishable from ordinary words such as ids,
 #   URLs and keys, so finding them needs a large hand-kept allow-list. Tailwind's
-#   own scanner cannot see runtime-assembled names either. The template has none
-#   today, and the always-on digest test fails on any edit that is not rebuilt.
+#   own scanner cannot see runtime-assembled names either. The one place the
+#   page builds class names in script is the set of class-returning getters and
+#   methods of index.html (scraperTextClass, scraperDotClass, secretBadgeClass,
+#   secretMessageClass); they return whole literal strings, which Tailwind finds
+#   in the raw file, and `test_every_class_the_script_can_return_has_a_rule`
+#   runs them in node and checks each returned class. The always-on digest test
+#   fails on any edit that is not rebuilt.
 # - Classes added by Jinja, e.g. `class="a {{ x }}"`: raises, so it cannot pass
 #   unnoticed.
 CLASS_ATTRIBUTES = {
@@ -847,8 +880,6 @@ def test_the_allow_lists_are_not_stale():
 @pytest.mark.parametrize(
     "token",
     [
-        "shadow-[0_0_8px_rgba(16,185,129,0.4)]",
-        "shadow-[0_0_8px_rgba(239,68,68,0.4)]",
         "after:content-['']",
         "hover:bg-white/[0.02]",
     ],
@@ -969,3 +1000,40 @@ def test_page_uses_no_tailwind_plugin_classes_and_no_dark_variants():
 
     assert plugin_hits == []
     assert dark_hits == []
+
+
+def test_every_class_the_script_can_return_has_a_rule(tmp_path):
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    from tests.test_settings_ui import run_js
+
+    page = main.templates.get_template("index.html").render(
+        config={"apps": [], "sources": []}, available_apps=[], metadata={}, request=None
+    )
+    steps = """
+      const out = [];
+      for (const state of ['available', 'starting', 'stopping', 'unavailable', 'stopped']) {
+        for (const scraper of [true, false]) {
+          app.browser = {state}; app.diagnostics = {scraper};
+          out.push(app.scraperTextClass, app.scraperDotClass);
+        }
+      }
+      for (const source of ['environment', 'environment_invalid', 'file', null]) {
+        app.secretsLoaded = true;
+        app.secrets = {s: {set: source === 'file', source}};
+        out.push(app.secretBadgeClass('s'));
+      }
+      app.secretsLoaded = false;
+      out.push(app.secretBadgeClass('s'));
+      for (const kind of ['ok', 'error', undefined]) {
+        app.secretMessage = {s: kind ? {kind, text: 'x'} : null};
+        out.push(app.secretMessageClass('s'));
+      }
+      return out;
+    """
+    returned = run_js(page, tmp_path, steps)
+
+    tokens = {token for text in returned for token in text.split()}
+    css = STYLESHEET.read_text()
+    assert len(tokens) > 15
+    assert sorted(t for t in tokens if not has_own_rule(t, css)) == []

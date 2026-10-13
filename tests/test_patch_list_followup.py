@@ -86,6 +86,7 @@ def test_missing_or_null_patch_name_is_still_accepted(data_dir):
 
 class Release:
     """Minimal GitHub release lookup response."""
+
     is_redirect = False
 
     status_code = 200
@@ -292,6 +293,7 @@ def test_new_release_with_a_broken_list_still_counts_as_an_update(
 
 class NoReleases:
     """GitHub answer for a repository that has no releases."""
+
     is_redirect = False
 
     status_code = 404
@@ -431,4 +433,11 @@ def test_dialogs_check_the_response_before_parsing_its_body():
         parse = body.index("const data = await response.json()")
         assert body.index("response.ok") < parse
         error_branch = body[body.index("response.ok") : body.index("const data =")]
-        assert "response.json().catch(" in error_branch
+        assert "this.responseDetail(response" in error_branch
+
+    detail_start = html.index("async responseDetail(")
+    detail_body = html[
+        detail_start : html.index("focusableDialogElements(", detail_start)
+    ]
+    assert "await response.json()" in detail_body
+    assert "catch (e) {}" in detail_body

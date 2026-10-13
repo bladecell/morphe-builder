@@ -20,7 +20,16 @@ from collections.abc import Sequence
 from typing import Any, TextIO
 from urllib.parse import quote, urljoin, urlsplit
 from packaging import version
-from src.apkmirror_downloader import ApkMirror_Downloader, Arch, Dpi, BundleType
+from src.apkmirror_downloader import (
+    ApkMirror_Downloader,
+    AndroidVariantMetadataError,
+    AndroidVariantInspectionError,
+    AndroidVariantUnavailableError,
+    Arch,
+    BundleType,
+    Dpi,
+    is_invalid_license_error,
+)
 
 from src import secrets_store
 from src.config_store import DATA_DIR, load_config, update_config
@@ -81,9 +90,7 @@ def run_child(
     )
 
 
-def start_child(
-    command: Sequence[str | Path], **kwargs: Any
-) -> subprocess.Popen[Any]:
+def start_child(command: Sequence[str | Path], **kwargs: Any) -> subprocess.Popen[Any]:
     """Start a subprocess without the secrets in its environment.
 
     Args:
@@ -98,6 +105,7 @@ def start_child(
         OSError: As `subprocess.Popen`.
     """
     return subprocess.Popen(command, env=secrets_store.child_environment(), **kwargs)
+
 
 VERSIONS_FILE = DATA_DIR / "bin" / "versions.json"
 VERSION_CACHE_FILE = DATA_DIR / "bin" / "version_cache.json"
@@ -441,6 +449,33 @@ def github_token_warning() -> str | None:
         f"The GitHub token has permissions ({', '.join(state.scopes)}). Patch "
         "bundles can read it. Use a token with no permissions."
     )
+
+
+def github_token_permissions() -> str | None:
+    """Summarise what is known about the permissions of the token in effect now.
+
+    Returns:
+        None when no token is set (or the secrets file cannot be read, logged).
+        Otherwise one of: "unchecked" (no successful authenticated request with
+        this token yet, or GitHub rejected it), "none" (a classic token with no
+        scopes), "present" (a classic token with scopes; see
+        `github_token_warning` for the names) or "unverifiable" (GitHub sent no
+        scope header: a fine-grained or GitHub App token, whose permissions are
+        not reported this way).
+    """
+    try:
+        token = secrets_store.get_secret(secrets_store.GITHUB_TOKEN)
+    except OSError:
+        logger.error("Could not read the secrets file to check the GitHub token")
+        return None
+    if token is None:
+        return None
+    state = _token_state
+    if state is None or state.rejected or state.fingerprint != _fingerprint(token):
+        return "unchecked"
+    if state.scopes is None:
+        return "unverifiable"
+    return "present" if state.scopes else "none"
 
 
 def github_token_rejected() -> str | None:
@@ -1195,9 +1230,7 @@ def check_and_download_release(
         extensions_to_paths = {".json": extensions_to_paths[".json"]}
         repair_only = True
 
-    keep_stored_list = (
-        current_tag == latest_tag and not incomplete
-    ) or list_unreadable
+    keep_stored_list = (current_tag == latest_tag and not incomplete) or list_unreadable
     # The list first: a release without a usable list must not cost a bundle
     # download that is thrown away on every sync.
     ordered = sorted(extensions_to_paths.items(), key=lambda item: item[0] != ".json")
@@ -1332,6 +1365,29 @@ def find_file_collision(repo: str, sources: list[dict]) -> str | None:
     return None
 
 
+def _reject_source_path_alias(repo: str, sources: list[dict]) -> None:
+    """Reject an active, different repo that shares this repo's local files."""
+    other = source_path_alias(repo, sources)
+    if other is not None:
+        raise PatchSelectionError("Selected patch source is not usable")
+
+
+def source_path_alias(repo: str, sources: list[dict]) -> str | None:
+    """Find another active configured repo that maps to this source's files."""
+    local_bundle = get_source_paths(repo)[".mpp"]
+    for source in sources:
+        other = source.get("repo")
+        if (
+            source.get("active", True)
+            and is_valid_repo(other)
+            and isinstance(other, str)
+            and other.casefold() != repo.casefold()
+            and get_source_paths(other)[".mpp"] == local_bundle
+        ):
+            return other
+    return None
+
+
 def plan_source_sync(config: dict) -> tuple[list[dict], list[str]]:
     """Decide which active sources can be synced and describe the ones that cannot.
 
@@ -1385,19 +1441,20 @@ def check_dependencies(config):
     """Checks if required system tools are available."""
     results = {"java": False, "scraper": False}
     java_bin = config.get("settings", {}).get("java_path", "java")
-    
+
     try:
         run_child([java_bin, "-version"], capture_output=True, check=True)
         results["java"] = True
     except:
         pass
-        
+
     try:
         from src.apkmirror_downloader import ApkMirror_Downloader
+
         results["scraper"] = True
     except ImportError:
         pass
-        
+
     return results
 
 
@@ -1422,19 +1479,60 @@ def _apply_versions(config: dict, local_versions: dict) -> None:
         tools["apkeditor_version"] = local_versions[repos["apkeditor"]]
 
 
-def selected_patches(app: dict) -> dict[str, list[str]]:
-    """Return an app's patch selection in a form that compares regardless of order.
+def selected_patches(app: dict, config: dict | None = None) -> dict:
+    """Return an app's patch selection in a stable, order-independent form.
 
     Args:
         app: App entry from the config.
 
     Returns:
-        Sorted included and excluded patch names under "include" and "exclude".
+        Sorted legacy names or source-keyed names under "include", plus sorted
+        excluded names. Mapping repo keys are canonicalized against config when
+        available by callers before storing build records.
     """
+    included = app.get("include_patches") or []
+    if isinstance(included, dict):
+        configured_repos: dict[str, str] = {}
+        if config is not None:
+            for source in config.get("sources", []):
+                repo = source.get("repo")
+                if not is_valid_repo(repo):
+                    continue
+                key = repo.casefold()
+                if key in configured_repos:
+                    raise PatchSelectionError("Duplicate source repositories in config")
+                configured_repos[key] = repo
+        normalized: dict[str, list[str]] = {}
+        for repo, names in included.items():
+            if not is_valid_repo(repo) or not isinstance(names, list):
+                raise PatchSelectionError("Invalid source-keyed patch selection")
+            key = configured_repos.get(repo.casefold(), repo.casefold())
+            if key in normalized:
+                raise PatchSelectionError("Duplicate source keys in patch selection")
+            if not all(isinstance(name, str) for name in names):
+                raise PatchSelectionError("Patch selection names must be text")
+            normalized[key] = sorted(
+                set(names), key=lambda name: (name.casefold(), name)
+            )
+        included = dict(sorted(normalized.items()))
+    elif isinstance(included, list):
+        included = sorted(included)
+    else:
+        raise PatchSelectionError("Patch selection must be a list or source mapping")
+
     return {
-        "include": sorted(app.get("include_patches") or []),
+        "include": included,
         "exclude": sorted(app.get("exclude_patches") or []),
     }
+
+
+def effective_build_selection(app: dict, config: dict | None) -> dict:
+    """Selection identity including artifact requirements affecting its bytes."""
+    selection = selected_patches(app, config)
+    minimum_sdk = required_minimum_sdk(app, config or {})
+    if minimum_sdk is not None:
+        selection = {"patches": selection, "minimum_sdk": minimum_sdk}
+    return selection
 
 
 # Version of how patched APKs are put together. It is part of the version hash
@@ -1448,7 +1546,7 @@ BUILD_LAYOUT = 2
 def build_combined_version(
     app_version: str,
     patch_versions: dict[str, str],
-    selection: dict[str, list[str]],
+    selection: dict,
 ) -> str:
     """Build the version string Obtainium sees for one patched APK.
 
@@ -1475,11 +1573,21 @@ def build_combined_version(
     if patch_versions:
         morphe_repo = next((r for r in patch_versions if is_base_repo(r)), None)
         primary_tag = patch_versions[morphe_repo or next(iter(patch_versions))]
+    canonical_selection = dict(selection)
+    included = canonical_selection.get("include", [])
+    if isinstance(included, dict):
+        canonical_selection["include"] = {
+            repo: sorted(names, key=lambda name: (name.casefold(), name))
+            for repo, names in sorted(included.items(), key=lambda item: item[0])
+        }
+    else:
+        canonical_selection["include"] = sorted(included)
+    canonical_selection["exclude"] = sorted(canonical_selection.get("exclude", []))
     digest_input = json.dumps(
         {
             "layout": BUILD_LAYOUT,
             "patch_versions": patch_versions,
-            "patches": selection,
+            "patches": canonical_selection,
         },
         sort_keys=True,
     )
@@ -1494,6 +1602,7 @@ def is_build_current(
     app: dict,
     patch_versions: dict[str, str],
     patched_dir: Path,
+    config: dict | None = None,
 ) -> bool:
     """Decide from the recorded inputs whether an app's APK needs no rebuild.
 
@@ -1516,9 +1625,27 @@ def is_build_current(
     return (
         last_build.get("build_layout") == BUILD_LAYOUT
         and last_build.get("app_version") == app_version
-        and last_build.get("patches") == selected_patches(app)
+        and last_build.get("patches") == effective_build_selection(app, config)
         and all(patch_versions.get(r) == v for r, v in recorded_sources.items())
+        and active_selected_repos(app, config).issubset(
+            {repo.casefold() for repo in recorded_sources}
+        )
     )
+
+
+def active_selected_repos(app: dict, config: dict | None) -> set[str]:
+    """Return active configured repos named by a source-keyed selection."""
+    included = app.get("include_patches")
+    if not isinstance(included, dict) or config is None:
+        return set()
+    selected = {repo.casefold() for repo, names in included.items() if names}
+    return {
+        source["repo"].casefold()
+        for source in config.get("sources", [])
+        if source.get("active", True)
+        and is_valid_repo(source.get("repo"))
+        and source["repo"].casefold() in selected
+    }
 
 
 def save_app_result(app_id: str, **fields: object) -> None:
@@ -1626,7 +1753,7 @@ def _update_tools_locked(config: dict, quiet: bool, force: bool) -> bool:
 
     repos = config["repositories"]
     tools = config["tools"]
-    
+
     any_updated = False
     stop_error: GitHubRateLimitError | GitHubTokenRejectedError | None = None
 
@@ -1652,7 +1779,9 @@ def _update_tools_locked(config: dict, quiet: bool, force: bool) -> bool:
         for source in usable_sources:
             repo = source["repo"]
             if not quiet:
-                print(f"Checking for updates for source: {source.get('name')} ({repo})...")
+                print(
+                    f"Checking for updates for source: {source.get('name')} ({repo})..."
+                )
             if check_and_download_release(repo, get_source_paths(repo), force=force):
                 any_updated = True
     except (GitHubRateLimitError, GitHubTokenRejectedError) as e:
@@ -1675,6 +1804,9 @@ def _update_tools_locked(config: dict, quiet: bool, force: bool) -> bool:
 
 
 BASE_PATCHES_REPO = "MorpheApp/morphe-patches"
+HUSHFACEBOOK_REPO = "SysAdminDoc/HushFacebook"
+HUSHFACEBOOK_PACKAGE = "com.facebook.katana"
+HUSHFACEBOOK_MINIMUM_SDK = 30
 
 
 def is_base_repo(repo: str) -> bool:
@@ -1808,47 +1940,81 @@ def get_supported_versions(
         PatchListError: An active source's patch list exists but cannot be read.
         VersionLookupError: The lookup failed and `raise_lookup_errors` is set.
     """
-    app_config = next((a for a in config.get("apps", []) if a["id"] == package_name), {})
+    app_config = next(
+        (a for a in config.get("apps", []) if a["id"] == package_name), {}
+    )
+    raw_selection = app_config.get("include_patches") or []
     pinned_v = app_config.get("version")
-    if pinned_v:
-        if not quiet: print(f"    [+] Using pinned version from config for {package_name}: {pinned_v}")
+    has_source_mapping = isinstance(raw_selection, dict)
+    has_selected_patches = (
+        any(raw_selection.values())
+        if isinstance(raw_selection, dict)
+        else bool(raw_selection)
+    )
+    if pinned_v and not has_source_mapping:
+        if not quiet:
+            print(
+                f"    [+] Using pinned version from config for {package_name}: {pinned_v}"
+            )
         return [str(pinned_v)], None, None
 
-    selected_patches = set(app_config.get("include_patches", []))
-    
+    selected_repos = (
+        set(resolve_patch_selection(app_config, config, require_all=has_source_mapping))
+        if has_selected_patches
+        else set()
+    )
+    if has_source_mapping and has_selected_patches and not selected_repos:
+        raise PatchSelectionError(
+            f"{package_name}: none of the selected patch sources are active"
+        )
+    selected_repo_keys = {repo.casefold() for repo in selected_repos}
+
+    if pinned_v:
+        if not quiet:
+            print(
+                f"    [+] Using pinned version from config for {package_name}: {pinned_v}"
+            )
+        return [str(pinned_v)], None, None
+
     # 1. Parse Recommended versions from active patch sources
     # POLICY: Only look at sources that are either "Morphe Patches" (base)
     # OR sources that actually provide one of the selected patches.
-    versions_by_source = {} # repo -> set of versions
-    providing_sources = [] # repos in config order
+    versions_by_source = {}  # repo -> set of versions
+    providing_sources = []  # repos in config order
 
     for source in config.get("sources", []):
-        if not source.get("active", True): continue
+        if not source.get("active", True):
+            continue
         repo = source["repo"]
+        if has_selected_patches and repo.casefold() not in selected_repo_keys:
+            continue
         json_path = get_source_paths(source["repo"])[".json"]
-        if not json_path.exists(): continue
-        
+        if not json_path.exists():
+            continue
+
         patches = load_patch_list(repo)
 
         s_versions = set()
         has_selected_patch = False
-        
+
         for p in patches:
-            p_name = p.get("name")
-            if p_name in selected_patches:
+            if has_selected_patches and repo.casefold() in selected_repo_keys:
                 has_selected_patch = True
-            
+
             compat = p.get("compatiblePackages")
-            if not compat: continue
-            
+            if not compat:
+                continue
+
             v_list = []
             if isinstance(compat, dict) and package_name in compat:
                 v_list = compat[package_name]
             elif isinstance(compat, list):
                 for pkg in compat:
-                    if not isinstance(pkg, dict): continue
+                    if not isinstance(pkg, dict):
+                        continue
                     pkg_id = pkg.get("packageName") or pkg.get("name")
-                    if pkg_id != package_name: continue
+                    if pkg_id != package_name:
+                        continue
                     v_list = pkg.get("versions") or []
                     targets = pkg.get("targets")
                     if targets and isinstance(targets, list):
@@ -1859,19 +2025,22 @@ def get_supported_versions(
                             and t.get("version")
                             and not t.get("isExperimental", False)
                         ]
-            
+
             if v_list:
-                if isinstance(v_list, list): s_versions.update([str(v).strip() for v in v_list if v])
-                elif isinstance(v_list, str): s_versions.add(v_list.strip())
-        
+                if isinstance(v_list, list):
+                    s_versions.update([str(v).strip() for v in v_list if v])
+                elif isinstance(v_list, str):
+                    s_versions.add(v_list.strip())
+
         if s_versions:
             versions_by_source[repo] = s_versions
-            if has_selected_patch or is_base_repo(repo):
+            if has_selected_patch:
                 providing_sources.append(repo)
-    
-    # If patches are selected, only use versions supported by the providers
+
+    # Selected patches constrain providers; discovery with no selection retains
+    # the existing behavior of merging recommendations across active sources.
     recommended_set = set()
-    if selected_patches and providing_sources:
+    if has_selected_patches and providing_sources:
         # Collect versions from providing sources
         for repo in providing_sources:
             if repo in versions_by_source:
@@ -1888,16 +2057,18 @@ def get_supported_versions(
                         # If no intersection, fallback to the provider that isn't Morphe
                         if not is_base_repo(repo):
                             recommended_set = versions_by_source[repo]
-    else:
-        # No patches selected yet (Discovery mode), merge all
-        for s_versions in versions_by_source.values():
-            recommended_set.update(s_versions)
+    elif not has_selected_patches:
+        for source_versions in versions_by_source.values():
+            recommended_set.update(source_versions)
 
     recommended = sorted(
         list(recommended_set), key=_safe_version_sort_key, reverse=True
     )
     if recommended:
-        if not quiet: print(f"    [+] Found {len(recommended)} compatible recommended versions. Using newest: {recommended[0]}")
+        if not quiet:
+            print(
+                f"    [+] Found {len(recommended)} compatible recommended versions. Using newest: {recommended[0]}"
+            )
         return [recommended[0]], None, None
 
     # 2. Fallback to newest from APKMirror
@@ -1905,14 +2076,18 @@ def get_supported_versions(
     entry = cache.get(package_name, {})
     now = time.time()
     cached_remote = entry.get("versions", [])
-    
-    if not force_refresh and entry and (now - entry.get("timestamp", 0) < 43200):
-        if cached_remote: return cached_remote, None, None
 
-    if not quiet: print(f"Fetching newest version for {package_name} from APKMirror...")
+    if not force_refresh and entry and (now - entry.get("timestamp", 0) < 43200):
+        if cached_remote:
+            return cached_remote, None, None
+
+    if not quiet:
+        print(f"Fetching newest version for {package_name} from APKMirror...")
     close_scraper = False
     if scraper is None:
-        scraper = ApkMirror_Downloader()
+        scraper = ApkMirror_Downloader(
+            license_key=secrets_store.get_secret(secrets_store.CLOAKBROWSER_LICENSE_KEY)
+        )
         close_scraper = True
 
     try:
@@ -1921,16 +2096,21 @@ def get_supported_versions(
             versions = [newest]
             cache[package_name] = {"versions": versions, "timestamp": now}
             save_version_cache(cache)
-            if not quiet: print(f"    [+] Found newest on APKMirror: {newest}")
+            if not quiet:
+                print(f"    [+] Found newest on APKMirror: {newest}")
             return versions, None, None
         return cached_remote, None, None
     except Exception as e:
+        if is_invalid_license_error(e):
+            raise
         if raise_lookup_errors:
             raise VersionLookupError(f"{type(e).__name__}: {e}") from e
-        if not quiet: print(f"    [!] Scraper failed for {package_name}: {e}")
+        if not quiet:
+            print(f"    [!] Scraper failed for {package_name}: {e}")
         return cached_remote, None, None
     finally:
-        if close_scraper: scraper.close()
+        if close_scraper:
+            scraper.close()
 
 
 def extract_app_metadata(apk_path, package_id, scraper=None):
@@ -1938,7 +2118,7 @@ def extract_app_metadata(apk_path, package_id, scraper=None):
     try:
         java_bin = load_config().get("settings", {}).get("java_path", "java")
         apkeditor_path = DATA_DIR / "bin" / "APKEditor.jar"
-        
+
         app_name = package_id
         version_name = "Unknown"
 
@@ -1946,9 +2126,9 @@ def extract_app_metadata(apk_path, package_id, scraper=None):
             result = run_child(
                 [java_bin, "-jar", str(apkeditor_path), "info", "-i", str(apk_path)],
                 capture_output=True,
-                text=True
+                text=True,
             )
-            
+
             if result.returncode == 0:
                 lines = result.stdout.splitlines()
                 info = {}
@@ -1963,26 +2143,58 @@ def extract_app_metadata(apk_path, package_id, scraper=None):
         icon_dir = DATA_DIR / "apks" / "icons"
         icon_dir.mkdir(parents=True, exist_ok=True)
         target_icon = icon_dir / f"{package_id}.png"
-        
+
         if not target_icon.exists():
             print(f"    [!] Icon missing for {package_id}, fetching from APKMirror...")
             close_scraper = False
             if scraper is None:
-                scraper = ApkMirror_Downloader()
+                scraper = ApkMirror_Downloader(
+                    license_key=secrets_store.get_secret(
+                        secrets_store.CLOAKBROWSER_LICENSE_KEY
+                    )
+                )
                 close_scraper = True
-            
+            temporary_icon = icon_dir / f".{package_id}.{uuid.uuid4().hex}.png"
+
             try:
                 app_data = scraper.search(package_name=package_id, only_release=True)
                 if app_data and app_data.icon_url and app_data.icon_url != "Unknown":
-                    scraper.download_file(
+                    downloaded_icon = scraper.download_file(
                         target_url=app_data.icon_url,
                         dest_directory=str(icon_dir),
-                        filename=f"{package_id}.png"
+                        filename=temporary_icon.name,
                     )
+                    if downloaded_icon and temporary_icon.is_file():
+                        os.replace(temporary_icon, target_icon)
+            except Exception as e:
+                if is_invalid_license_error(e):
+                    raise
+                print(f"    [!] Icon lookup failed for {package_id}: {e}")
             finally:
+                try:
+                    temporary_icon.unlink(missing_ok=True)
+                except OSError as e:
+                    print(
+                        f"    [!] Could not remove temporary icon for {package_id}: {e}"
+                    )
                 if close_scraper:
-                    scraper.close()
-        
+                    try:
+                        scraper.close()
+                    except Exception as e:
+                        if is_invalid_license_error(e):
+                            raise
+                        if isinstance(
+                            e,
+                            (
+                                AndroidVariantInspectionError,
+                                AndroidVariantMetadataError,
+                            ),
+                        ):
+                            raise
+                        print(
+                            f"    [!] Could not close icon scraper for {package_id}: {e}"
+                        )
+
         # Save metadata
         metadata_file = DATA_DIR / "bin" / "metadata.json"
         metadata = {}
@@ -1992,17 +2204,16 @@ def extract_app_metadata(apk_path, package_id, scraper=None):
                     metadata = json.load(f)
                 except:
                     pass
-        
-        metadata[package_id] = {
-            "real_name": app_name,
-            "version": version_name
-        }
-        
+
+        metadata[package_id] = {"real_name": app_name, "version": version_name}
+
         with open(metadata_file, "w") as f:
             json.dump(metadata, f, indent=4)
-            
+
         return metadata[package_id]
     except Exception as e:
+        if is_invalid_license_error(e):
+            raise
         print(f"    [!] Failed to extract metadata for {package_id}: {e}")
         return None
 
@@ -2010,71 +2221,95 @@ def extract_app_metadata(apk_path, package_id, scraper=None):
 def get_app_preferences(package_name, config):
     """Scans patch sources to find if the app has a preferred apkFileType (APK vs BUNDLE)."""
     for source in config.get("sources", []):
-        if not source.get("active", True): continue
+        if not source.get("active", True):
+            continue
         json_path = get_source_paths(source["repo"])[".json"]
-        if not json_path.exists(): continue
+        if not json_path.exists():
+            continue
         try:
             with open(json_path, "r") as f:
                 data = json.load(f)
                 patches = data.get("patches", []) if isinstance(data, dict) else data
                 for p in patches:
                     compat = p.get("compatiblePackages")
-                    if not compat or not isinstance(compat, list): continue
+                    if not compat or not isinstance(compat, list):
+                        continue
                     for pkg in compat:
-                        if not isinstance(pkg, dict): continue
+                        if not isinstance(pkg, dict):
+                            continue
                         p_id = pkg.get("packageName") or pkg.get("name")
                         if p_id == package_name:
                             ftype = pkg.get("apkFileType")
                             if ftype:
                                 return ftype.upper()
-        except: pass
+        except:
+            pass
     return None
 
 
-def download_apk(package_name, target_version, final_path, tools_config, config, scraper=None):
+def download_apk(
+    package_name,
+    target_version,
+    final_path,
+    tools_config,
+    config,
+    scraper=None,
+    minimum_sdk: int | None = None,
+):
     print(f"Downloading {package_name} v{target_version} using ApkMirror_Downloader...")
     java_bin = config.get("settings", {}).get("java_path", "java")
-    
+
     close_scraper = False
     if scraper is None:
-        scraper = ApkMirror_Downloader()
+        scraper = ApkMirror_Downloader(
+            license_key=secrets_store.get_secret(secrets_store.CLOAKBROWSER_LICENSE_KEY)
+        )
         close_scraper = True
 
     try:
         # Check for preferred file type from patches
         pref = get_app_preferences(package_name, config)
-        
+
         prefer_bundle = False
         if pref:
             if "APK" in pref and "APKM" not in pref:
-                print(f"    [+] Source specifies standalone preference: {pref}. Prioritizing APK.")
+                print(
+                    f"    [+] Source specifies standalone preference: {pref}. Prioritizing APK."
+                )
                 prefer_bundle = False
             elif any(x in pref for x in ["BUNDLE", "APKM", "XAPK"]):
-                print(f"    [+] Source specifies bundle preference: {pref}. Prioritizing Bundle.")
+                print(
+                    f"    [+] Source specifies bundle preference: {pref}. Prioritizing Bundle."
+                )
                 prefer_bundle = True
         else:
-            print(f"    [~] No patch preference found. Using default architecture/bundle settings...")
-            prefer_bundle = True # Default to bundle as APKEditor can merge it cleanly
+            print(
+                f"    [~] No patch preference found. Using default architecture/bundle settings..."
+            )
+            prefer_bundle = True  # Default to bundle as APKEditor can merge it cleanly
 
         app_data = scraper.search(
             package_name=package_name,
             version=target_version,
             only_release=True,
-            prefer_bundle=prefer_bundle
+            prefer_bundle=prefer_bundle,
+            minimum_sdk=minimum_sdk,
         )
 
         if not app_data:
-            raise Exception(f"Could not find {package_name} v{target_version} on APKMirror")
+            raise Exception(
+                f"Could not find {package_name} v{target_version} on APKMirror"
+            )
 
-        with tempfile.TemporaryDirectory() as temp_dir:
+        with tempfile.TemporaryDirectory(dir=Path(final_path).parent) as temp_dir:
             temp_file_name = f"{package_name}_{target_version}_download.tmp"
-            
+
             downloaded_path = scraper.download_file(
                 target_url=app_data.download_url,
                 dest_directory=temp_dir,
-                filename=temp_file_name
+                filename=temp_file_name,
             )
-            
+
             if not downloaded_path or not os.path.exists(downloaded_path):
                 raise Exception("Download failed or file not found.")
 
@@ -2085,19 +2320,20 @@ def download_apk(package_name, target_version, final_path, tools_config, config,
                 scraper.download_file(
                     target_url=app_data.icon_url,
                     dest_directory=str(icon_dir),
-                    filename=f"{package_name}.png"
+                    filename=f"{package_name}.png",
                 )
 
             # Check if the downloaded file is a bundle by inspecting its zip contents
             import zipfile
+
             is_bundle_file = False
             try:
-                with zipfile.ZipFile(downloaded_path, 'r') as z:
-                    if any(name.endswith('.apk') for name in z.namelist()):
+                with zipfile.ZipFile(downloaded_path, "r") as z:
+                    if any(name.endswith(".apk") for name in z.namelist()):
                         is_bundle_file = True
             except:
                 pass
-            
+
             if is_bundle_file:
                 print(f"Downloaded bundle. Merging splits via APKEditor...")
                 apkeditor_path = DATA_DIR / tools_config["apkeditor_jar"]
@@ -2109,13 +2345,22 @@ def download_apk(package_name, target_version, final_path, tools_config, config,
                     "-i",
                     downloaded_path,
                     "-o",
-                    str(final_path),
+                    str(Path(temp_dir) / "merged.apk"),
                 ]
                 run_child(merge_command, check=True)
+                candidate_path = Path(temp_dir) / "merged.apk"
                 print(f"Successfully merged Universal APK to {final_path}")
             else:
-                shutil.move(downloaded_path, final_path)
+                candidate_path = Path(downloaded_path)
                 print(f"Successfully downloaded standalone APK to {final_path}")
+
+            if minimum_sdk is not None:
+                actual_minimum_sdk = _read_minimum_sdk(java_bin, candidate_path)
+                if actual_minimum_sdk < minimum_sdk:
+                    raise AndroidVariantUnavailableError(
+                        "Downloaded APK does not meet the required Android version"
+                    )
+            os.replace(candidate_path, final_path)
 
             # Extract name from APK as a final check/metadata update
             extract_app_metadata(final_path, package_name, scraper=scraper)
@@ -2169,22 +2414,92 @@ def _read_package_id(java_bin: str, input_apk: Path | str, fallback: str) -> str
     return fallback
 
 
-def _compatible_patch_names(repo: str, package_id: str) -> set[str]:
-    """List the patch names of one source that apply to a package.
+def _read_minimum_sdk(java_bin: str, input_apk: Path | str) -> int:
+    """Read an APK's manifest minSdk with the configured APKEditor CLI."""
+    apkeditor_path = DATA_DIR / "bin" / "APKEditor.jar"
+    try:
+        result = run_child(
+            [
+                java_bin,
+                "-jar",
+                str(apkeditor_path),
+                "info",
+                "-i",
+                str(input_apk),
+                "-min-sdk-version",
+                "-t",
+                "json",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise AndroidVariantInspectionError(
+            "Could not verify the APK's Android version requirement"
+        ) from error
+
+    try:
+        payload = json.loads(result.stdout)
+    except (TypeError, json.JSONDecodeError):
+        payload = None
+
+    sdk_values: list[object] = []
+
+    def collect_minimum_sdk(value: object) -> None:
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                if (
+                    str(key).replace("_", "").replace("-", "").casefold()
+                    == "minsdkversion"
+                ):
+                    sdk_values.append(nested)
+                else:
+                    collect_minimum_sdk(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                collect_minimum_sdk(nested)
+
+    if payload is not None:
+        collect_minimum_sdk(payload)
+    if len(sdk_values) == 1 and type(sdk_values[0]) is int:
+        return sdk_values[0]
+    raise AndroidVariantMetadataError(
+        "Could not verify the APK's Android version requirement"
+    )
+
+
+def _snapshot_apk(source: Path, scratch_dir: Path) -> Path:
+    """Copy an atomically replaced cache APK into private build scratch space."""
+    descriptor, snapshot_name = tempfile.mkstemp(
+        prefix="validated-input-", suffix=".apk", dir=scratch_dir
+    )
+    os.close(descriptor)
+    snapshot = Path(snapshot_name)
+    try:
+        shutil.copyfile(source, snapshot)
+    except BaseException:
+        snapshot.unlink(missing_ok=True)
+        raise
+    return snapshot
+
+
+def compatible_patches(repo: str, package_id: str) -> list[dict[str, object]]:
+    """Return one source's patch records that apply to a package.
 
     Args:
         repo: Source repo, `owner/repo`; its patch list must be on disk.
         package_id: Package the APK really has.
 
     Returns:
-        Casefolded names of the patches compatible with the package.
+        Patch records compatible with the package, preserving source order.
 
     Raises:
         PatchListError: The patch list is missing, unreadable or malformed.
     """
     if not get_source_paths(repo)[".json"].exists():
         raise PatchListError(repo, "the file is missing")
-    names: set[str] = set()
+    patches: list[dict[str, object]] = []
     for patch in load_patch_list(repo):
         comp = patch.get("compatiblePackages")
         if isinstance(comp, dict):
@@ -2199,8 +2514,355 @@ def _compatible_patch_names(repo: str, package_id: str) -> set[str]:
             is_compat = not comp
         name = patch.get("name")
         if is_compat and isinstance(name, str) and name:
-            names.add(name.casefold())
-    return names
+            patches.append(patch)
+    return patches
+
+
+def _compatible_patch_names(repo: str, package_id: str) -> set[str]:
+    """List casefolded names of patches from one repo for a package."""
+    return {
+        str(patch["name"]).casefold()
+        for patch in compatible_patches(repo, package_id)
+        if patch.get("name")
+    }
+
+
+def _compatible_patch_name_counts(repo: str, package_id: str) -> dict[str, int]:
+    """Count casefolded compatible patch identities from one local source."""
+    counts: dict[str, int] = {}
+    for patch in compatible_patches(repo, package_id):
+        folded = str(patch["name"]).casefold()
+        counts[folded] = counts.get(folded, 0) + 1
+    return counts
+
+
+def _compatible_patch_name_index(repo: str, package_id: str) -> dict[str, str]:
+    """Index compatible patch names by identity, retaining catalog spelling."""
+    return {
+        str(patch["name"]).casefold(): str(patch["name"])
+        for patch in compatible_patches(repo, package_id)
+    }
+
+
+def resolve_patch_selection(
+    app_config: dict,
+    config: dict,
+    *,
+    require_all: bool = True,
+    allow_unresolved: bool = False,
+    warn_unavailable: bool = True,
+    partial_preview: bool = False,
+    preview_errors: list[tuple[str, list[str]]] | None = None,
+) -> dict[str, list[str]]:
+    """Resolve legacy names and validate source-keyed selections for one APK.
+
+    Args:
+        app_config: App configuration with legacy or source-keyed inclusions.
+        config: Full configuration, including the ordered source list.
+        require_all: Whether unresolved legacy names should raise an error.
+        allow_unresolved: Return the applicable subset of mapped names instead
+            of raising when a selected name is unavailable. Source-list and
+            source-bundle errors still raise.
+        warn_unavailable: Print warnings for selected mapped sources that are
+            inactive or deleted.
+        partial_preview: Skip unavailable mapped sources and stop legacy
+            provider resolution when an earlier active source is unreadable.
+        preview_errors: Optional list populated with unavailable source keys and
+            affected selection names when `partial_preview` is enabled.
+
+    Returns:
+        Included patch names keyed by the configured repo spelling. Legacy
+        names are assigned to the first active compatible source in config
+        order; deleted and inactive mapped selections are retained in config
+        but omitted here with a warning.
+
+    Raises:
+        PatchListError: A relevant active source list is missing or unreadable,
+            or a mapped source has no bundle.
+        PatchSelectionError: The selection shape, repo identity, or selected
+            patch name is invalid or ambiguous, or a legacy name is unresolved
+            when `require_all` is true and `allow_unresolved` is false.
+    """
+    package_id = app_config["id"]
+    included = app_config.get("include_patches") or []
+    sources_by_repo: dict[str, dict] = {}
+    active_sources: list[dict] = []
+    for source in config.get("sources", []):
+        repo = source.get("repo")
+        if not is_valid_repo(repo):
+            continue
+        key = repo.casefold()
+        if key in sources_by_repo:
+            raise PatchSelectionError("Duplicate source repositories in config")
+        sources_by_repo[key] = source
+        if source.get("active", True):
+            active_sources.append(source)
+
+    if isinstance(included, dict):
+        requested: dict[str, list[str]] = {}
+        for repo, names in included.items():
+            if not is_valid_repo(repo) or not isinstance(names, list):
+                raise PatchSelectionError("Invalid source-keyed patch selection")
+            key = repo.casefold()
+            if key in requested:
+                raise PatchSelectionError("Duplicate source keys in patch selection")
+            if not all(isinstance(name, str) and name for name in names):
+                raise PatchSelectionError(
+                    "Patch selection names must be non-empty text"
+                )
+            requested[key] = list(dict.fromkeys(names))
+
+        resolved: dict[str, list[str]] = {}
+        resolved_keys: set[str] = set()
+        for source in active_sources:
+            repo = source["repo"]
+            repo_key = repo.casefold()
+            names = requested.get(repo_key)
+            if not names:
+                continue
+            resolved_keys.add(repo_key)
+            try:
+                _reject_source_path_alias(repo, config.get("sources", []))
+            except PatchSelectionError:
+                if not partial_preview:
+                    raise
+                if preview_errors is not None:
+                    preview_errors.append((repo_key, names))
+                continue
+            paths = get_source_paths(repo)
+            if not paths[".mpp"].is_file():
+                if partial_preview:
+                    if preview_errors is not None:
+                        preview_errors.append((repo_key, names))
+                    continue
+                raise PatchListError(repo, "the selected patch bundle is missing")
+            try:
+                name_counts = _compatible_patch_name_counts(repo, package_id)
+            except PatchListError:
+                if not partial_preview:
+                    raise
+                if preview_errors is not None:
+                    preview_errors.append((repo_key, names))
+                continue
+            carries = set(name_counts)
+            missing = [name for name in names if name.casefold() not in carries]
+            if missing and not allow_unresolved:
+                raise PatchSelectionError("Selected patch is unavailable")
+            ambiguous_names = [
+                name for name in names if name_counts.get(name.casefold(), 0) > 1
+            ]
+            if ambiguous_names and not partial_preview:
+                raise PatchSelectionError(
+                    "Selected patch name is ambiguous in its source"
+                )
+            if ambiguous_names and preview_errors is not None:
+                preview_errors.append((repo_key, ambiguous_names))
+            canonical_names = _compatible_patch_name_index(repo, package_id)
+            matched = [
+                name
+                for name in names
+                if name.casefold() in carries
+                and name_counts.get(name.casefold(), 0) == 1
+            ]
+            if matched:
+                resolved[repo] = [
+                    canonical_names[name.casefold()] if partial_preview else name
+                    for name in matched
+                ]
+        for repo_key in requested.keys() - resolved_keys:
+            if warn_unavailable:
+                print("    [!] Selected patch source is missing or inactive; skipping")
+        if any(requested.values()) and not resolved and not allow_unresolved:
+            raise PatchSelectionError("none of the selected patch sources are active")
+        return resolved
+
+    if not isinstance(included, list) or not all(
+        isinstance(name, str) and name for name in included
+    ):
+        raise PatchSelectionError("Patch selection must be a list or source mapping")
+
+    include_order = list(dict.fromkeys(included))
+    remaining = {name.casefold() for name in include_order}
+    resolved = {}
+    legacy_preview_blocked = False
+    for source in active_sources:
+        if not remaining:
+            break
+        repo = source["repo"]
+        if not get_source_paths(repo)[".json"].exists():
+            if partial_preview and remaining:
+                legacy_preview_blocked = True
+                if preview_errors is not None:
+                    preview_errors.append(
+                        (
+                            repo.casefold(),
+                            [
+                                name
+                                for name in include_order
+                                if name.casefold() in remaining
+                            ],
+                        )
+                    )
+                break
+            continue
+        try:
+            name_counts = _compatible_patch_name_counts(repo, package_id)
+        except PatchListError:
+            if not partial_preview:
+                raise
+            legacy_preview_blocked = True
+            if preview_errors is not None:
+                preview_errors.append(
+                    (
+                        repo.casefold(),
+                        [
+                            name
+                            for name in include_order
+                            if name.casefold() in remaining
+                        ],
+                    )
+                )
+            break
+        carries = set(name_counts)
+        found = remaining & carries
+        if not found:
+            continue
+        ambiguous_folded = {name for name in found if name_counts[name] > 1}
+        if ambiguous_folded and not partial_preview:
+            raise PatchSelectionError("Selected patch name is ambiguous in its source")
+        if ambiguous_folded:
+            legacy_preview_blocked = True
+            if preview_errors is not None:
+                preview_errors.append(
+                    (
+                        repo.casefold(),
+                        [
+                            name
+                            for name in include_order
+                            if name.casefold() in ambiguous_folded
+                        ],
+                    )
+                )
+            remaining -= ambiguous_folded
+            found -= ambiguous_folded
+        if not found:
+            continue
+        if partial_preview and not get_source_paths(repo)[".mpp"].is_file():
+            legacy_preview_blocked = True
+            if preview_errors is not None:
+                preview_errors.append(
+                    (
+                        repo.casefold(),
+                        [name for name in include_order if name.casefold() in found],
+                    )
+                )
+            break
+        try:
+            _reject_source_path_alias(repo, config.get("sources", []))
+        except PatchSelectionError:
+            if not partial_preview:
+                raise
+            legacy_preview_blocked = True
+            if preview_errors is not None:
+                preview_errors.append(
+                    (
+                        repo.casefold(),
+                        [name for name in include_order if name.casefold() in found],
+                    )
+                )
+            break
+        canonical_names = _compatible_patch_name_index(repo, package_id)
+        resolved[repo] = [
+            canonical_names[name.casefold()] if partial_preview else name
+            for name in include_order
+            if name.casefold() in found
+        ]
+        remaining -= found
+
+    base_key = BASE_PATCHES_REPO.casefold()
+    if remaining and base_key not in sources_by_repo and not legacy_preview_blocked:
+        base_bundle = get_source_paths(BASE_PATCHES_REPO)[".mpp"]
+        if base_bundle.is_file():
+            name_counts = _compatible_patch_name_counts(BASE_PATCHES_REPO, package_id)
+            carries = set(name_counts)
+            found = remaining & carries
+            if found:
+                ambiguous_folded = {name for name in found if name_counts[name] > 1}
+                if ambiguous_folded and not partial_preview:
+                    raise PatchSelectionError(
+                        "Selected patch name is ambiguous in its source"
+                    )
+                if ambiguous_folded:
+                    if preview_errors is not None:
+                        preview_errors.append(
+                            (
+                                base_key,
+                                [
+                                    name
+                                    for name in include_order
+                                    if name.casefold() in ambiguous_folded
+                                ],
+                            )
+                        )
+                    remaining -= ambiguous_folded
+                    found -= ambiguous_folded
+                if not found:
+                    return dict(
+                        sorted(resolved.items(), key=lambda item: item[0].casefold())
+                    )
+                _reject_source_path_alias(BASE_PATCHES_REPO, config.get("sources", []))
+                if not base_bundle.is_file():
+                    raise PatchListError(
+                        BASE_PATCHES_REPO, "the selected patch bundle is missing"
+                    )
+                canonical_names = _compatible_patch_name_index(
+                    BASE_PATCHES_REPO, package_id
+                )
+                resolved[BASE_PATCHES_REPO] = [
+                    canonical_names[name.casefold()] if partial_preview else name
+                    for name in include_order
+                    if name.casefold() in found
+                ]
+                remaining -= found
+
+    if remaining and require_all:
+        raise PatchSelectionError(
+            "No active patch source provides every selected patch"
+        )
+    return dict(sorted(resolved.items(), key=lambda item: item[0].casefold()))
+
+
+def required_minimum_sdk(app_config: dict, config: dict) -> int | None:
+    """Return the artifact SDK floor for an app's resolved selected providers.
+
+    The HushFacebook requirement is limited to Facebook and applies only when
+    that repository actually provides a selected patch. Legacy flat selections
+    use the same config-order resolution as builds.
+
+    Args:
+        app_config: App entry with package id and patch selection.
+        config: Full configuration with ordered sources.
+
+    Returns:
+        The required Android API level, or None when no constraint applies.
+
+    Raises:
+        PatchListError: A relevant source list or bundle is unavailable.
+    """
+    package_id = app_config.get("id")
+    if not isinstance(package_id, str) or package_id.casefold() != HUSHFACEBOOK_PACKAGE:
+        return None
+
+    try:
+        selected_repos = resolve_patch_selection(app_config, config)
+    except PatchSelectionError:
+        return None
+    if any(
+        repo.casefold() == HUSHFACEBOOK_REPO.casefold() and names
+        for repo, names in selected_repos.items()
+    ):
+        return HUSHFACEBOOK_MINIMUM_SDK
+    return None
 
 
 def patch_app(
@@ -2230,10 +2892,9 @@ def patch_app(
         Tuple of success flag and the repos of the bundles that were used.
 
     Raises:
-        PatchSelectionError: If a selected name is unknown to every bundle, or
-            patches were selected and the CLI applied none. The output APK is
-            removed in the second case. The message then quotes the last CLI
-            output lines.
+        PatchSelectionError: If a selected name is unknown to every bundle,
+            there are no active selected sources, or the CLI applies no selected
+            patches. The output APK is removed when the CLI applies none.
         PatchListError: If the patch list of a source that is needed, or of the
             base bundle used as fallback, is missing or unreadable.
     """
@@ -2242,53 +2903,32 @@ def patch_app(
     app_name = app_config["name"]
     input_package_id = _read_package_id(java_bin, input_apk, app_config["id"])
 
+    raw_selection = app_config.get("include_patches") or []
+    resolved_selection = resolve_patch_selection(app_config, config)
+    has_selected_patches = (
+        any(raw_selection.values())
+        if isinstance(raw_selection, dict)
+        else bool(raw_selection)
+    )
+    if has_selected_patches and not resolved_selection:
+        raise PatchSelectionError("none of the selected patch sources are active")
+
     included_mpps: dict[str, str] = {}  # path -> repo
     bundle_includes: dict[str, list[str]] = {}  # path -> names enabled via -e
     bundle_carries: dict[str, set[str]] = {}  # path -> casefolded names it carries
-    include_order = list(dict.fromkeys(app_config.get("include_patches") or []))
-    remaining = {name.casefold() for name in include_order}
-
-    for source in config.get("sources", []):
-        if not source.get("active", True) or not remaining:
-            continue
-        paths = get_source_paths(source["repo"])
-        if not paths[".mpp"].exists():
-            continue
-        carries = _compatible_patch_names(source["repo"], input_package_id)
-        found = remaining & carries
-        if not found:
-            continue
+    for repo, names in resolved_selection.items():
+        paths = get_source_paths(repo)
         key = str(paths[".mpp"])
-        included_mpps[key] = source["repo"]
-        bundle_includes.setdefault(key, []).extend(
-            n for n in include_order if n.casefold() in found
-        )
-        bundle_carries[key] = carries
-        remaining -= found
+        included_mpps[key] = repo
+        bundle_includes[key] = names
+        bundle_carries[key] = _compatible_patch_names(repo, input_package_id)
 
-    if remaining or not included_mpps:
+    if not included_mpps:
         default_mpp = get_source_paths(BASE_PATCHES_REPO)[".mpp"]
-        if default_mpp.exists():
-            default_carries = (
-                _compatible_patch_names(BASE_PATCHES_REPO, input_package_id)
-                if remaining
-                else set()
-            )
-            found = remaining & default_carries
-            key = str(default_mpp)
-            included_mpps[key] = BASE_PATCHES_REPO
-            bundle_includes.setdefault(key, []).extend(
-                n for n in include_order if n.casefold() in found
-            )
-            bundle_carries.setdefault(key, set()).update(default_carries)
-            remaining -= found
-
-    if remaining:
-        missing = [n for n in include_order if n.casefold() in remaining]
-        raise PatchSelectionError(
-            f"{app_name}: no patch bundle carries {', '.join(missing)} "
-            f"for {input_package_id}"
-        )
+        if default_mpp.is_file():
+            included_mpps[str(default_mpp)] = BASE_PATCHES_REPO
+            bundle_includes[str(default_mpp)] = []
+            bundle_carries[str(default_mpp)] = set()
 
     command = [
         java_bin,
@@ -2366,13 +3006,12 @@ def patch_app(
             output_path.unlink(missing_ok=True)
             return False, []
 
-        if include_order and applied_count == 0:
+        selected_names = [
+            name for names in resolved_selection.values() for name in names
+        ]
+        if selected_names and applied_count == 0:
             output_path.unlink(missing_ok=True)
-            raise PatchSelectionError(
-                f"{app_name}: no patch was applied although "
-                f"{len(include_order)} were selected. Last CLI output: "
-                f"{' | '.join(recent_lines) or '(none)'}"
-            )
+            raise PatchSelectionError("Selected patches were not applied")
 
         print(f"Successfully patched {app_name} to {output_apk}")
         return True, list(included_mpps.values())
@@ -2394,12 +3033,12 @@ def save_metadata(package_id, data):
                 metadata = json.load(f)
             except:
                 pass
-    
+
     if package_id not in metadata:
         metadata[package_id] = {}
-    
+
     metadata[package_id].update(data)
-    
+
     with open(metadata_file, "w") as f:
         json.dump(metadata, f, indent=4)
     return metadata[package_id]
@@ -2420,7 +3059,7 @@ def get_current_version(package_id):
     raw_dir = DATA_DIR / "apks" / "raw"
     if not raw_dir.exists():
         return None
-    
+
     versions_found = []
     for f in raw_dir.glob(f"{package_id}-*.apk"):
         # Extract version from filename: pkg.id-1.2.3.apk
@@ -2429,7 +3068,7 @@ def get_current_version(package_id):
             versions_found.append(version.parse(v_str))
         except:
             continue
-    
+
     if not versions_found:
         return None
     return str(max(versions_found))
@@ -2442,7 +3081,7 @@ def run_pipeline(package_ids=None, quiet=False, scraper=None):
     except (GitHubRateLimitError, GitHubTokenRejectedError) as e:
         print(f"[x] {e} Continuing with the tools and patches already on disk.")
         was_updated = False
-    
+
     # Get current versions of all active patch sources
     current_patch_versions = get_patch_versions(config)
 
@@ -2460,11 +3099,34 @@ def run_pipeline(package_ids=None, quiet=False, scraper=None):
     if package_ids:
         apps_to_build = [a for a in apps_to_build if a["id"] in package_ids]
 
+    buildable_apps = []
+    for app in apps_to_build:
+        selection = app.get("include_patches") or []
+        has_selected_patches = isinstance(selection, dict) and any(selection.values())
+        if has_selected_patches:
+            try:
+                resolved = resolve_patch_selection(app, config)
+                if not resolved:
+                    raise PatchSelectionError(
+                        "none of the selected patch sources are active"
+                    )
+            except (PatchListError, PatchSelectionError) as error:
+                print(f"[x] {error}")
+                save_app_result(app["id"], status="Error", error=str(error))
+                continue
+        buildable_apps.append(app)
+    apps_to_build = buildable_apps
+    if not apps_to_build:
+        return []
+
     patched_apps = []
-    
+
     close_scraper = False
+    private_snapshots: list[Path] = []
     if scraper is None:
-        scraper = ApkMirror_Downloader()
+        scraper = ApkMirror_Downloader(
+            license_key=secrets_store.get_secret(secrets_store.CLOAKBROWSER_LICENSE_KEY)
+        )
         close_scraper = True
 
     try:
@@ -2473,17 +3135,23 @@ def run_pipeline(package_ids=None, quiet=False, scraper=None):
                 # Mimic human behavior with small delays between apps
                 if i > 0:
                     time.sleep(5)
-                
+
                 # Check for patch source updates handled in main loop
-                
-                supported, _, _ = get_supported_versions(app["id"], config, scraper=scraper, force_refresh=True)
-                
+
+                supported, _, _ = get_supported_versions(
+                    app["id"], config, scraper=scraper, force_refresh=True
+                )
+
                 # PINNED VERSION LOGIC:
                 # ...
                 pinned_version = app.get("version")
                 if pinned_version:
-                    print(f"[!] Pinned version {pinned_version} detected for {app['id']}. Ignoring other versions.")
+                    print(
+                        f"[!] Pinned version {pinned_version} detected for {app['id']}. Ignoring other versions."
+                    )
                     supported = [pinned_version]
+
+                minimum_sdk = required_minimum_sdk(app, config)
 
                 if not supported:
                     print(f"[!] No supported versions found for {app['id']}")
@@ -2495,38 +3163,99 @@ def run_pipeline(package_ids=None, quiet=False, scraper=None):
                 download_success = False
                 target_version = None
                 raw_apk_path = None
+                patch_input_path = None
 
                 for v in supported:
                     raw_apk_path = raw_dir / f"{app['id']}-{v}.apk"
                     if raw_apk_path.exists():
-                        target_version = v
-                        download_success = True
-                        print(f"Raw APK already exists for {app['id']} v{v}, skipping download.")
-                        extract_app_metadata(raw_apk_path, app['id'], scraper=scraper)
-                        break
-                    
+                        if minimum_sdk is None:
+                            target_version = v
+                            download_success = True
+                            print(
+                                f"Raw APK already exists for {app['id']} v{v}, skipping download."
+                            )
+                            extract_app_metadata(
+                                raw_apk_path, app["id"], scraper=scraper
+                            )
+                            break
+                        cached_snapshot = _snapshot_apk(raw_apk_path, scratch_dir)
+                        private_snapshots.append(cached_snapshot)
+                        cached_minimum_sdk = _read_minimum_sdk(
+                            config.get("settings", {}).get("java_path", "java"),
+                            cached_snapshot,
+                        )
+                        if cached_minimum_sdk >= minimum_sdk:
+                            target_version = v
+                            download_success = True
+                            patch_input_path = cached_snapshot
+                            break
+                        cached_snapshot.unlink(missing_ok=True)
+                        private_snapshots.remove(cached_snapshot)
+                        print(
+                            "Cached APK fails Android version validation; replacing it."
+                        )
+
                     try:
-                        download_apk(app["id"], v, raw_apk_path, config["tools"], config, scraper=scraper)
+                        download_apk(
+                            app["id"],
+                            v,
+                            raw_apk_path,
+                            config["tools"],
+                            config,
+                            scraper=scraper,
+                            minimum_sdk=minimum_sdk,
+                        )
+                        if minimum_sdk is not None:
+                            download_snapshot = _snapshot_apk(raw_apk_path, scratch_dir)
+                            private_snapshots.append(download_snapshot)
+                            if (
+                                _read_minimum_sdk(
+                                    config.get("settings", {}).get("java_path", "java"),
+                                    download_snapshot,
+                                )
+                                < minimum_sdk
+                            ):
+                                raise AndroidVariantUnavailableError(
+                                    "Downloaded APK does not meet the required Android version"
+                                )
+                            patch_input_path = download_snapshot
                         target_version = v
                         download_success = True
                         break
                     except Exception as e:
-                        print(f"    [!] Failed to download v{v}: {e}. Trying next version...")
-                        if raw_apk_path and raw_apk_path.exists():
-                            raw_apk_path.unlink(missing_ok=True) # Cleanup partial download
+                        if is_invalid_license_error(e):
+                            raise
+                        print(
+                            f"    [!] Failed to download v{v}: {e}. Trying next version..."
+                        )
+                        if (
+                            minimum_sdk is None
+                            and raw_apk_path
+                            and raw_apk_path.exists()
+                        ):
+                            raw_apk_path.unlink(
+                                missing_ok=True
+                            )  # Cleanup partial download
                         continue
 
                 if not download_success:
                     # ...
-                    print(f"[x] Could not download any supported version for {app['id']}")
+                    print(
+                        f"[x] Could not download any supported version for {app['id']}"
+                    )
                     save_app_result(app["id"], status="Error", error="Download failed")
                     continue
 
                 # ... patching logic ...
                 last_build = app.get("last_successful_build", {})
-                
+
                 if not was_updated and is_build_current(
-                    last_build, target_version, app, current_patch_versions, patched_dir
+                    last_build,
+                    target_version,
+                    app,
+                    current_patch_versions,
+                    patched_dir,
+                    config,
                 ):
                     recorded = last_build.get("combined_version")
                     print(
@@ -2541,7 +3270,11 @@ def run_pipeline(package_ids=None, quiet=False, scraper=None):
                     scratch_apk = Path(scratch) / f"{app['id']}.apk"
                     try:
                         success, used_repos = patch_app(
-                            app, config["tools"], raw_apk_path, scratch_apk, config
+                            app,
+                            config["tools"],
+                            patch_input_path or raw_apk_path,
+                            scratch_apk,
+                            config,
                         )
                     except PatchSelectionError as e:
                         print(f"[x] {e}")
@@ -2559,7 +3292,7 @@ def run_pipeline(package_ids=None, quiet=False, scraper=None):
                         combined_version = build_combined_version(
                             target_version,
                             relevant_patch_versions,
-                            selected_patches(app),
+                            effective_build_selection(app, config),
                         )
                         patched_apk_path = (
                             patched_dir / f"{app['id']}-{combined_version}.apk"
@@ -2574,9 +3307,9 @@ def run_pipeline(package_ids=None, quiet=False, scraper=None):
                         "patch_versions": relevant_patch_versions,
                         "combined_version": combined_version,
                         "filename": patched_apk_path.name,
-                        "patches": selected_patches(app),
+                        "patches": effective_build_selection(app, config),
                         "build_layout": BUILD_LAYOUT,
-                        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
                     }
                     save_app_result(
                         app["id"],
@@ -2599,22 +3332,26 @@ def run_pipeline(package_ids=None, quiet=False, scraper=None):
                         error="Patching failed with SEVERE errors",
                     )
             except Exception as e:
+                if is_invalid_license_error(e):
+                    raise
                 print(f"Error processing {app['id']}: {e}")
                 save_app_result(app["id"], status="Error", error=str(e))
     finally:
+        for snapshot in private_snapshots:
+            snapshot.unlink(missing_ok=True)
         if close_scraper:
             scraper.close()
-            
+
     return patched_apps
 
 
 def get_all_available_apps(config):
     """Scans all active source JSONs and returns a unique list of supported apps with translated names."""
-    apps_data = {} # pkg_id -> name
+    apps_data = {}  # pkg_id -> name
     for source in config.get("sources", []):
         if not source.get("active", True):
             continue
-        
+
         json_path = get_source_paths(source["repo"])[".json"]
         if not json_path.exists():
             continue
@@ -2645,7 +3382,8 @@ def get_all_available_apps(config):
             elif isinstance(compat_pkgs, list):
                 pkgs_to_add = []
                 for pkg in compat_pkgs:
-                    if not isinstance(pkg, dict): continue
+                    if not isinstance(pkg, dict):
+                        continue
                     # Prioritize packageName (ReVanced style), then name
                     p_id = pkg.get("packageName") or pkg.get("name")
                     if p_id:
@@ -2655,7 +3393,8 @@ def get_all_available_apps(config):
                             entry_names[str(p_id)] = pkg["name"]
 
             for pkg_id in pkgs_to_add:
-                if not pkg_id: continue
+                if not pkg_id:
+                    continue
                 pkg_id = str(pkg_id)
                 translated_name = entry_names.get(pkg_id) or app_names_map.get(pkg_id)
                 if translated_name is not None and not isinstance(translated_name, str):
@@ -2671,4 +3410,7 @@ def get_all_available_apps(config):
 
 if __name__ == "__main__":
     secrets_store.absorb_environment()
+    from src.apkmirror_downloader import configure_cloakbrowser_cache
+
+    configure_cloakbrowser_cache(DATA_DIR / "bin" / "cloakbrowser")
     run_pipeline()

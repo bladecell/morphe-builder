@@ -2,13 +2,16 @@
 
 ## Responsibility
 
-The whole backend. Four modules in a strict layering, plus Jinja templates:
+The backend: the pipeline/scraper layers, persistence, request/secret controls,
+and Jinja templates:
 
 | Module | Layer | Role |
 |---|---|---|
 | `main.py` | Presentation + orchestration | FastAPI app, UI JSON API, Obtainium endpoints, APScheduler jobs, `ScraperWorker`, build task |
 | `patcher.py` | Pipeline / service | GitHub release sync for tools and patch sources, version selection, APK download and split merge, morphe-cli invocation, metadata |
 | `config_store.py` | Persistence | All `config.yaml` I/O: `load_config`, `update_config`, atomic write, `DATA_DIR`, `DEFAULT_CONFIG` |
+| `secrets_store.py` | Secret persistence | Environment/file precedence for GitHub, cloakbrowser and Apprise secrets; atomic `DATA_DIR/.env`, redaction, child-environment stripping |
+| `request_guards.py` | Request security | Host, Origin, and Fetch Metadata checks; no authentication |
 | `apkmirror_downloader.py` | Gateway | `ApkMirror_Downloader`: drives one cloakbrowser (Playwright sync API) page through APKMirror |
 | `templates/` | View | See [templates/codemap.md](templates/codemap.md) |
 
@@ -17,6 +20,12 @@ The whole backend. Four modules in a strict layering, plus Jinja templates:
 **Dependency direction.** `main -> patcher -> apkmirror_downloader`, with `main` and
 `patcher` both depending on `config_store`, which depends on nothing in `src/`. `main`
 gets `ApkMirror_Downloader` and `DATA_DIR` through `src.patcher`, not directly.
+
+**HushFacebook artifact floor.** `patcher.run_pipeline` snapshots constrained raw
+APKs into `.building` before APKEditor `minSdkVersion` inspection and patches that
+same snapshot. `main.upload_apk` rechecks the selected-provider requirement under
+the config-store lock immediately before atomic promotion; APK inspection stays
+outside the lock.
 
 **Config writes (unit of work).** `config_store.update_config(mutate)` holds one
 process-wide `RLock` while it loads the current file, calls `mutate(config)` and, if
@@ -51,11 +60,13 @@ no locks. Only `config.yaml` is protected.
 | File | Written by | Contents |
 |---|---|---|
 | `config.yaml` | `config_store.update_config` | `repositories`, `sources`, `tools`, `apps`, `settings`. Shape in `config_store.DEFAULT_CONFIG`. Seeded from the project root copy or the defaults on first load |
+| `.env` | `secrets_store` | Optional plaintext GitHub/cloakbrowser secrets and JSON-array `APPRISE_URLS`; atomic mode `0600`; never source/load as an environment file |
 | `bin/versions.json` | `patcher.save_local_versions` | Release tag per GitHub repo, plus `<repo>#last_check` timestamps |
 | `bin/version_cache.json` | `patcher.save_version_cache` | Newest APKMirror version per package, 12 h TTL |
 | `bin/metadata.json` | `patcher.extract_app_metadata`, `patcher.save_metadata` | `real_name` and `version` per package |
 | `bin/patches-<owner>-<repo>.{mpp,json}` | `patcher.check_and_download_release` | Patch bundle and patch list per source; paths from `get_source_paths` |
 | `bin/build.log` | `main.build_task` | Captured stdout of the current or last build |
+| `bin/cloakbrowser/` | `main.startup_event` | Isolated browser cache; an existing `license.key` causes refusal and is not automatically removed |
 | `apks/raw/<pkg>-<version>.apk` | `download_apk`, `/api/ui/upload_apk` | Unpatched APKs |
 | `apks/patched/<pkg>-<version>-<patch tag>-<hash>.apk` | `run_pipeline` | Output served to Obtainium; moved in atomically from `apks/.building/` |
 | `apks/.building/` | `run_pipeline` | Scratch output of the patch in progress; wiped at the start of every build |
@@ -79,11 +90,15 @@ opened with `newline=""` so the UI can collapse them.
 
 ### Startup (`main.startup_event`)
 
-1. `ensure_data_dirs`, `load_config`, `setup_cron_job`.
-2. `check_dependencies` fills `DIAGNOSTICS` (Java on PATH, scraper importable).
-3. `SCRAPER_WORKER.start()` launches the browser.
+1. `secrets_store.absorb_environment` captures recognized environment secrets
+   and removes them from `os.environ`; then prepare data directories and the
+   app-owned cloakbrowser cache at `DATA_DIR/bin/cloakbrowser`.
+2. Load config, schedule jobs, and fill `DIAGNOSTICS` (Java on PATH, scraper
+   importable).
+3. `SCRAPER_WORKER.start()` launches the browser with the effective configured
+   key passed explicitly, if present.
 4. If either tool jar is missing, `update_tools_task` runs synchronously.
-5. `scheduler.start()` and a one-off `refresh_versions_task` job.
+5. Start the scheduler and queue a one-off `refresh_versions_task` job.
 
 ### Scheduler jobs
 
@@ -183,24 +198,39 @@ returns `(True, [repos used])`.
 - `_goto` is the only navigation entry point apart from the final download hop. It
   relaunches the browser and retries once when the Playwright error mentions `crash`
   or `closed`; timeouts are re-raised.
+- A code-77 invalid-key denial is preserved across selector, download, version lookup,
+  metadata and build catches so the worker can close the browser and fail the current
+  task. Later tasks run keyless until the configured key changes. Only code 77
+  permits keyless fallback; other licence codes do not downgrade.
 
 ## Integration
 
 ### HTTP surface (`main.py`)
 
+Patch-selection contract: default `GET /api/ui/patches/{package_id}` remains the
+legacy flat shape; `?format=grouped` opts into repo groups and stored/resolved/
+unresolved state. `POST /api/ui/add_app` accepts legacy lists or repo mappings;
+mapping is full replacement, while omitted existing exclusions are preserved.
+See [README API notes](../README.md#patch-selection-api) and
+`tests/test_grouped_patch_api.py` for the HTTP contract.
+
 | Group | Routes | Notes |
 |---|---|---|
 | UI page | `GET /` | Renders `index.html` with `config`, `available_apps`, `metadata` |
 | Apps | `GET /api/ui/patches/{package_id}`, `POST /api/ui/add_app`, `POST /api/ui/delete_app`, `POST /api/ui/upload_apk` | `add_app` also edits; it merges over the existing entry to keep pin, status and last build |
-| Sources | `POST /api/ui/add_source`, `toggle_source`, `delete_source`, `GET /api/ui/discovery`, `GET /api/ui/source_updates` | `add_source` syncs first with `force=True`, judges success by files on disk, and re-checks for a duplicate inside the config update. `discovery?sync=true` queues `update_tools_task` |
+| Sources | `POST /api/ui/add_source`, `toggle_source`, `delete_source`, `GET /api/ui/discovery` | `add_source` syncs first with `force=True`, judges success by files on disk, and re-checks for a duplicate inside the config update. `POST /api/ui/discovery/sync` queues `update_tools_task`; `/api/ui/source_updates` was deleted |
 | Status | `GET /api/ui/updates`, `build_status`, `tools_status`, `logs`, `metadata` | `updates` blocks on the worker for unpinned apps; returns the stale cache while a build or refresh is active |
 | Build | `POST /api/ui/trigger_build` | `package_ids` null or empty means all apps |
-| Settings | `POST /api/ui/save_settings`, `POST /api/ui/test_notification` | Saving reschedules cron |
+| Settings | `POST /api/ui/save_settings`, `POST /api/ui/test_notification`, `GET /api/ui/secrets`, `PUT`/`DELETE /api/ui/secrets/{slug}`, `PUT`/`DELETE /api/ui/secrets/apprise-urls`, `POST /api/ui/secrets/apprise-urls/migration` | General settings reject non-empty notification URL bodies; tests use the effective stored list. Apprise status is count/source/migration metadata only; explicit migration removes legacy config only after secret persistence. The UI card currently exposes GitHub and cloakbrowser fields, not Apprise URL editing. Token changes report sync scheduling in `X-Sync` |
 | Obtainium | `GET /view/{package_id}`, `GET /api/apps`, `GET /api/apps/{obtainium_id}`, `GET /download/{package_name}` | `/view` accepts package id or `obtainium_id`. `/download` takes an exact filename or a package id and serves the newest APK of exactly that package, or 404. Unknown ids on `/api/apps/{id}` give 404 |
 | Static | `/icons` | `DATA_DIR/apks/icons` |
 | Static | `/static` | `src/static`: `app.css` (URL carries a content hash) and the vendored Alpine.js |
 
-No authentication on any route; CORS allows all origins.
+No authentication on any route. Host/Origin/Fetch Metadata request guards are not
+authentication. `ALLOWED_HOSTS` bare names allow a Host only; full origins allow
+the exact scheme/host/port as an Origin and replace `settings.server_url` as a trust
+anchor. Reverse proxies must preserve the original Host; `X-Forwarded-Host` is not
+trusted. See [README host/proxy guidance](../README.md#host-and-reverse-proxy-checks).
 
 ### External
 
@@ -208,7 +238,8 @@ No authentication on any route; CORS allows all origins.
 - APKMirror through cloakbrowser.
 - `java` subprocesses for `morphe-cli.jar` and `APKEditor.jar` (`settings.java_path`
   overrides the binary).
-- Apprise for notifications (`settings.notification_urls`).
+- Apprise for notifications, resolving `APPRISE_URLS` before the legacy
+  `settings.notification_urls` runtime fallback.
 
 ### Consumers
 

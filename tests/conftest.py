@@ -1,6 +1,7 @@
 """Shared fixtures for the pipeline and config tests."""
 
 import socket
+import threading
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,14 @@ APP_A = {
     "exclude_patches": [],
 }
 APP_B = {"id": "com.b", "name": "B", "include_patches": [], "exclude_patches": []}
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Register the marker that opts a test out of the sync-scheduling stub."""
+    config.addinivalue_line(
+        "markers",
+        "real_sync_scheduling: use the real post-token-change sync scheduling",
+    )
 
 
 def make_config() -> dict:
@@ -42,7 +51,18 @@ def isolated_data_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "TOOLS_UPDATING", False)
     monkeypatch.setattr(main, "_ACTIVITY_COUNT", 0)
     # Values the secret store remembered for masking belong to one test only.
-    for name, empty in (("_current", {}), ("_retired", ()), ("_known", ())):
+    for name, empty in (
+        ("_current", {}),
+        ("_retired", ()),
+        ("_known", ()),
+        ("_captured_environment", {}),
+        ("_apprise_mask_current", ()),
+        ("_apprise_mask_retired", ()),
+        ("_apprise_mask_known", ()),
+        ("_active_apprise_masks", {}),
+        ("_active_apprise_mask_known", ()),
+        ("_temporary_redaction", threading.local()),
+    ):
         monkeypatch.setattr(secrets_store, name, empty, raising=False)
     # Both paths are bound at import, so DATA_DIR alone does not move them.
     for name in ("VERSIONS_FILE", "VERSION_CACHE_FILE"):
@@ -55,8 +75,15 @@ def isolated_data_dir(tmp_path, monkeypatch):
     )
     # The test client sends Host: testserver; production rules stay unchanged.
     monkeypatch.setenv("ALLOWED_HOSTS", "testserver")
-    for secret_name in ("GITHUB_TOKEN", "CLOAKBROWSER_LICENSE_KEY"):
+    for secret_name in (
+        "GITHUB_TOKEN",
+        "CLOAKBROWSER_LICENSE_KEY",
+        "APPRISE_URLS",
+    ):
         monkeypatch.delenv(secret_name, raising=False)
+    cache_dir = tmp_path.with_name(f"{tmp_path.name}-cloakbrowser-cache")
+    monkeypatch.setenv("CLOAKBROWSER_CACHE_DIR", str(cache_dir))
+    apkmirror_downloader.configure_cloakbrowser_cache(cache_dir)
     return tmp_path
 
 
@@ -151,3 +178,15 @@ def edit_app(app_id: str, **fields: object) -> None:
         next(a for a in config["apps"] if a["id"] == app_id).update(fields)
 
     config_store.update_config(apply)
+
+
+@pytest.fixture(autouse=True)
+def no_token_sync_scheduling(request, monkeypatch):
+    """Keep a token change over HTTP from scheduling a real tool sync.
+
+    The routes claim and schedule a sync after the GitHub token changes; without
+    this stub any test that PUTs or DELETEs a token would start one. Tests that
+    exercise the scheduling carry `@pytest.mark.real_sync_scheduling`.
+    """
+    if request.node.get_closest_marker("real_sync_scheduling") is None:
+        monkeypatch.setattr(main, "_schedule_tools_sync", lambda config: None)

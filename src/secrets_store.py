@@ -1,14 +1,11 @@
-"""Two secrets kept in DATA_DIR/.env or the environment, never in the config.
+"""Secrets kept in DATA_DIR/.env or the environment, never in the config.
 
-Only `GITHUB_TOKEN` and `CLOAKBROWSER_LICENSE_KEY` are recognised. A real
-environment variable wins over the file, and is held to the same value pattern:
-an invalid one is ignored (never returned, no fallback to the file), reported as
-"environment_invalid" in the status and named once in the log. Other lines and
-comments in the file are kept verbatim when it is rewritten but never loaded.
-Values are validated so a value cannot carry a newline (and so another variable)
-into the file, and they are never logged: callers log only names.
+`GITHUB_TOKEN`, `CLOAKBROWSER_LICENSE_KEY`, and `APPRISE_URLS` are recognised.
+Environment values win over the file; invalid environment values are never
+returned and do not fall back to the file. Other lines and comments in the file
+are kept verbatim when it is rewritten but never loaded.
 
-At startup `absorb_environment` moves both variables out of `os.environ` into
+At startup `absorb_environment` moves all three variables out of `os.environ` into
 memory, so nothing the app starts afterwards (a subprocess, the browser, library
 code) inherits them. The store keeps reporting them as coming from the
 environment and keeps validating and locking them. Nothing here ever writes a
@@ -26,18 +23,20 @@ are atomic, mode 0600, and serialised by one process-wide lock.
 
 WARNING: DATA_DIR/.env must never be loaded as a process environment file
 (compose `env_file`, `uvicorn --env-file`, a shell `source`). A value set from
-the network would then count as environment-sourced and be locked, and the
-file is not shell syntax: values are limited to `[A-Za-z0-9._+/=:@-]`
-so it stays harmless if it is loaded by mistake.
+the network would then count as environment-sourced and be locked. APPRISE_URLS
+is JSON and must not be interpreted as shell syntax.
 """
 
 import logging
+import json
 import os
 import re
 import threading
 import traceback
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Literal
+from collections.abc import Iterable
+from typing import Iterator, Literal
 
 from src import config_store
 
@@ -45,7 +44,21 @@ logger = logging.getLogger(__name__)
 
 GITHUB_TOKEN = "GITHUB_TOKEN"
 CLOAKBROWSER_LICENSE_KEY = "CLOAKBROWSER_LICENSE_KEY"
+APPRISE_URLS = "APPRISE_URLS"
 SECRET_NAMES = (GITHUB_TOKEN, CLOAKBROWSER_LICENSE_KEY)
+MAX_APPRISE_URL_COUNT = 16
+MAX_APPRISE_URL_BYTES = 2048
+MAX_APPRISE_URLS_BYTES = 32768
+MAX_APPRISE_STORAGE_BYTES = 65536
+_LINE_SEPARATORS = frozenset("\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029")
+
+
+def contains_line_separator(text: str) -> bool:
+    """Return whether text contains a control or Unicode line separator."""
+    return any(
+        ord(char) < 32 or ord(char) == 127 or char in _LINE_SEPARATORS for char in text
+    )
+
 
 Source = Literal["environment", "environment_invalid", "file"]
 
@@ -54,6 +67,7 @@ Source = Literal["environment", "environment_invalid", "file"]
 # fullmatch rejects a trailing newline too.
 _VALUE_PATTERN = re.compile(r"[A-Za-z0-9._+/=:@-]{8,512}")
 _LINE_PATTERN = re.compile(r"\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)")
+_APPRISE_LINE_PATTERN = re.compile(r"\s*(?:export\s+)?APPRISE_URLS\s*=")
 _FILE_LOCK = threading.Lock()
 _warned_invalid_env: set[str] = set()
 _warned_invalid_file: set[str] = set()
@@ -72,6 +86,14 @@ _retired: tuple[str, ...] = ()
 _known: tuple[str, ...] = ()
 # The most that `_known` can hold: the retired values plus one per name and source.
 MAX_REMEMBERED_VALUES = MAX_RETIRED_VALUES + 2 * len(SECRET_NAMES)
+MAX_RETIRED_APPRISE_MASK_SETS = 32
+MAX_APPRISE_MASK_VALUES = 8192
+MAX_APPRISE_MASK_BYTES = 131072
+_apprise_mask_current: tuple[str, ...] = ()
+_apprise_mask_retired: tuple[tuple[str, ...], ...] = ()
+_apprise_mask_known: tuple[str, ...] = ()
+_active_apprise_masks: dict[str, int] = {}
+_active_apprise_mask_known: tuple[str, ...] = ()
 # A value being written right now. Masked from before the write until it is
 # either in effect (then it is in `_current`) or dropped, so a log line made
 # during the write cannot show it.
@@ -94,6 +116,14 @@ class SecretFromEnvironmentError(RuntimeError):
     def __init__(self, name: str, invalid: bool = False) -> None:
         super().__init__(name)
         self.invalid = invalid
+
+
+class InvalidAppriseFileError(RuntimeError):
+    """The existing APPRISE_URLS file assignment is invalid and is authoritative."""
+
+
+class AppriseRedactionCapacityError(RuntimeError):
+    """Active notification masks cannot be admitted within bounded capacity."""
 
 
 def _track(name: str, source: str, value: str | None) -> None:
@@ -186,17 +216,130 @@ def _read_lines() -> list[str]:
         OSError: The file exists but could not be read.
     """
     try:
-        return _env_path().read_text(encoding="utf-8", errors="replace").splitlines()
+        text = _env_path().read_text(encoding="utf-8", errors="replace")
+        physical_lines = text.split("\n")
+        if physical_lines and physical_lines[-1] == "":
+            physical_lines.pop()
+        lines: list[str] = []
+        for physical_line in physical_lines:
+            line = physical_line.removesuffix("\r")
+            if _APPRISE_LINE_PATTERN.match(line):
+                # Keep Unicode separators inside JSON as data so they cannot
+                # become sibling secret assignments. Other lines retain the
+                # existing splitlines() behavior for token-file compatibility.
+                lines.append(line)
+            else:
+                split_lines = line.splitlines()
+                lines.extend(split_lines if split_lines else [""])
+        return lines
     except FileNotFoundError:
         return []
 
 
 def _line_name(line: str) -> str | None:
     """Return the recognised secret name a line assigns, else None."""
+    if contains_line_separator(line):
+        return None
     match = _LINE_PATTERN.fullmatch(line)
-    if match is None or match.group(1) not in SECRET_NAMES:
+    if match is None or match.group(1) not in (*SECRET_NAMES, APPRISE_URLS):
         return None
     return match.group(1)
+
+
+def validate_apprise_urls(value: object) -> tuple[str, ...]:
+    """Validate the bounded URL-list shape without inspecting URL syntax.
+
+    Apprise owns service URL parsing. Keeping the shape check here ensures the
+    same limits apply to environment, file and API values.
+    """
+    if not isinstance(value, list) or len(value) > MAX_APPRISE_URL_COUNT:
+        raise InvalidSecretError("Invalid notification URL list")
+    urls: list[str] = []
+    total_bytes = 0
+    for item in value:
+        if not isinstance(item, str):
+            raise InvalidSecretError("Invalid notification URL list")
+        try:
+            size = len(item.encode("utf-8"))
+        except UnicodeEncodeError:
+            raise InvalidSecretError("Invalid notification URL list") from None
+        if not item or size > MAX_APPRISE_URL_BYTES or contains_line_separator(item):
+            raise InvalidSecretError("Invalid notification URL list")
+        total_bytes += size
+        if total_bytes > MAX_APPRISE_URLS_BYTES:
+            raise InvalidSecretError("Invalid notification URL list")
+        urls.append(item)
+    return tuple(urls)
+
+
+def _decode_apprise_urls(raw: str) -> tuple[tuple[str, ...] | None, bool]:
+    """Decode an APPRISE_URLS JSON list without returning invalid input."""
+    try:
+        if len(raw.encode("utf-8")) > MAX_APPRISE_STORAGE_BYTES:
+            return None, False
+        urls = validate_apprise_urls(json.loads(raw))
+        encoded = json.dumps(urls, ensure_ascii=True, separators=(",", ":"))
+        if len(encoded.encode("utf-8")) > MAX_APPRISE_STORAGE_BYTES:
+            return None, False
+        return urls, True
+    except (ValueError, RecursionError, UnicodeEncodeError):
+        return None, False
+
+
+def read_apprise_urls() -> tuple[tuple[str, ...] | None, str | None, bool]:
+    """Read effective APPRISE_URLS and report its owner and validity.
+
+    Environment ownership is based on presence, not truthiness. In particular,
+    a blank or invalid value locks the variable and prevents file fallback.
+    Returns `(urls, source, valid)`; `urls=None` means no usable value.
+    """
+    if APPRISE_URLS in _captured_environment:
+        urls, valid = _decode_apprise_urls(_captured_environment[APPRISE_URLS])
+        return urls, "environment" if valid else "environment_invalid", valid
+    if APPRISE_URLS in os.environ:
+        urls, valid = _decode_apprise_urls(os.environ[APPRISE_URLS])
+        return urls, "environment" if valid else "environment_invalid", valid
+
+    raw: str | None = None
+    malformed_line = False
+    for line in _read_lines():
+        match = _LINE_PATTERN.fullmatch(line)
+        if match is not None and match.group(1) == APPRISE_URLS:
+            raw = match.group(2)
+            malformed_line = contains_line_separator(line)
+    if raw is None:
+        return None, None, True
+    if malformed_line:
+        return None, "file_invalid", False
+    urls, valid = _decode_apprise_urls(raw)
+    return urls, "file" if valid else "file_invalid", valid
+
+
+def set_apprise_urls(urls: object) -> None:
+    """Atomically replace APPRISE_URLS in DATA_DIR/.env, preserving other lines."""
+    parsed = validate_apprise_urls(urls)
+    encoded = json.dumps(parsed, ensure_ascii=True, separators=(",", ":"))
+    if len(encoded.encode("utf-8")) > MAX_APPRISE_STORAGE_BYTES:
+        raise InvalidSecretError("Invalid notification URL list")
+    with _FILE_LOCK:
+        if APPRISE_URLS in _captured_environment or APPRISE_URLS in os.environ:
+            raise SecretFromEnvironmentError(APPRISE_URLS)
+        _, current_source, current_valid = read_apprise_urls()
+        if current_source == "file_invalid" or not current_valid:
+            raise InvalidAppriseFileError(APPRISE_URLS)
+        kept = [line for line in _read_lines() if _line_name(line) != APPRISE_URLS]
+        kept.append(f"{APPRISE_URLS}={encoded}")
+        config_store.write_file_atomic(
+            _env_path(), "".join(f"{line}\n" for line in kept), mode=0o600
+        )
+        stored, source, valid = read_apprise_urls()
+        if source != "file" or not valid or stored != parsed:
+            raise OSError("Could not verify notification URL storage")
+
+
+def clear_apprise_urls() -> None:
+    """Persist an empty-list tombstone so legacy config cannot reappear."""
+    set_apprise_urls([])
 
 
 def _file_value(name: str) -> str | None:
@@ -211,6 +354,8 @@ def _file_value(name: str) -> str | None:
     """
     value: str | None = None
     for line in _read_lines():
+        if contains_line_separator(line):
+            continue
         match = _LINE_PATTERN.fullmatch(line)
         if match is None or match.group(1) != name:
             continue
@@ -362,9 +507,7 @@ def set_secret(name: str, value: str) -> None:
         reason = (error.strerror or type(error).__name__).replace(value, "***")
         raise OSError(error.errno, reason) from None
     except Exception as error:  # noqa: BLE001 - unknown failure: say only its type
-        raise RuntimeError(
-            f"{type(error).__name__} while storing the secret"
-        ) from None
+        raise RuntimeError(f"{type(error).__name__} while storing the secret") from None
 
 
 def clear_secret(name: str) -> None:
@@ -383,7 +526,7 @@ def clear_secret(name: str) -> None:
 
 
 def absorb_environment() -> None:
-    """Move both secrets out of `os.environ` into memory. Call it once, at startup.
+    """Move the secrets out of `os.environ` into memory at startup.
 
     Afterwards nothing the app starts, library code included, inherits them.
     The store still reports them as coming from the environment, validates them
@@ -398,6 +541,9 @@ def absorb_environment() -> None:
         value = os.environ.pop(name, None)
         if value is not None and value.strip():
             _captured_environment[name] = value.strip()
+    apprise_value = os.environ.pop(APPRISE_URLS, None)
+    if apprise_value is not None:
+        _captured_environment[APPRISE_URLS] = apprise_value
     for name in SECRET_NAMES:
         _env_value(name)
         try:
@@ -429,14 +575,101 @@ def redact(text: str) -> str:
     # inside a longer one cannot leave the rest of the longer one visible.
     pending = _pending
     known = _known
-    values = sorted({*known, *pending}, key=len, reverse=True) if pending else known
+    temporary = getattr(_temporary_redaction, "values", ())
+    apprise_values = (*_apprise_mask_known, *_active_apprise_mask_known)
+    values = sorted(
+        {*known, *pending, *temporary, *apprise_values}, key=len, reverse=True
+    )
     for value in values:
         text = text.replace(value, "***")
     return text
 
 
+def remember_apprise_masks(values: Iterable[str]) -> None:
+    """Remember parser-extracted masks for an accepted effective Apprise set.
+
+    Call only with URL strings and credential fields extracted from the
+    Apprise parser, after local validation or successful persistence. The
+    replaced effective set remains masked in a bounded history. This
+    process-wide snapshot covers Apprise's notifier worker threads.
+    """
+    global _apprise_mask_current, _apprise_mask_retired, _apprise_mask_known
+    unique_values = {value for value in values if value}
+    total_bytes = sum(len(value.encode("utf-8")) for value in unique_values)
+    if (
+        len(unique_values) > MAX_APPRISE_MASK_VALUES
+        or total_bytes > MAX_APPRISE_MASK_BYTES
+    ):
+        raise ValueError("Apprise redaction data exceeds its bounded capacity")
+    masks = tuple(sorted(unique_values, key=len, reverse=True))
+    with _known_lock:
+        previous = _apprise_mask_current
+        if previous == masks:
+            return
+        _apprise_mask_current = masks
+        retired_values = set(previous).difference(masks)
+        if retired_values:
+            _apprise_mask_retired = (
+                *_apprise_mask_retired,
+                tuple(sorted(retired_values, key=len, reverse=True)),
+            )[-MAX_RETIRED_APPRISE_MASK_SETS:]
+        all_values = {
+            value
+            for values in (_apprise_mask_current, *_apprise_mask_retired)
+            for value in values
+        }
+        _apprise_mask_known = tuple(sorted(all_values, key=len, reverse=True))
+
+
+@contextmanager
+def active_apprise_masks(values: Iterable[str]) -> Iterator[None]:
+    """Pin validated masks until notification and all Apprise workers complete."""
+    global _active_apprise_mask_known
+    masks = {value for value in values if value}
+    with _known_lock:
+        proposed = set(_active_apprise_masks).union(masks)
+        if (
+            len(proposed) > MAX_APPRISE_MASK_VALUES
+            or sum(len(value.encode("utf-8")) for value in proposed)
+            > MAX_APPRISE_MASK_BYTES
+        ):
+            raise AppriseRedactionCapacityError
+        for value in masks:
+            _active_apprise_masks[value] = _active_apprise_masks.get(value, 0) + 1
+        _active_apprise_mask_known = tuple(
+            sorted(_active_apprise_masks, key=len, reverse=True)
+        )
+    try:
+        yield
+    finally:
+        with _known_lock:
+            for value in masks:
+                remaining = _active_apprise_masks[value] - 1
+                if remaining:
+                    _active_apprise_masks[value] = remaining
+                else:
+                    del _active_apprise_masks[value]
+            _active_apprise_mask_known = tuple(
+                sorted(_active_apprise_masks, key=len, reverse=True)
+            )
+
+
+_temporary_redaction = threading.local()
+
+
+@contextmanager
+def temporary_redactions(values: Iterable[str]) -> Iterator[None]:
+    """Mask request-scoped credential material without retaining it after use."""
+    previous = getattr(_temporary_redaction, "values", ())
+    _temporary_redaction.values = (*previous, *(value for value in values if value))
+    try:
+        yield
+    finally:
+        _temporary_redaction.values = previous
+
+
 def child_environment() -> dict[str, str]:
-    """Return a copy of the process environment without the two secrets.
+    """Return a copy of the process environment without the secrets.
 
     Every subprocess the app starts gets this as its environment, so none of
     them inherits a token or key. This is inheritance only, not secrecy: code
@@ -450,7 +683,7 @@ def child_environment() -> dict[str, str]:
     return {
         name: value
         for name, value in os.environ.items()
-        if name.upper() not in SECRET_NAMES
+        if name.upper() not in (*SECRET_NAMES, APPRISE_URLS)
     }
 
 

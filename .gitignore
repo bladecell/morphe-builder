@@ -18,3 +18,4 @@ config.yaml
 
 # Tailwind standalone CLI cache (scripts/build_css.py)
 .cache/
+.claude/

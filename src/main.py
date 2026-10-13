@@ -1,4 +1,12 @@
-from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, UploadFile, File, Form
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Request,
+    BackgroundTasks,
+    UploadFile,
+    File,
+    Form,
+)
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -14,13 +22,16 @@ import sys
 import io
 import time
 import apprise
+from apprise import plugins as apprise_plugins
 from dataclasses import dataclass
 from typing import Any, Callable, List, Protocol, TypeVar, cast
 from pathlib import Path
+from urllib.parse import unquote
 from src.patcher import (
     get_supported_versions,
     load_patch_list,
     PatchListError,
+    PatchSelectionError,
     VersionLookupError,
     get_all_available_apps,
     find_file_collision,
@@ -33,14 +44,20 @@ from src.patcher import (
     check_and_download_release,
     load_local_versions,
     selected_patches,
+    active_selected_repos,
     is_base_repo,
     DATA_DIR,
     GitHubRateLimitError,
     GitHubTokenRejectedError,
+    github_token_permissions,
     github_token_warning,
     github_token_rejected,
     SYNC_LOCK,
     remove_stale_download_files,
+    compatible_patches as get_compatible_patches,
+    resolve_patch_selection,
+    source_path_alias,
+    is_valid_repo,
 )
 from packaging import version
 from apscheduler.jobstores.base import JobLookupError  # type: ignore[import-untyped]
@@ -49,6 +66,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 import threading
 import uuid
+import yaml  # type: ignore[import-untyped]
 import asyncio
 import logging
 import queue
@@ -96,7 +114,7 @@ class _Task:
     result: "queue.Queue[tuple[object, Exception | None]]"
 
 
-def _launch_downloader() -> Downloader:
+def _launch_downloader(license_key: str | None = None) -> Downloader:
     """Start the persistent APKMirror downloader (launches the browser).
 
     Returns:
@@ -104,7 +122,7 @@ def _launch_downloader() -> Downloader:
     """
     from src.patcher import ApkMirror_Downloader
 
-    return ApkMirror_Downloader()
+    return ApkMirror_Downloader(license_key=license_key)
 
 
 # Global worker to manage a persistent downloader instance
@@ -119,9 +137,10 @@ class ScraperWorker(threading.Thread):
 
     def __init__(
         self,
-        launch: Callable[[], Downloader] = _launch_downloader,
+        launch: Callable[..., Downloader] = _launch_downloader,
         clock: Callable[[], float] = time.monotonic,
         cooldown: float = LAUNCH_COOLDOWN_SECONDS,
+        license_key_provider: Callable[[], str | None] | None = None,
     ) -> None:
         """Create the worker; call `start()` to launch the browser.
 
@@ -136,6 +155,9 @@ class ScraperWorker(threading.Thread):
         self.error: str | None = None  # redacted text of the last launch failure
         self.initialized = threading.Event()
         self._launch = launch
+        self._license_key_provider = license_key_provider
+        self._license_key: str | None = None
+        self._license_key_rejected = False
         self._clock = clock
         self._cooldown = cooldown
         self._next_attempt_at = 0.0
@@ -169,6 +191,7 @@ class ScraperWorker(threading.Thread):
     def _run_task_body(self, task: _Task) -> None:
         """Launch the browser if needed, run the task and answer its caller."""
         try:
+            self._refresh_license_key()
             if self.downloader is None and self._clock() >= self._next_attempt_at:
                 self._try_launch()
             if self.downloader is None:
@@ -177,6 +200,12 @@ class ScraperWorker(threading.Thread):
             result = task.func(*task.args, scraper=self.downloader, **task.kwargs)
             task.result.put((result, None))
         except Exception as error:  # noqa: BLE001 - handed to the caller
+            from src.apkmirror_downloader import is_invalid_license_error
+
+            if is_invalid_license_error(error):
+                self._license_key_rejected = True
+                self._close_downloader()
+                self._next_attempt_at = 0.0
             task.result.put((None, error))
         except BaseException as error:  # noqa: BLE001 - SystemExit and the like
             # Must not end the thread or leave the caller waiting.
@@ -189,9 +218,20 @@ class ScraperWorker(threading.Thread):
         logger.info("Initializing persistent ApkMirror_Downloader...")
         self._launching = True
         try:
-            self.downloader = self._launch()
+            if self._license_key_provider is None:
+                self.downloader = self._launch()
+            else:
+                self._license_key = self._license_key_provider()
+                launch_key = None if self._license_key_rejected else self._license_key
+                self.downloader = self._launch(launch_key)
+                self._license_key_rejected = self._license_key_rejected or bool(
+                    getattr(self.downloader, "license_key_rejected", False)
+                )
         except Exception as error:  # noqa: BLE001 - any launch failure is recoverable
             # No exc_info: the traceback would repeat the unredacted message.
+            self._license_key_rejected = self._license_key_rejected or bool(
+                getattr(error, "license_key_rejected", False)
+            )
             self.error = secrets_store.redact(f"{type(error).__name__}: {error}")
             self._next_attempt_at = self._clock() + self._cooldown
             logger.error("Browser launch failed: %s", self.error)
@@ -199,6 +239,18 @@ class ScraperWorker(threading.Thread):
         finally:
             self._launching = False
         self.error = None
+
+    def _refresh_license_key(self) -> None:
+        """Relaunch between tasks when the effective configured key changes."""
+        if self._license_key_provider is None:
+            return
+        current_key = self._license_key_provider()
+        if current_key == self._license_key:
+            return
+        self._close_downloader()
+        self._license_key = current_key
+        self._license_key_rejected = False
+        self._next_attempt_at = 0.0
 
     def _finish(self) -> None:
         """Close the browser and answer every task still queued."""
@@ -271,11 +323,10 @@ class ScraperWorker(threading.Thread):
             "error": self.error,
             "retry_in": self._retry_in(),
             "busy_since": self._busy_since,
+            "license_key_rejected": self._license_key_rejected,
         }
 
-    def execute(
-        self, func: Callable[..., T], *args: object, **kwargs: object
-    ) -> T:
+    def execute(self, func: Callable[..., T], *args: object, **kwargs: object) -> T:
         """Run a function in the worker thread and return its result.
 
         Waits for the result with no timeout while the worker is alive: a timeout
@@ -335,7 +386,11 @@ class ScraperWorker(threading.Thread):
             self.task_queue.put(None)
 
 
-SCRAPER_WORKER = ScraperWorker()
+SCRAPER_WORKER = ScraperWorker(
+    license_key_provider=lambda: secrets_store.get_secret(
+        secrets_store.CLOAKBROWSER_LICENSE_KEY
+    )
+)
 # True while any scraper activity (a version refresh or a build) is queued or
 # running. It is derived from `_ACTIVITY_COUNT`, so one activity ending cannot
 # clear it while another still runs.
@@ -430,6 +485,13 @@ def ensure_data_dirs():
     (DATA_DIR / "apks" / "raw").mkdir(parents=True, exist_ok=True)
     (DATA_DIR / "apks" / "patched").mkdir(parents=True, exist_ok=True)
     (DATA_DIR / "apks" / "icons").mkdir(parents=True, exist_ok=True)
+
+
+def configure_cloakbrowser_cache() -> None:
+    """Use an isolated cloakbrowser cache under the app's data directory."""
+    from src.apkmirror_downloader import configure_cloakbrowser_cache as configure
+
+    configure(DATA_DIR / "bin" / "cloakbrowser")
 
 
 # Cache for update status to prevent excessive polling load
@@ -572,6 +634,7 @@ def _refresh_updates() -> dict:
 
     # Get current versions of all active patch sources
     from src.patcher import get_patch_versions
+
     remote_patch_versions = get_patch_versions(config)
 
     for app_info in config.get("apps", []):
@@ -659,8 +722,18 @@ def _refresh_updates() -> dict:
         if not file_exists:
             has_update = True
 
-        if last_build and last_build.get("patches") != selected_patches(app_info):
-            has_update = True
+        if last_build:
+            try:
+                if last_build.get("patches") != selected_patches(app_info, config):
+                    has_update = True
+                built_repos = {
+                    repo.casefold() for repo in last_build.get("patch_versions", {})
+                }
+                if not active_selected_repos(app_info, config).issubset(built_repos):
+                    has_update = True
+            except PatchSelectionError:
+                has_update = True
+                patch_list_error = "Invalid patch selection configuration"
 
         update_status[package_id] = {
             "has_update": has_update,
@@ -683,6 +756,7 @@ def _refresh_updates() -> dict:
         }
     return update_status
 
+
 # --- WEB UI ROUTES ---
 
 
@@ -690,8 +764,11 @@ def _refresh_updates() -> dict:
 async def web_ui(request: Request):
     """Serves the main Web UI with the initial data injected."""
     config = load_config()
+    settings = config.get("settings")
+    if isinstance(settings, dict):
+        settings.pop("notification_urls", None)
     available_apps = get_all_available_apps(config)
-    
+
     metadata = {}
     metadata_file = DATA_DIR / "bin" / "metadata.json"
     if metadata_file.exists():
@@ -706,15 +783,15 @@ async def web_ui(request: Request):
         request=request,
         name="index.html",
         context={
-            "config": config, 
+            "config": config,
             "available_apps": available_apps,
-            "metadata": metadata
+            "metadata": metadata,
         },
     )
 
 
 @app.get("/api/ui/patches/{package_id}")
-def get_patches_for_app(package_id: str):
+def get_patches_for_app(package_id: str, format: str | None = None):
     """List the patches of all active sources that apply to one package.
 
     Args:
@@ -730,12 +807,17 @@ def get_patches_for_app(package_id: str):
             patch list is unreadable.
     """
     config = load_config()
-    compatible_patches = []
+    if format == "grouped":
+        return _get_grouped_patches_for_app(package_id, config)
+    if format is not None:
+        raise HTTPException(status_code=400, detail="Unsupported patch catalog format")
+
+    compatible_patches: list[dict[str, object]] = []
 
     for source in config.get("sources", []):
         if not source.get("active", True):
             continue
-        
+
         json_path = get_source_paths(source["repo"])[".json"]
         if not json_path.exists():
             continue
@@ -752,9 +834,13 @@ def get_patches_for_app(package_id: str):
                 use = True
             elif isinstance(compat_pkgs, list):
                 for pkg in compat_pkgs:
-                    if not isinstance(pkg, dict): continue
+                    if not isinstance(pkg, dict):
+                        continue
                     # ReVanced schema uses packageName, others use name
-                    if pkg.get("packageName") == package_id or pkg.get("name") == package_id:
+                    if (
+                        pkg.get("packageName") == package_id
+                        or pkg.get("name") == package_id
+                    ):
                         use = True
                         break
             elif not compat_pkgs:
@@ -762,8 +848,10 @@ def get_patches_for_app(package_id: str):
 
             if use:
                 # Determine if it's enabled by default (check various schema fields)
-                is_default = patch.get("default", patch.get("enabled_by_default", patch.get("use", True)))
-                
+                is_default = patch.get(
+                    "default", patch.get("enabled_by_default", patch.get("use", True))
+                )
+
                 # Avoid duplicates from different sources
                 if not any(p["name"] == patch.get("name") for p in compatible_patches):
                     compatible_patches.append(
@@ -780,10 +868,268 @@ def get_patches_for_app(package_id: str):
     return compatible_patches
 
 
+def _grouped_patch_entry(
+    patch: dict, source: dict, selected: bool
+) -> dict[str, object]:
+    """Return the existing patch-dialog fields plus an explicit selection flag."""
+    return {
+        "name": patch.get("name"),
+        "description": patch.get("description", "No description available."),
+        "enabled_by_default": patch.get(
+            "default", patch.get("enabled_by_default", patch.get("use", True))
+        ),
+        "source": source["name"],
+        "is_base": is_base_repo(source["repo"]),
+        "selected": selected,
+    }
+
+
+def _stored_patch_entry(
+    name: str, repo: str, source: str, is_base: bool, status: str
+) -> dict[str, object]:
+    """Represent a stored selection whose patch is absent from the catalog."""
+    return {
+        "name": name,
+        "description": "Stored selection is not currently available.",
+        "enabled_by_default": False,
+        "source": source,
+        "is_base": is_base,
+        "selected": True,
+        "status": status,
+    }
+
+
+def _get_grouped_patches_for_app(package_id: str, config: dict) -> dict[str, object]:
+    """Build the opt-in grouped catalog and expose stored/resolved selection state."""
+    app = next(
+        (entry for entry in config.get("apps", []) if entry.get("id") == package_id),
+        {"id": package_id, "include_patches": []},
+    )
+    stored = app.get("include_patches") or []
+    selected_by_repo: dict[str, dict[str, str]] = {}
+    stored_repo_names: dict[str, str] = {}
+    if isinstance(stored, dict):
+        for repo, names in stored.items():
+            if isinstance(repo, str) and isinstance(names, list):
+                selected_by_repo[repo.casefold()] = {
+                    name.casefold(): name for name in names if isinstance(name, str)
+                }
+                stored_repo_names[repo.casefold()] = repo
+
+    resolved: dict[str, list[str]] = {}
+    preview_errors: list[tuple[str, list[str]]] = []
+    selection_error: dict[str, str] | None = None
+    try:
+        resolved = resolve_patch_selection(
+            app,
+            config,
+            require_all=False,
+            allow_unresolved=True,
+            warn_unavailable=False,
+            partial_preview=True,
+            preview_errors=preview_errors,
+        )
+    except PatchListError:
+        selection_error = {
+            "code": "source_unavailable",
+            "message": "A selected patch source is unavailable.",
+        }
+    except PatchSelectionError:
+        selection_error = {
+            "code": "selection_invalid",
+            "message": "Some selected patches cannot be resolved.",
+        }
+    if preview_errors:
+        selection_error = {
+            "code": "source_unavailable",
+            "message": "A selected patch source is unavailable.",
+        }
+    resolved_selection = {
+        repo.casefold(): {name.casefold() for name in names}
+        for repo, names in resolved.items()
+    }
+
+    groups: list[dict[str, object]] = []
+    source_status: dict[str, str] = {}
+    source_by_repo: dict[str, dict] = {}
+    seen_repos: set[str] = set()
+    for source in config.get("sources", []):
+        repo = source.get("repo")
+        valid_repo = is_valid_repo(repo)
+        repo_key = repo.casefold() if valid_repo else ""
+        display_name = source.get("name") if isinstance(source.get("name"), str) else ""
+        group: dict[str, object] = {
+            "repo": repo if isinstance(repo, str) else "",
+            "source": display_name,
+            "is_base": is_base_repo(repo) if valid_repo else False,
+            "status": "invalid",
+            "patches": [],
+        }
+        catalog_records: list[dict[str, object]] = []
+        if valid_repo:
+            source_by_repo[repo_key] = source
+            if repo_key in seen_repos:
+                group["status"] = "conflict"
+            elif not source.get("active", True):
+                group["status"] = "inactive"
+            else:
+                seen_repos.add(repo_key)
+                alias = source_path_alias(repo, config.get("sources", []))
+                paths = get_source_paths(repo)
+                records: list[dict] = []
+                if alias is not None:
+                    group["status"] = "conflict"
+                elif paths[".json"].exists():
+                    try:
+                        records = get_compatible_patches(repo, package_id)
+                        group["status"] = (
+                            "available" if paths[".mpp"].is_file() else "missing"
+                        )
+                    except PatchListError:
+                        group["status"] = "unreadable"
+                else:
+                    group["status"] = "missing"
+
+                name_counts: dict[str, int] = {}
+                for patch_record in records:
+                    name = patch_record.get("name")
+                    if isinstance(name, str):
+                        folded = name.casefold()
+                        name_counts[folded] = name_counts.get(folded, 0) + 1
+                if any(count > 1 for count in name_counts.values()):
+                    group["status"] = "ambiguous"
+                catalog_records = [
+                    _grouped_patch_entry(
+                        patch_record,
+                        source,
+                        isinstance(patch_record.get("name"), str)
+                        and patch_record["name"].casefold()
+                        in resolved_selection.get(repo_key, set()),
+                    )
+                    for patch_record in records
+                ]
+
+            selected_names = selected_by_repo.get(repo_key, {})
+            represented = {
+                str(entry["name"]).casefold()
+                for entry in catalog_records
+                if isinstance(entry.get("name"), str)
+            }
+            catalog_records.extend(
+                _stored_patch_entry(
+                    selected_name,
+                    repo,
+                    display_name or repo,
+                    is_base_repo(repo),
+                    str(group["status"]),
+                )
+                for folded_name, selected_name in sorted(selected_names.items())
+                if folded_name not in represented
+            )
+            source_status[repo_key] = str(group["status"])
+        group["patches"] = catalog_records
+        groups.append(group)
+
+    for repo_key, names in selected_by_repo.items():
+        if repo_key in source_by_repo:
+            continue
+        stored_repo = stored_repo_names.get(repo_key, repo_key)
+        group = {
+            "repo": stored_repo,
+            "source": stored_repo,
+            "is_base": is_base_repo(stored_repo),
+            "status": "deleted",
+            "patches": [
+                _stored_patch_entry(
+                    name, stored_repo, stored_repo, is_base_repo(stored_repo), "deleted"
+                )
+                for name in sorted(names.values(), key=str.casefold)
+            ],
+        }
+        groups.append(group)
+        source_status[repo_key] = "deleted"
+
+    resolved_names = {
+        (repo.casefold(), name.casefold())
+        for repo, names in resolved.items()
+        for name in names
+    }
+    unresolved: list[dict[str, str | None]] = []
+    if isinstance(stored, dict):
+        for repo, names in stored.items():
+            if not isinstance(repo, str) or not isinstance(names, list):
+                continue
+            canonical = next(
+                (
+                    source["repo"]
+                    for source in config.get("sources", [])
+                    if is_valid_repo(source.get("repo"))
+                    and source["repo"].casefold() == repo.casefold()
+                ),
+                repo,
+            )
+            status = source_status.get(repo.casefold(), "deleted")
+            for name in names:
+                if (
+                    not isinstance(name, str)
+                    or (canonical.casefold(), name.casefold()) in resolved_names
+                ):
+                    continue
+                reason = (
+                    "source_unavailable"
+                    if status
+                    in {"inactive", "deleted", "missing", "unreadable", "conflict"}
+                    else "patch_unavailable"
+                )
+                unresolved.append({"repo": canonical, "name": name, "reason": reason})
+    elif isinstance(stored, list):
+        assigned = {name.casefold() for _, name in resolved_names}
+        blocked_legacy_names = {
+            name.casefold() for _, names in preview_errors for name in names
+        }
+        unresolved.extend(
+            {
+                "repo": None,
+                "name": name,
+                "reason": (
+                    "source_unavailable"
+                    if isinstance(name, str) and name.casefold() in blocked_legacy_names
+                    else "patch_unavailable"
+                ),
+            }
+            for name in stored
+            if isinstance(name, str) and name.casefold() not in assigned
+        )
+
+    has_selection = bool(stored)
+    status = (
+        "empty"
+        if not has_selection
+        else "resolved"
+        if not unresolved and selection_error is None
+        else "partial"
+    )
+    if unresolved and selection_error is None:
+        selection_error = {
+            "code": "selection_partial",
+            "message": "Some selected patches are unavailable; review the selection.",
+        }
+    return {
+        "sources": groups,
+        "selection": {
+            "stored": stored,
+            "resolved": resolved,
+            "status": status,
+            "unresolved": unresolved,
+            "error": selection_error,
+        },
+    }
+
+
 class AddAppPayload(BaseModel):
     package_id: str
     name: str
-    include_patches: List[str]
+    include_patches: Any
 
 
 @app.post("/api/ui/add_app")
@@ -802,16 +1148,138 @@ def add_app_to_config(payload: AddAppPayload) -> dict[str, str]:
     if not PACKAGE_ID_PATTERN.fullmatch(payload.package_id):
         raise HTTPException(status_code=400, detail="Invalid package id")
 
+    if not isinstance(payload.include_patches, (list, dict)):
+        raise HTTPException(status_code=400, detail="Invalid patch selection")
+
+    initially_existing = any(
+        app.get("id") == payload.package_id for app in load_config().get("apps", [])
+    )
+
     def apply(config: dict) -> None:
         existing = next(
             (a for a in config.get("apps", []) if a["id"] == payload.package_id), None
         )
+        if initially_existing and existing is None:
+            raise HTTPException(status_code=404, detail="App no longer exists")
+        includes = payload.include_patches
+        if isinstance(includes, dict):
+            canonical_sources: dict[str, dict] = {}
+            for source in config.get("sources", []):
+                repo = source.get("repo")
+                if is_valid_repo(repo):
+                    key = repo.casefold()
+                    if key in canonical_sources:
+                        raise HTTPException(400, "Invalid patch selection")
+                    canonical_sources[key] = source
+            normalized: dict[str, list[str]] = {}
+            normalized_keys: set[str] = set()
+            try:
+                for repo, names in includes.items():
+                    if not is_valid_repo(repo) or not isinstance(names, list):
+                        raise ValueError
+                    key = repo.casefold()
+                    source = canonical_sources.get(key)
+                    canonical = source["repo"] if source else repo
+                    if canonical.casefold() in normalized_keys:
+                        raise ValueError
+                    normalized_keys.add(canonical.casefold())
+                    if not all(
+                        isinstance(name, str) and name.strip() for name in names
+                    ):
+                        raise ValueError
+                    accepted: dict[str, str] = {}
+                    if source is not None and source.get("active", True):
+                        old: dict[str, str] = {}
+                        old_includes = (
+                            existing.get("include_patches", []) if existing else []
+                        )
+                        if isinstance(old_includes, dict):
+                            for old_repo, old_names in old_includes.items():
+                                if (
+                                    isinstance(old_repo, str)
+                                    and old_repo.casefold() == key
+                                    and isinstance(old_names, list)
+                                ):
+                                    old = {
+                                        n.casefold(): n
+                                        for n in old_names
+                                        if isinstance(n, str)
+                                    }
+                        try:
+                            records = get_compatible_patches(
+                                canonical, payload.package_id
+                            )
+                        except PatchListError:
+                            records = []
+                        available: dict[str, str] = {}
+                        for record in records:
+                            name = record.get("name")
+                            if isinstance(name, str):
+                                folded = name.casefold()
+                                if folded in available:
+                                    raise ValueError
+                                available[folded] = name
+                        for name in names:
+                            folded = name.casefold()
+                            canonical_name = available.get(folded)
+                            if canonical_name is None:
+                                if folded not in old:
+                                    raise ValueError
+                                canonical_name = old[folded]
+                            accepted[folded] = canonical_name
+                    else:
+                        accepted = {name.casefold(): name for name in names}
+                    normalized[canonical] = list(accepted.values())
+            except (ValueError, TypeError, AttributeError):
+                raise HTTPException(400, detail="Invalid patch selection") from None
+            newly_selected: dict[str, list[str]] = {}
+            old_includes = existing.get("include_patches", []) if existing else []
+            if isinstance(old_includes, dict):
+                old_by_repo = {
+                    repo.casefold(): {
+                        name.casefold() for name in names if isinstance(name, str)
+                    }
+                    for repo, names in old_includes.items()
+                    if isinstance(repo, str) and isinstance(names, list)
+                }
+                for repo, names in normalized.items():
+                    source = canonical_sources.get(repo.casefold())
+                    if source is None or not source.get("active", True):
+                        continue
+                    additions = [
+                        name
+                        for name in names
+                        if name.casefold()
+                        not in old_by_repo.get(repo.casefold(), set())
+                    ]
+                    if additions:
+                        newly_selected[repo] = additions
+            else:
+                for repo, names in normalized.items():
+                    source = canonical_sources.get(repo.casefold())
+                    if source is not None and source.get("active", True):
+                        newly_selected[repo] = names
+            if newly_selected:
+                try:
+                    resolve_patch_selection(
+                        {
+                            "id": payload.package_id,
+                            "name": payload.name,
+                            "include_patches": newly_selected,
+                        },
+                        config,
+                    )
+                except (PatchListError, PatchSelectionError):
+                    raise HTTPException(400, detail="Invalid patch selection") from None
+            includes = normalized
+        elif not all(isinstance(name, str) and name.strip() for name in includes):
+            raise HTTPException(400, detail="Invalid patch selection")
         new_app = {
             "id": payload.package_id,
             "name": payload.name,
             "obtainium_id": f"morphe_{payload.package_id.split('.')[-1]}",
-            "include_patches": payload.include_patches,
-            "exclude_patches": [],
+            "include_patches": includes,
+            "exclude_patches": existing.get("exclude_patches", []) if existing else [],
         }
         # Preserve state (pinned version, last build, status) when editing an app
         if existing is not None:
@@ -981,7 +1449,9 @@ def add_source(payload: AddSourcePayload) -> dict[str, str]:
     """
     repo = normalize_repo(payload.repo)
     if not repo:
-        raise HTTPException(400, "Invalid repository. Use 'owner/repo' or a GitHub URL.")
+        raise HTTPException(
+            400, "Invalid repository. Use 'owner/repo' or a GitHub URL."
+        )
 
     config = load_config()
     sources = config.get("sources", [])
@@ -1081,7 +1551,7 @@ VERSION_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+~-]{0,63}")
 async def upload_apk(
     package_id: str = Form(""),
     version_str: str = Form(""),
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
 ):
     # Sanitize version string
     safe_version = version_str.strip().replace(" ", "_")
@@ -1093,15 +1563,102 @@ async def upload_apk(
     raw_dir = DATA_DIR / "apks" / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
     file_path = raw_dir / f"{package_id}-{safe_version}.apk"
-    
-    with open(file_path, "wb") as buffer:
-        content = await file.read()
-        buffer.write(content)
-    
-    from src.patcher import extract_app_metadata
+    config = load_config()
+    app_config = next(
+        (app for app in config.get("apps", []) if app.get("id") == package_id),
+        {"id": package_id},
+    )
+    from src.patcher import (
+        AndroidVariantInspectionError,
+        AndroidVariantMetadataError,
+        _read_minimum_sdk,
+        extract_app_metadata,
+        required_minimum_sdk,
+    )
+
+    minimum_sdk = required_minimum_sdk(app_config, config)
+    staged_path = raw_dir / f".{package_id}-{safe_version}.{uuid.uuid4().hex}.tmp"
+    actual_minimum_sdk = None
+    try:
+        staged_path.write_bytes(await file.read())
+        if minimum_sdk is not None:
+            try:
+                actual_minimum_sdk = _read_minimum_sdk(
+                    config.get("settings", {}).get("java_path", "java"), staged_path
+                )
+            except (
+                AndroidVariantMetadataError,
+                AndroidVariantInspectionError,
+            ) as error:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Could not verify uploaded APK Android version",
+                ) from error
+            if actual_minimum_sdk < minimum_sdk:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Uploaded APK does not meet the required Android version",
+                )
+
+        current_config = load_config()
+        current_app = next(
+            (
+                app
+                for app in current_config.get("apps", [])
+                if app.get("id") == package_id
+            ),
+            {"id": package_id},
+        )
+        current_minimum_sdk = required_minimum_sdk(current_app, current_config)
+        if current_minimum_sdk is not None and actual_minimum_sdk is None:
+            try:
+                actual_minimum_sdk = _read_minimum_sdk(
+                    current_config.get("settings", {}).get("java_path", "java"),
+                    staged_path,
+                )
+            except (
+                AndroidVariantMetadataError,
+                AndroidVariantInspectionError,
+            ) as error:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Could not verify uploaded APK Android version",
+                ) from error
+        if (
+            current_minimum_sdk is not None
+            and actual_minimum_sdk is not None
+            and actual_minimum_sdk < current_minimum_sdk
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Uploaded APK does not meet the required Android version",
+            )
+
+        def promote_if_still_eligible(current: dict) -> None:
+            current_app = next(
+                (app for app in current.get("apps", []) if app.get("id") == package_id),
+                {"id": package_id},
+            )
+            required_now = required_minimum_sdk(current_app, current)
+            if required_now is not None and (
+                actual_minimum_sdk is None or actual_minimum_sdk < required_now
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Upload policy changed; retry with an eligible APK",
+                )
+            staged_path.replace(file_path)
+
+        update_config(promote_if_still_eligible)
+    finally:
+        staged_path.unlink(missing_ok=True)
+
     extract_app_metadata(file_path, package_id)
-        
-    return {"status": "success", "message": f"Uploaded {file.filename} as {file_path.name}"}
+
+    return {
+        "status": "success",
+        "message": f"Uploaded {file.filename} as {file_path.name}",
+    }
 
 
 @app.get("/api/ui/metadata")
@@ -1154,40 +1711,269 @@ SERVER_URL_INVALID = (
 class SaveSettingsPayload(BaseModel):
     server_url: str
     cron_schedule: str
-    notification_urls: List[str] = []
+    notification_urls: object = None
+
+
+NOTIFICATION_URLS_LOCK = threading.RLock()
+APPRISE_URLS_INVALID = "Invalid notification URLs"
+APPRISE_URLS_LOCKED = "Notification URLs are set by the environment"
+APPRISE_MIGRATION_CONFLICT = "Notification URL migration conflict"
+APPRISE_STORAGE_ERROR = "Could not store notification URLs"
+APPRISE_REQUEST_TOO_LARGE = "Notification URL request is too large"
+APPRISE_SETTINGS_REJECTED = "Notification URLs must be managed in Secrets"
+APPRISE_MIGRATION_PATH = "/api/ui/secrets/apprise-urls/migration"
+APPRISE_CREDENTIAL_FIELD = re.compile(
+    r"(?:^|_)(?:password|passwd|token|secret|credential|auth|webhook|"
+    r"api_key|access_key|private_key|client_secret)(?:$|_)",
+    re.IGNORECASE,
+)
+
+
+def _legacy_apprise_urls(config: object) -> object:
+    """Return the legacy config field as-is for comparison and migration."""
+    if not isinstance(config, dict):
+        return None
+    settings = config.get("settings", {})
+    return settings.get("notification_urls") if isinstance(settings, dict) else None
+
+
+def _valid_legacy_urls(value: object) -> tuple[str, ...] | None:
+    """Return a structurally valid legacy URL list, or None if malformed."""
+    try:
+        return secrets_store.validate_apprise_urls(value)
+    except secrets_store.InvalidSecretError:
+        return None
+
+
+def _notification_secret_status(config: object) -> dict[str, object]:
+    """Summarize URL ownership and migration state without returning values."""
+    _effective_apprise_urls(config if isinstance(config, dict) else None)
+    urls, source, valid = secrets_store.read_apprise_urls()
+    legacy = _legacy_apprise_urls(config)
+    legacy_available = isinstance(legacy, list) and bool(legacy)
+    legacy_urls = _valid_legacy_urls(legacy)
+    count = len(urls) if valid and urls is not None else 0
+    if source is None:
+        if legacy_available:
+            source = "legacy"
+            count = len(legacy) if isinstance(legacy, list) else 0
+            migration_state = "pending"
+        else:
+            migration_state = "none"
+    elif not legacy_available:
+        migration_state = "none"
+    elif source == "file" and valid and urls == legacy_urls:
+        migration_state = "retry"
+    else:
+        migration_state = "conflict"
+    return {
+        "set": source in ("environment", "file", "legacy") and count > 0,
+        "count": count,
+        "source": source,
+        "legacy_available": legacy_available,
+        "migration_state": migration_state,
+    }
+
+
+def _effective_apprise_urls(config: dict | None = None) -> tuple[str, ...]:
+    """Resolve new environment/file values before the legacy config fallback."""
+    urls, source, valid = secrets_store.read_apprise_urls()
+    if source is not None:
+        effective = urls if valid and urls is not None else ()
+    else:
+        if config is None:
+            config = load_config()
+        legacy = _valid_legacy_urls(_legacy_apprise_urls(config))
+        effective = legacy or ()
+    if effective and _apprise_urls_are_supported(effective):
+        _remember_apprise_urls(effective)
+    return effective
+
+
+def _apprise_redaction_values(urls: tuple[str, ...]) -> tuple[str, ...]:
+    """Collect only URL strings and credential-named fields from Apprise parsing."""
+    values: set[str] = set(urls)
+
+    def private_fields(fields: object, schema: object) -> set[str]:
+        if not isinstance(schema, str):
+            return set()
+        try:
+            plugin = apprise_plugins.N_MGR[schema]
+        except (KeyError, TypeError):
+            return set()
+        tokens = getattr(plugin, "template_tokens", {})
+        if not isinstance(tokens, dict) or not isinstance(fields, dict):
+            return set()
+        result: set[str] = set()
+        for token_name, metadata in tokens.items():
+            if not isinstance(metadata, dict) or not metadata.get("private"):
+                continue
+            field_name = str(metadata.get("map_to") or token_name)
+            value = fields.get(field_name)
+            if isinstance(value, str) and value:
+                result.add(value)
+            elif isinstance(value, list):
+                result.update(item for item in value if isinstance(item, str) and item)
+        return result
+
+    def collect(fields: object) -> None:
+        if isinstance(fields, dict):
+            for name, value in fields.items():
+                field_name = str(name)
+                normalized_name = re.sub(
+                    r"(?<=[a-z0-9])(?=[A-Z])", "_", field_name
+                ).replace("-", "_")
+                if APPRISE_CREDENTIAL_FIELD.search(normalized_name) or (
+                    normalized_name.lower() == "user"
+                    and isinstance(value, str)
+                    and len(value) >= 8
+                ):
+                    if isinstance(value, str) and value:
+                        values.add(value)
+                    elif isinstance(value, list):
+                        values.update(
+                            item for item in value if isinstance(item, str) and item
+                        )
+                collect(value)
+        elif isinstance(fields, list):
+            for item in fields:
+                collect(item)
+
+    for url in urls:
+        fields = apprise_plugins.url_to_dict(url, secure_logging=True)
+        if fields is not None:
+            values.update(private_fields(fields, fields.get("schema")))
+            collect(fields)
+    return tuple(sorted(values, key=len, reverse=True))
+
+
+def _remember_apprise_urls(urls: tuple[str, ...]) -> None:
+    """Publish masks from accepted URLs to all process logging threads."""
+    with secrets_store.temporary_redactions(urls):
+        values = _apprise_redaction_values(urls)
+        secrets_store.remember_apprise_masks(values)
+
+
+def _has_decoded_newline(url: str) -> bool:
+    """Reject literal or URL-encoded line separators before Apprise parsing."""
+    decoded = url
+    for _ in range(8):
+        if secrets_store.contains_line_separator(decoded):
+            return True
+        next_value = unquote(decoded)
+        if next_value == decoded:
+            return False
+        decoded = next_value
+    return secrets_store.contains_line_separator(decoded)
+
+
+def _apprise_urls_are_supported(urls: tuple[str, ...]) -> bool:
+    """Check URL syntax with Apprise locally, without sending notifications."""
+    if not urls or any(_has_decoded_newline(url) for url in urls):
+        return False
+    with secrets_store.temporary_redactions(urls):
+        try:
+            redactions = _apprise_redaction_values(urls)
+            with secrets_store.temporary_redactions(redactions):
+                apobj = apprise.Apprise()
+                for url in urls:
+                    before = len(apobj.servers)
+                    if not apobj.add(url) or len(apobj.servers) - before != 1:
+                        return False
+                return True
+        except Exception:  # noqa: BLE001 - parser failure has a fixed API error
+            return False
+
+
+def _send_apprise(urls: tuple[str, ...], title: str, message: str) -> bool:
+    """Validate and deliver under a temporary, per-thread URL redaction scope."""
+    if not _apprise_urls_are_supported(urls):
+        return False
+    redactions = _apprise_redaction_values(urls)
+    try:
+        with (
+            secrets_store.active_apprise_masks((*urls, *redactions)),
+            secrets_store.temporary_redactions((*urls, *redactions)),
+        ):
+            try:
+                apobj = apprise.Apprise()
+                for url in urls:
+                    before = len(apobj.servers)
+                    if not apobj.add(url) or len(apobj.servers) - before != 1:
+                        return False
+                secrets_store.remember_apprise_masks(redactions)
+                return bool(
+                    apobj.notify(
+                        body=secrets_store.redact(message),
+                        title=secrets_store.redact(title),
+                    )
+                )
+            except Exception as error:  # noqa: BLE001 - fixed, redacted failure
+                logger.error("Apprise notification failed: %s", _redacted(error))
+                return False
+    except secrets_store.AppriseRedactionCapacityError:
+        logger.error("Could not start notification because redaction capacity is full")
+        return False
+
+
+async def _read_apprise_urls_value(request: Request) -> tuple[str, ...]:
+    """Read a bounded URL-list payload and return fixed errors without echoing it."""
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > secrets_store.MAX_APPRISE_STORAGE_BYTES:
+        raise HTTPException(status_code=413, detail=APPRISE_REQUEST_TOO_LARGE)
+    chunks: list[bytes] = []
+    received = 0
+    async for chunk in request.stream():
+        received += len(chunk)
+        if received > secrets_store.MAX_APPRISE_STORAGE_BYTES:
+            raise HTTPException(status_code=413, detail=APPRISE_REQUEST_TOO_LARGE)
+        chunks.append(chunk)
+    try:
+        body = json.loads(b"".join(chunks))
+        value = body.get("value") if isinstance(body, dict) else None
+        urls = secrets_store.validate_apprise_urls(value)
+    except (ValueError, RecursionError, UnicodeDecodeError):
+        raise HTTPException(status_code=400, detail=APPRISE_URLS_INVALID) from None
+    if not _apprise_urls_are_supported(urls):
+        raise HTTPException(status_code=400, detail=APPRISE_URLS_INVALID)
+    return urls
+
+
+def _remove_legacy_apprise_urls(expected: object) -> None:
+    """Remove legacy URLs only if they still match the observed config value."""
+
+    def apply(config: dict) -> None:
+        settings = config.setdefault("settings", {})
+        current = settings.get("notification_urls")
+        if current != expected:
+            raise ValueError("Legacy notification URLs changed")
+        settings.pop("notification_urls", None)
+
+    update_config(apply)
 
 
 def send_notification(title: str, message: str, config=None):
     """Send a notification to the configured URLs; secret values are removed."""
     if not config:
         config = load_config()
-    
-    urls = config.get("settings", {}).get("notification_urls", [])
+
+    urls = _effective_apprise_urls(config)
     if not urls:
         return
-        
-    apobj = apprise.Apprise()
-    for url in urls:
-        apobj.add(url)
-        
-    apobj.notify(
-        body=secrets_store.redact(message),
-        title=secrets_store.redact(title),
-    )
+    _send_apprise(urls, secrets_store.redact(title), secrets_store.redact(message))
 
 
 @app.post("/api/ui/test_notification")
-def test_notification(payload: SaveSettingsPayload):
-    if not payload.notification_urls:
+def test_notification():
+    urls = _effective_apprise_urls()
+    if not urls:
         return {"status": "error", "message": "No notification URLs provided"}
-        
-    apobj = apprise.Apprise()
-    for url in payload.notification_urls:
-        apobj.add(url)
-        
-    success = apobj.notify(
-        body="This is a test notification from Morphe Builder.",
-        title="Morphe Builder Test",
+    if not _apprise_urls_are_supported(urls):
+        raise HTTPException(status_code=400, detail=APPRISE_URLS_INVALID)
+    success = _send_apprise(
+        urls,
+        "Morphe Builder Test",
+        "This is a test notification from Morphe Builder.",
     )
     return {"status": "success" if success else "error"}
 
@@ -1210,28 +1996,30 @@ def save_settings(payload: SaveSettingsPayload) -> dict[str, str]:
             `http(s)://host[:port][/prefix]`, is not empty and differs from
             the stored one; nothing is written then.
     """
-    stored = load_config().get("settings", {}).get("server_url")
-    unchanged = isinstance(stored, str) and payload.server_url.rstrip(
-        "/"
-    ) == stored.rstrip("/")
-    # A value already stored never blocks saving the other settings (the page
-    # posts all of them); only a changed value has to be valid. Empty means
-    # unset.
-    acceptable = unchanged or payload.server_url == ""
-    if not acceptable and not request_guards.is_valid_server_url(payload.server_url):
-        raise HTTPException(status_code=400, detail=SERVER_URL_INVALID)
+    if payload.notification_urls not in (None, []):
+        raise HTTPException(status_code=400, detail=APPRISE_SETTINGS_REJECTED)
+    with NOTIFICATION_URLS_LOCK:
+        stored = load_config().get("settings", {}).get("server_url")
+        unchanged = isinstance(stored, str) and payload.server_url.rstrip(
+            "/"
+        ) == stored.rstrip("/")
+        # A value already stored never blocks saving the other settings (the page
+        # posts all of them); only a changed value has to be valid. Empty means
+        # unset.
+        acceptable = unchanged or payload.server_url == ""
+        if not acceptable and not request_guards.is_valid_server_url(
+            payload.server_url
+        ):
+            raise HTTPException(status_code=400, detail=SERVER_URL_INVALID)
 
-    def apply(config: dict) -> None:
-        settings = config.setdefault("settings", {})
-        settings["server_url"] = payload.server_url.rstrip("/")
-        settings["cron_schedule"] = payload.cron_schedule
-        settings["notification_urls"] = payload.notification_urls
+        def apply(config: dict) -> None:
+            settings = config.setdefault("settings", {})
+            settings["server_url"] = payload.server_url.rstrip("/")
+            settings["cron_schedule"] = payload.cron_schedule
 
-    update_config(apply)
-    # Schedule from the file as it is now, one caller at a time, so the last
-    # scheduling call always sees the last saved settings.
-    with CRON_LOCK:
-        setup_cron_job(load_config())
+        update_config(apply)
+        with CRON_LOCK:
+            setup_cron_job(load_config())
     return {"status": "success"}
 
 
@@ -1255,13 +2043,25 @@ def _secret_status() -> dict[str, dict[str, object]]:
         raise HTTPException(
             status_code=500, detail="Could not read the secrets file"
         ) from None
-    return {
+    result: dict[str, dict[str, object]] = {
         slug: {
             "set": sources[name] in ("environment", "file"),
             "source": sources[name],
         }
         for slug, name in SECRET_SLUGS.items()
     }
+    try:
+        with NOTIFICATION_URLS_LOCK:
+            try:
+                config = load_config()
+            except yaml.YAMLError:
+                logger.warning("Could not parse config.yaml for notification status")
+                config = {}
+            result["apprise-urls"] = _notification_secret_status(config)
+    except OSError:
+        logger.error("Could not read notification URL storage")
+        raise HTTPException(status_code=500, detail=APPRISE_STORAGE_ERROR) from None
+    return result
 
 
 def _secret_name(slug: str) -> str:
@@ -1326,18 +2126,242 @@ def get_secrets():
     return _secret_status()
 
 
+def _store_apprise_urls(urls: tuple[str, ...]) -> dict[str, dict[str, object]]:
+    """Persist URLs first, then remove matching legacy values if present."""
+    with NOTIFICATION_URLS_LOCK:
+        config = load_config()
+        legacy = _legacy_apprise_urls(config)
+        try:
+            secrets_store.set_apprise_urls(list(urls))
+            _remember_apprise_urls(urls)
+        except secrets_store.InvalidAppriseFileError:
+            raise HTTPException(
+                status_code=409, detail=APPRISE_MIGRATION_CONFLICT
+            ) from None
+        except secrets_store.SecretFromEnvironmentError:
+            raise HTTPException(status_code=409, detail=APPRISE_URLS_LOCKED) from None
+        except OSError:
+            logger.error("Could not write notification URL storage")
+            raise HTTPException(status_code=500, detail=APPRISE_STORAGE_ERROR) from None
+        if isinstance(legacy, list):
+            try:
+                _remove_legacy_apprise_urls(legacy)
+            except (OSError, ValueError):
+                logger.error("Could not remove legacy notification URLs")
+                raise HTTPException(
+                    status_code=500, detail=APPRISE_STORAGE_ERROR
+                ) from None
+        return _secret_status()
+
+
+@app.put("/api/ui/secrets/apprise-urls")
+async def put_apprise_urls(request: Request) -> dict[str, dict[str, object]]:
+    """Replace the write-only notification URL list."""
+    urls = await _read_apprise_urls_value(request)
+    return _store_apprise_urls(urls)
+
+
+@app.delete("/api/ui/secrets/apprise-urls")
+def delete_apprise_urls() -> dict[str, dict[str, object]]:
+    """Clear notification URLs and remove any legacy fallback values."""
+    with NOTIFICATION_URLS_LOCK:
+        config = load_config()
+        legacy = _legacy_apprise_urls(config)
+        try:
+            # An empty owned value is a tombstone: it suppresses legacy fallback
+            # even if config cleanup cannot complete.
+            secrets_store.set_apprise_urls([])
+            _remember_apprise_urls(())
+        except secrets_store.InvalidAppriseFileError:
+            raise HTTPException(
+                status_code=409, detail=APPRISE_MIGRATION_CONFLICT
+            ) from None
+        except secrets_store.SecretFromEnvironmentError:
+            raise HTTPException(status_code=409, detail=APPRISE_URLS_LOCKED) from None
+        except OSError:
+            logger.error("Could not clear notification URL storage")
+            raise HTTPException(status_code=500, detail=APPRISE_STORAGE_ERROR) from None
+        if isinstance(legacy, list):
+            try:
+                _remove_legacy_apprise_urls(legacy)
+            except (OSError, ValueError):
+                logger.error("Could not remove legacy notification URLs")
+                raise HTTPException(
+                    status_code=500, detail=APPRISE_STORAGE_ERROR
+                ) from None
+        return _secret_status()
+
+
+@app.post(APPRISE_MIGRATION_PATH)
+def migrate_apprise_urls() -> dict[str, dict[str, object]]:
+    """Explicitly move the legacy notification list into write-only storage."""
+    with NOTIFICATION_URLS_LOCK:
+        try:
+            urls, source, valid = secrets_store.read_apprise_urls()
+            config = load_config()
+            legacy = _legacy_apprise_urls(config)
+            if source in ("environment", "environment_invalid"):
+                raise HTTPException(status_code=409, detail=APPRISE_MIGRATION_CONFLICT)
+            if source == "file_invalid":
+                raise HTTPException(status_code=409, detail=APPRISE_MIGRATION_CONFLICT)
+            if not isinstance(legacy, list):
+                return _secret_status()
+            legacy_urls = _valid_legacy_urls(legacy)
+            if legacy_urls is None or not _apprise_urls_are_supported(legacy_urls):
+                raise HTTPException(status_code=409, detail=APPRISE_MIGRATION_CONFLICT)
+            if source == "file":
+                if not valid or urls != legacy_urls:
+                    raise HTTPException(
+                        status_code=409, detail=APPRISE_MIGRATION_CONFLICT
+                    )
+                _remember_apprise_urls(legacy_urls)
+            else:
+                try:
+                    secrets_store.set_apprise_urls(list(legacy_urls))
+                    _remember_apprise_urls(legacy_urls)
+                except secrets_store.InvalidAppriseFileError:
+                    raise HTTPException(
+                        status_code=409, detail=APPRISE_MIGRATION_CONFLICT
+                    ) from None
+                except secrets_store.SecretFromEnvironmentError:
+                    raise HTTPException(
+                        status_code=409, detail=APPRISE_MIGRATION_CONFLICT
+                    ) from None
+            try:
+                _remove_legacy_apprise_urls(legacy)
+            except (OSError, ValueError):
+                logger.error(
+                    "Could not remove legacy notification URLs after migration"
+                )
+                raise HTTPException(
+                    status_code=500, detail=APPRISE_STORAGE_ERROR
+                ) from None
+            return _secret_status()
+        except HTTPException:
+            raise
+        except OSError:
+            logger.error("Could not migrate notification URL storage")
+            raise HTTPException(status_code=500, detail=APPRISE_STORAGE_ERROR) from None
+
+
+def _schedule_tools_sync(config: dict) -> None:
+    """Hand a forced tool sync, whose claim is already taken, to the scheduler.
+
+    A scheduler job, not a Starlette background task: a background task runs
+    only if the response was fully sent, and a task that never runs would leave
+    the claim held for good. No misfire limit, so a job that starts late still
+    runs and releases the claim.
+
+    Args:
+        config: The loaded config the sync works from.
+    """
+    scheduler.add_job(
+        update_tools_task,
+        id=f"token_sync_{uuid.uuid4().hex}",
+        args=[config, True, True],
+        misfire_grace_time=None,
+    )
+
+
+def _sync_after_token_change(name: str, changed: bool) -> str | None:
+    """Schedule one forced tool sync after the GitHub token changed.
+
+    The sync shows what the new token can do (`github_token_permissions`,
+    `github_token_rejected`). It shares the one-at-a-time claim of the
+    Discovery sync. Blocking (reads config.yaml); call it off the event loop.
+
+    Args:
+        name: The secret that was just written.
+        changed: Whether the stored value differs from before the write.
+
+    Returns:
+        None for any other secret. Otherwise the `X-Sync` value: "queued",
+        "already-running" (the running sync may have started with the old
+        token; nothing is queued), "not-needed" (the token did not change) or
+        "unavailable" (config.yaml unusable or the scheduler refused the job).
+    """
+    if name != secrets_store.GITHUB_TOKEN:
+        return None
+    if not changed:
+        return "not-needed"
+    # Everything that can fail runs before the claim is taken (see
+    # `sync_discovery`); a failure here must not undo the saved token.
+    try:
+        config = load_config()
+    except (OSError, yaml.YAMLError):
+        logger.error("Could not read config.yaml; no sync queued after token change")
+        return "unavailable"
+    if not isinstance(config, dict):
+        logger.error("config.yaml is not a mapping; no sync queued after token change")
+        return "unavailable"
+    if SYNC_LOCK.locked() or not _claim_tools_sync():
+        return "already-running"
+    scheduled = False
+    try:
+        _schedule_tools_sync(config)
+        scheduled = True
+    except Exception:  # the saved token must stand; the claim is released below
+        logger.exception("Could not schedule the sync after the token change")
+    finally:
+        if not scheduled:
+            _release_tools_sync()
+    return "queued" if scheduled else "unavailable"
+
+
+def _release_tools_sync() -> None:
+    """Give back a claim from `_claim_tools_sync` that no task will end."""
+    global TOOLS_UPDATING
+    with _STATE_LOCK:
+        TOOLS_UPDATING = False
+
+
+def _change_secret_and_sync(name: str, value: str | None) -> tuple[dict, str | None]:
+    """Write or clear a secret, then schedule the token sync if one is due.
+
+    Returns:
+        The new status and the `X-Sync` value (see `_sync_after_token_change`).
+
+    Raises:
+        HTTPException: As `_change_secret`; nothing is scheduled then.
+    """
+    try:
+        before = secrets_store.get_secret(name)
+    except OSError:
+        before = None  # the write below reports an unreadable file
+    status = _change_secret(name, value)
+    return status, _sync_after_token_change(name, before != value)
+
+
+def _with_sync_header(result: tuple[dict, str | None], response: Response) -> dict:
+    """Put the `X-Sync` header on `response` and return the status body."""
+    status, sync = result
+    if sync is not None:
+        response.headers["X-Sync"] = sync
+    return status
+
+
 @app.put("/api/ui/secrets/{slug}")
-async def put_secret(slug: str, request: Request):
-    """Store a secret from `{"value": "..."}`; 409 if the environment sets it."""
+async def put_secret(slug: str, request: Request, response: Response):
+    """Store a secret from `{"value": "..."}`; 409 if the environment sets it.
+
+    Changing the GitHub token also schedules one background tool sync and says
+    so in the `X-Sync` header: "queued", "already-running", "not-needed" or
+    "unavailable". The body is the secret status.
+    """
     name = _secret_name(slug)
     value = await _read_secret_value(request)
-    return await run_in_threadpool(_change_secret, name, value)
+    result = await run_in_threadpool(_change_secret_and_sync, name, value)
+    return _with_sync_header(result, response)
 
 
 @app.delete("/api/ui/secrets/{slug}")
-def delete_secret(slug: str):
-    """Remove a stored secret; 409 if the environment sets it."""
-    return _change_secret(_secret_name(slug), None)
+def delete_secret(slug: str, response: Response):
+    """Remove a stored secret; 409 if the environment sets it.
+
+    Clearing a stored GitHub token also schedules a sync (`X-Sync`, as for PUT).
+    """
+    result = _change_secret_and_sync(_secret_name(slug), None)
+    return _with_sync_header(result, response)
 
 
 class Tee(io.TextIOBase):
@@ -1417,6 +2441,7 @@ def build_task(
             sys.stdout = Tee(sys.stdout, log_file)
             try:
                 from src.patcher import run_pipeline
+
                 # Pass the persistent scraper to the pipeline
                 patched_ids = run_pipeline(package_ids, quiet=is_cron, scraper=scraper)
                 BUILD_STATUS["message"] = "Finished"
@@ -1439,6 +2464,10 @@ def build_task(
                 print(f"\n[FATAL ERROR] {message}")
                 BUILD_STATUS["message"] = f"Failed: {message}"
                 send_notification("Build Failed", f"Pipeline error: {message}")
+                from src.apkmirror_downloader import is_invalid_license_error
+
+                if is_invalid_license_error(e):
+                    raise
             finally:
                 sys.stdout = old_stdout
                 # Invalidate update cache when build finishes
@@ -1510,8 +2539,10 @@ def get_tools_status() -> dict:
 
     Returns:
         `updating`, `sync_error`, `github_token_warning`,
-        `github_token_rejected`, `diagnostics`,
-        `browser` (the worker status, including `busy_since`) and `data_dir`.
+        `github_token_rejected`, `github_token_permissions` (null, "unchecked",
+        "none", "present" or "unverifiable"), `diagnostics`, `browser` (the
+        worker status, including `busy_since`), `server_time` (epoch seconds,
+        the clock `busy_since` is measured on) and `data_dir`.
     """
     return {
         "updating": TOOLS_UPDATING,
@@ -1520,6 +2551,8 @@ def get_tools_status() -> dict:
         # masking could only remove a scope that happens to match a secret.
         "github_token_warning": github_token_warning(),
         "github_token_rejected": github_token_rejected(),
+        "github_token_permissions": github_token_permissions(),
+        "server_time": time.time(),
         "diagnostics": DIAGNOSTICS,
         "browser": SCRAPER_WORKER.status(),
         "data_dir": str(DATA_DIR),
@@ -1546,7 +2579,9 @@ def download_app_by_name(package_name: str):
     # Priority 1: Exact filename match in patched directory
     file_path = DATA_DIR / "apks" / "patched" / package_name
     if file_path.exists() and file_path.is_file():
-        return FileResponse(file_path, media_type="application/vnd.android.package-archive")
+        return FileResponse(
+            file_path, media_type="application/vnd.android.package-archive"
+        )
 
     # Clean package name to handle .apk extension if present for globbing
     base_name = package_name.replace("-patched.apk", "").replace(".apk", "")
@@ -1575,6 +2610,7 @@ def download_app_by_name(package_name: str):
     # confirm whether the requested name held a secret.
     raise HTTPException(status_code=404, detail="No patched APK found")
 
+
 @app.get("/view/{package_id}", response_class=HTMLResponse)
 async def view_app(package_id: str, request: Request):
     """Serves a minimal HTML page for Obtainium to parse."""
@@ -1582,15 +2618,20 @@ async def view_app(package_id: str, request: Request):
     # Try to find by package ID first, then fallback to obtainium_id
     app_info = next((a for a in config.get("apps", []) if a["id"] == package_id), None)
     if not app_info:
-        app_info = next((a for a in config.get("apps", []) if a.get("obtainium_id") == package_id), None)
-        
+        app_info = next(
+            (a for a in config.get("apps", []) if a.get("obtainium_id") == package_id),
+            None,
+        )
+
     if not app_info:
         return HTMLResponse("App not found in pipeline", status_code=404)
-        
+
     last_build = app_info.get("last_successful_build", {})
-    current_version = last_build.get("combined_version") or last_build.get("app_version", "Unknown")
-    
-    # Resolve the correct filename: 
+    current_version = last_build.get("combined_version") or last_build.get(
+        "app_version", "Unknown"
+    )
+
+    # Resolve the correct filename:
     # 1. Check if metadata has it
     # 2. Check if the file actually exists
     # 3. Fallback to globbing the latest on disk
@@ -1602,18 +2643,20 @@ async def view_app(package_id: str, request: Request):
             matches.sort(key=lambda x: x.stat().st_mtime, reverse=True)
             filename = matches[0].name
         else:
-            filename = f"{app_info['id']}-patched.apk" # Legacy fallback
-    
+            filename = f"{app_info['id']}-patched.apk"  # Legacy fallback
+
     patch_versions = last_build.get("patch_versions", {})
-    
+
     # Just show first few patch versions if many exist
-    patch_version_str = ", ".join([f"{repo.split('/')[-1]}:{v}" for repo, v in patch_versions.items()])
-        
+    patch_version_str = ", ".join(
+        [f"{repo.split('/')[-1]}:{v}" for repo, v in patch_versions.items()]
+    )
+
     # Build absolute URL for the download link to help some parsers
     settings = config.get("settings", {})
     base_url = settings.get("server_url", str(request.base_url).rstrip("/"))
     download_url = f"{base_url}/download/{filename}"
-        
+
     return templates.TemplateResponse(
         request=request,
         name="obtainium.html",
@@ -1621,8 +2664,8 @@ async def view_app(package_id: str, request: Request):
             "app": app_info,
             "version": current_version,
             "patch_version": patch_version_str,
-            "download_url": download_url
-        }
+            "download_url": download_url,
+        },
     )
 
 
@@ -1632,14 +2675,19 @@ def get_single_app(obtainium_id: str, request: Request):
     config = load_config()
     settings = config.get("settings", {})
     base_url = settings.get("server_url", str(request.base_url).rstrip("/"))
-    
-    app_info = next((a for a in config.get("apps", []) if a.get("obtainium_id") == obtainium_id), None)
+
+    app_info = next(
+        (a for a in config.get("apps", []) if a.get("obtainium_id") == obtainium_id),
+        None,
+    )
     if not app_info:
         raise HTTPException(status_code=404, detail="App not found")
-        
+
     last_build = app_info.get("last_successful_build", {})
-    version = last_build.get("combined_version") or last_build.get("app_version", "Unknown")
-    
+    version = last_build.get("combined_version") or last_build.get(
+        "app_version", "Unknown"
+    )
+
     # Resolve filename with fallback
     filename = last_build.get("filename")
     patched_dir = DATA_DIR / "apks" / "patched"
@@ -1654,7 +2702,7 @@ def get_single_app(obtainium_id: str, request: Request):
     # CRITICAL: Obtainium needs the 'id' to match the actual Android Package Name
     # to avoid the "could not get ID from apk" error.
     response = {
-        "id": app_info["id"], 
+        "id": app_info["id"],
         "name": app_info["name"],
         "version": version,
         "download_url": f"{base_url}/download/{filename}",
@@ -1667,13 +2715,15 @@ def get_apps(request: Request):
     config = load_config()
     settings = config.get("settings", {})
     base_url = settings.get("server_url", str(request.base_url).rstrip("/"))
-    
+
     response_data = []
     patched_dir = DATA_DIR / "apks" / "patched"
     for app_info in config.get("apps", []):
         last_build = app_info.get("last_successful_build", {})
-        version = last_build.get("combined_version") or last_build.get("app_version", "Unknown")
-        
+        version = last_build.get("combined_version") or last_build.get(
+            "app_version", "Unknown"
+        )
+
         # Resolve filename with fallback
         filename = last_build.get("filename")
         if not filename or not (patched_dir / filename).exists():
@@ -1686,7 +2736,7 @@ def get_apps(request: Request):
 
         response_data.append(
             {
-                "id": app_info["id"], # Match real package name
+                "id": app_info["id"],  # Match real package name
                 "name": app_info["name"],
                 "version": version,
                 "download_url": f"{base_url}/download/{filename}",
@@ -1716,11 +2766,18 @@ def setup_cron_job(config: dict) -> None:
     if cron:
         try:
             # For cron, we pass package_ids=None (default) and is_cron=True
-            scheduler.add_job(build_task, CronTrigger.from_crontab(cron), id="periodic_build", kwargs={"is_cron": True})
+            scheduler.add_job(
+                build_task,
+                CronTrigger.from_crontab(cron),
+                id="periodic_build",
+                kwargs={"is_cron": True},
+            )
             print(f"[Cron] Scheduled background build with: {cron}")
-            
+
             # Refresh versions every hour to keep UI up to date
-            scheduler.add_job(refresh_versions_task, CronTrigger(hour="*"), id="version_refresh")
+            scheduler.add_job(
+                refresh_versions_task, CronTrigger(hour="*"), id="version_refresh"
+            )
             print("[Cron] Scheduled hourly version cache refresh")
         except Exception as e:  # noqa: BLE001 - scheduling must not stop the app
             logger.error("Cron scheduling failed: %s", _redacted(e))
@@ -1732,24 +2789,25 @@ async def startup_event() -> None:
     global DIAGNOSTICS
     # First, before anything is started: take both secrets out of os.environ so
     # no thread, subprocess or library inherits them.
-    # NOTE: cloakbrowser reads CLOAKBROWSER_LICENSE_KEY from os.environ itself,
-    # so an environment licence key no longer reaches the browser until the
-    # browser launch passes the key explicitly (a later step).
+    # The isolated cloakbrowser cache prevents its implicit license.key lookup;
+    # configured keys are passed explicitly by the worker.
     secrets_store.absorb_environment()
     ensure_data_dirs()
+    configure_cloakbrowser_cache()
     config = load_config()
+    _effective_apprise_urls(config)
     setup_cron_job(config)
     DIAGNOSTICS = check_dependencies(config)
-    
+
     # Start the persistent scraper worker
     SCRAPER_WORKER.start()
-    
+
     cli_jar = DATA_DIR / config["tools"]["cli_jar"]
     apkeditor_jar = DATA_DIR / config["tools"]["apkeditor_jar"]
     if not cli_jar.exists() or not apkeditor_jar.exists():
         print("[Init] Tools missing, triggering initial sync...")
         update_tools_task(config)
-    
+
     scheduler.start()
     # Trigger an immediate refresh of versions in the background
     scheduler.add_job(refresh_versions_task, id="initial_version_refresh")

@@ -1,7 +1,6 @@
 """HTTP-level tests for upload, download, Obtainium lookups, settings and the UI card."""
 
 import os
-import re
 import threading
 import time
 from pathlib import Path
@@ -226,5 +225,6 @@ def test_card_does_not_interpolate_name_into_attributes():
     assert "<b>" not in html
     assert "Bob&#39;s" not in html
     assert "&lt;b&gt;" not in html
-    assert re.search(r"confirm\([^)]*pipelineApps\[0\]\.name", html)
+    assert "@click=\"deleteApp(pipelineApps[0], 'com.a')\"" in html
+    assert "if (!confirm(`Remove ${app.name}?`)) return;" in html
     assert "Bob\\u0027s" in html  # present only as JSON data

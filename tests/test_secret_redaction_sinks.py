@@ -45,7 +45,11 @@ class FakeApprise:
 
     sent: ClassVar[list[dict[str, str]]] = []
 
+    def __init__(self) -> None:
+        self.servers: list[str] = []
+
     def add(self, url):
+        self.servers.append(url)
         return True
 
     def notify(self, body, title):

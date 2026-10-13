@@ -67,7 +67,9 @@ Key constraints:
 - `config.yaml` is the only database. All changes go through
   `config_store.update_config` (in-process lock, atomic replace), which requires a
   single uvicorn worker.
-- No authentication on any endpoint.
+- No application authentication on any endpoint; deployments need network-level
+  access control and TLS for remote use. `src/request_guards.py` checks Host,
+  Origin and Fetch Metadata but is not authentication.
 
 ## Runtime Data (`DATA_DIR`)
 
@@ -77,8 +79,15 @@ gitignored.
 | Path | Contents |
 |---|---|
 | `config.yaml` | Sources, apps, settings, last successful build per app |
-| `bin/` | Tool jars, per-source `.mpp` and `.json`, `versions.json`, `version_cache.json`, `metadata.json`, `build.log` |
+| `.env` | Optional plaintext secrets file (`GITHUB_TOKEN`, `CLOAKBROWSER_LICENSE_KEY`, JSON-array `APPRISE_URLS`), atomically written with mode `0600` |
+| `bin/` | Tool jars, per-source `.mpp` and `.json`, `versions.json`, `version_cache.json`, `metadata.json`, `build.log`, isolated `cloakbrowser/` cache |
 | `apks/raw/`, `apks/patched/`, `apks/icons/` | Downloaded APKs, patched APKs, app icons |
 | `apks/.building/` | Scratch output of the patch in progress |
+
+Environment values override `.env`; startup captures and removes them from
+`os.environ`. Do not use `DATA_DIR/.env` as a shell or container environment
+file. Docker runtime variables can be passed with `-e`; see [README deployment
+guidance](README.md#runtime-environment). Cloakbrowser's cache is configured at
+`DATA_DIR/bin/cloakbrowser`, not the operator's home cache.
 
 File-level ownership of each of these is in [src/codemap.md](src/codemap.md).

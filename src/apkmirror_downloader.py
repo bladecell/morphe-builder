@@ -1,11 +1,21 @@
-import os
 import json
 import logging
+import os
+import re
 import urllib.request
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from enum import Enum
-from urllib.parse import urlencode, urlunparse, urljoin
-from cloakbrowser import launch
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlencode, urljoin, urlunparse
+
+from cloakbrowser import (  # type: ignore[import-untyped]
+    CloakBrowserLicenseError,
+    launch,
+)
+from cloakbrowser.license import (  # type: ignore[import-untyped]
+    license_error_for_code,
+)
 from playwright.sync_api import Error as PlaywrightError
 from selectolax.parser import HTMLParser, Node
 
@@ -32,6 +42,55 @@ _stdout_handler.setFormatter(
 )
 logger.addHandler(_stdout_handler)
 logger.propagate = False
+_CLOAKBROWSER_CACHE_DIR: Path | None = None
+
+
+def is_invalid_license_error(error: BaseException) -> bool:
+    """Identify cloakbrowser's specific invalid-key denial (exit code 77)."""
+    if not isinstance(error, CloakBrowserLicenseError):
+        return False
+    invalid_key_error = license_error_for_code(77)
+    return invalid_key_error is not None and str(error) == str(invalid_key_error)
+
+
+def configure_cloakbrowser_cache(cache_dir: Path) -> None:
+    """Configure cloakbrowser to use an app-owned cache with no stored key.
+
+    The supported cache-dir environment setting is configured once before any
+    browser launch. Existing `license.key` files are rejected by existence
+    check only; their contents are never read.
+
+    Raises:
+        OSError: The app-owned cache directory could not be prepared.
+        RuntimeError: The cache already contains a cloakbrowser key file.
+    """
+    global _CLOAKBROWSER_CACHE_DIR
+    cache_dir = cache_dir.resolve()
+    cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.path.lexists(cache_dir / "license.key"):
+        raise RuntimeError("Cloakbrowser cache contains an unmanaged licence key")
+    cache_dir.chmod(0o700)
+    os.environ["CLOAKBROWSER_CACHE_DIR"] = str(cache_dir)
+    _CLOAKBROWSER_CACHE_DIR = cache_dir
+
+
+def _require_isolated_cloakbrowser_cache(keyless: bool) -> None:
+    """Fail closed if cache configuration changes or a cached key appears."""
+    cache_dir = _CLOAKBROWSER_CACHE_DIR
+    if cache_dir is None or os.environ.get("CLOAKBROWSER_CACHE_DIR") != str(cache_dir):
+        raise RuntimeError("Cloakbrowser isolated cache is not configured")
+    if os.path.lexists(cache_dir / "license.key"):
+        raise RuntimeError("Cloakbrowser cache contains an unmanaged licence key")
+    if keyless and os.environ.get("CLOAKBROWSER_LICENSE_KEY", "").strip():
+        raise RuntimeError(
+            "Cloakbrowser keyless launch refused while an environment key exists"
+        )
+
+
+class LicenseFallbackError(RuntimeError):
+    """Keyless launch failed after cloakbrowser rejected the configured key."""
+
+    license_key_rejected = True
 
 
 class Arch(str, Enum):
@@ -66,6 +125,85 @@ class BundleType(str, Enum):
     APK_FILES = "apk_files"
 
 
+class AndroidVariantMetadataError(RuntimeError):
+    """A constrained APKMirror variant lacks an unambiguous Android floor."""
+
+
+class AndroidVariantInspectionError(RuntimeError):
+    """APKEditor could not execute to inspect a constrained artifact."""
+
+
+class AndroidVariantUnavailableError(RuntimeError):
+    """No APKMirror variant satisfies the requested Android API floor."""
+
+
+_ANDROID_MINIMUM_LABEL = re.compile(
+    r"\bAndroid\s+(\d+(?:\.\d+)?[LW]?)\s*(?:\+|and\s+up)",
+    re.IGNORECASE,
+)
+_ANDROID_RELEASE_APIS = {
+    "1.0": 1,
+    "1.1": 2,
+    "1.5": 3,
+    "1.6": 4,
+    "2.0": 5,
+    "2.0.1": 6,
+    "2.1": 7,
+    "2.2": 8,
+    "2.3": 9,
+    "2.3.3": 10,
+    "3.0": 11,
+    "3.1": 12,
+    "3.2": 13,
+    "4.0": 14,
+    "4.0.3": 15,
+    "4.1": 16,
+    "4.2": 17,
+    "4.3": 18,
+    "4.4": 19,
+    "4.4w": 20,
+    "5.0": 21,
+    "5.1": 22,
+    "6": 23,
+    "6.0": 23,
+    "7": 24,
+    "7.0": 24,
+    "7.1": 25,
+    "8": 26,
+    "8.0": 26,
+    "8.1": 27,
+    "9": 28,
+    "10": 29,
+    "11": 30,
+    "12": 31,
+    "12l": 32,
+    "13": 33,
+    "14": 34,
+    "15": 35,
+    "16": 36,
+}
+
+
+def _android_minimum_api(row_text: str) -> int:
+    """Convert one explicit Android lower-bound label to its API level."""
+    labels = {
+        match.group(1).lower() for match in _ANDROID_MINIMUM_LABEL.finditer(row_text)
+    }
+    if len(labels) != 1:
+        raise AndroidVariantMetadataError(
+            "Could not verify the Android version requirement for an APK variant"
+        )
+    label = next(iter(labels))
+    api_level = _ANDROID_RELEASE_APIS.get(label)
+    if api_level is None and label.endswith(".0"):
+        api_level = _ANDROID_RELEASE_APIS.get(label[:-2])
+    if api_level is None:
+        raise AndroidVariantMetadataError(
+            "Could not verify the Android version requirement for an APK variant"
+        )
+    return api_level
+
+
 @dataclass
 class AppMetadata:
     title: str
@@ -83,15 +221,53 @@ class ApkMirror_Downloader:
     BASE_URL = "https://www.apkmirror.com"
     BASE_NETLOC = "www.apkmirror.com"
 
-    def __init__(self) -> None:
-        """Launch the browser session used for all navigation."""
+    def __init__(self, license_key: str | None = None) -> None:
+        """Launch the browser session used for all navigation.
+
+        Args:
+            license_key: Effective cloakbrowser key, or None for keyless launch.
+        """
+        self._license_key = license_key
+        self.license_key_rejected = False
         self._launch()
 
     def _launch(self) -> None:
         """Start a fresh browser and open the page used for navigation."""
         logger.info("Initializing cloakbrowser context session...")
-        self.browser = launch()
-        self.page = self.browser.new_page()
+        _require_isolated_cloakbrowser_cache(self._license_key is None)
+        try:
+            self.browser, self.page = self._launch_browser(self._license_key)
+        except CloakBrowserLicenseError as error:
+            if self._license_key is None or not is_invalid_license_error(error):
+                raise
+            self.license_key_rejected = True
+            self._license_key = None
+            logger.warning(
+                "Cloakbrowser licence key rejected; launching keyless instead"
+            )
+            try:
+                self.browser, self.page = self._launch_browser(None)
+            except Exception:  # noqa: BLE001 - fallback error must not echo key data
+                raise LicenseFallbackError(
+                    "Cloakbrowser rejected the licence key and keyless launch failed"
+                ) from None
+
+    @staticmethod
+    def _launch_browser(license_key: str | None) -> tuple[Any, Any]:
+        """Launch cloakbrowser and create its first page, closing on failure."""
+        if license_key is None:
+            browser = launch()
+        else:
+            browser = launch(license_key=license_key)
+        try:
+            page = browser.new_page()
+        except Exception:
+            try:
+                browser.close()
+            except Exception:  # noqa: BLE001 - preserve the initialization error
+                logger.warning("Browser close failed after page initialization error")
+            raise
+        return browser, page
 
     def _goto(self, url: str) -> None:
         """Navigate to url, relaunching the browser once if it has died."""
@@ -112,6 +288,12 @@ class ApkMirror_Downloader:
                 logger.debug(f"Closing the dead browser failed: {close_error}")
             self._launch()
             self.page.goto(url, wait_until="domcontentloaded")
+
+    def _propagate_license_denial(self, error: Exception) -> None:
+        """Mark code-77 denial and let the worker fail the current operation."""
+        if is_invalid_license_error(error):
+            self.license_key_rejected = True
+            raise error
 
     def _build_search_url(
         self, package_name, version=None, archs=None, dpis=None, bundles=None
@@ -153,12 +335,14 @@ class ApkMirror_Downloader:
         preferred_arch=Arch.ARM64_V8A,
         preferred_dpi=Dpi.NODPI,
         prefer_bundle=False,
+        minimum_sdk: int | None = None,
     ) -> AppMetadata | None:
         url = self._build_search_url(package_name, version)
         logger.info(f"Navigating to search results endpoint for '{package_name}'...")
         try:
             self._goto(url)
         except Exception as e:
+            self._propagate_license_denial(e)
             logger.error(f"Navigation to search page failed: {e}")
             return None
 
@@ -166,7 +350,8 @@ class ApkMirror_Downloader:
             self.page.wait_for_selector(
                 ".appRow, .variants-table, .downloadButton", timeout=15000
             )
-        except Exception:
+        except Exception as error:  # noqa: BLE001 - classify license denial before fallback
+            self._propagate_license_denial(error)
             logger.error("Timeout reached. No valid target layouts loaded.")
             return None
 
@@ -197,7 +382,8 @@ class ApkMirror_Downloader:
                 self.page.wait_for_selector(
                     ".variants-table, .downloadButton", timeout=15000
                 )
-            except Exception:
+            except Exception as error:
+                self._propagate_license_denial(error)
                 logger.error("Failed to load subsequent release page components.")
                 return None
 
@@ -209,9 +395,17 @@ class ApkMirror_Downloader:
                 "Variant options table detected. Processing architectural score matching..."
             )
             variant_page_url = self._get_best_variant(
-                parser, preferred_arch, preferred_dpi, prefer_bundle
+                parser,
+                preferred_arch,
+                preferred_dpi,
+                prefer_bundle,
+                minimum_sdk=minimum_sdk,
             )
             if not variant_page_url:
+                if minimum_sdk is not None:
+                    raise AndroidVariantUnavailableError(
+                        "No APKMirror variant meets the required Android version"
+                    )
                 logger.warning(
                     "Failed to calculate an eligible architectural match variant row target link."
                 )
@@ -223,12 +417,17 @@ class ApkMirror_Downloader:
             self._goto(variant_page_url)
             try:
                 self.page.wait_for_selector(".downloadButton", timeout=15000)
-            except Exception:
+            except Exception as error:
+                self._propagate_license_denial(error)
                 logger.error("Final download button missing from layout DOM context.")
                 return None
 
             parser = HTMLParser(self.page.content())
         else:
+            if minimum_sdk is not None:
+                raise AndroidVariantMetadataError(
+                    "APKMirror did not provide Android version metadata for variants"
+                )
             logger.info(
                 "Single variant detected! Skipped variants grid directly to final download layout."
             )
@@ -314,7 +513,12 @@ class ApkMirror_Downloader:
         return None
 
     def _get_best_variant(
-        self, parser, preferred_arch, preferred_dpi, prefer_bundle
+        self,
+        parser,
+        preferred_arch,
+        preferred_dpi,
+        prefer_bundle,
+        minimum_sdk: int | None = None,
     ) -> str | None:
         variant_rows = parser.css(".variants-table .table-row")
         if not variant_rows:
@@ -328,6 +532,14 @@ class ApkMirror_Downloader:
             cells = row.css(".table-cell")
             if len(cells) < 4:
                 continue
+
+            if minimum_sdk is not None:
+                try:
+                    row_minimum_sdk = _android_minimum_api(cells[2].text(strip=True))
+                except AndroidVariantMetadataError:
+                    continue
+                if row_minimum_sdk < minimum_sdk:
+                    continue
 
             variant_cell = cells[0]
             arch_text = cells[1].text(strip=True).lower()
@@ -426,7 +638,8 @@ class ApkMirror_Downloader:
                     out_file.write(chunk)
             logger.info(f"File payload asset safely saved locally: {filename}")
             return dest_path
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - classify license denial before fallback
+            self._propagate_license_denial(e)
             logger.warning(
                 f"Standard chunk connection dropped: {e}. Falling back to browser..."
             )
@@ -441,7 +654,8 @@ class ApkMirror_Downloader:
 
             try:
                 self.page.wait_for_selector("#download-link", timeout=10000)
-            except Exception:
+            except Exception as error:
+                self._propagate_license_denial(error)
                 logger.error(
                     "Timed out waiting for direct '#download-link' to appear on the page."
                 )
@@ -488,7 +702,8 @@ class ApkMirror_Downloader:
             )
             return dest_path
 
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - classify license denial before fallback
+            self._propagate_license_denial(e)
             logger.error(f"Direct browser download extraction sequence failed: {e}")
             return None
 
@@ -500,7 +715,13 @@ class ApkMirror_Downloader:
 
 
 if __name__ == "__main__":
-    downloader = ApkMirror_Downloader()
+    from src import config_store, secrets_store
+
+    secrets_store.absorb_environment()
+    configure_cloakbrowser_cache(config_store.DATA_DIR / "bin" / "cloakbrowser")
+    downloader = ApkMirror_Downloader(
+        license_key=secrets_store.get_secret(secrets_store.CLOAKBROWSER_LICENSE_KEY)
+    )
     output_dir = "./test_downloads"
 
     try:

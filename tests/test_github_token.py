@@ -8,6 +8,7 @@ redirect handling) runs and nothing reaches the network.
 import json
 import logging
 import os
+import time
 import traceback
 from dataclasses import dataclass, field
 
@@ -912,3 +913,71 @@ def test_bounded_download_does_not_send_netrc_credentials(
     patcher._download_bounded(ASSET_URL, tmp_path / "p.json", 1024)
 
     assert transport.with_header("Authorization") == []
+
+
+# --- github_token_permissions: the state the Settings page shows ---------------
+
+
+def test_permissions_is_null_without_a_token(data_dir):
+    assert patcher.github_token_permissions() is None
+
+
+def test_permissions_is_unchecked_before_any_request(token, data_dir):
+    assert patcher.github_token_permissions() == "unchecked"
+
+
+def test_permissions_is_none_for_a_classic_token_without_scopes(
+    transport, token, tmp_path
+):
+    lookup_with_scopes(transport, "", tmp_path)
+
+    assert patcher.github_token_permissions() == "none"
+
+
+def test_permissions_is_present_for_a_classic_token_with_scopes(
+    transport, token, tmp_path
+):
+    lookup_with_scopes(transport, "repo", tmp_path)
+
+    assert patcher.github_token_permissions() == "present"
+
+
+def test_permissions_is_unverifiable_without_a_scope_header(
+    transport, token, tmp_path
+):
+    lookup_with_scopes(transport, None, tmp_path)
+
+    assert patcher.github_token_permissions() == "unverifiable"
+
+
+def test_permissions_is_unchecked_after_the_token_was_rejected(
+    transport, token, tmp_path
+):
+    transport.route(API_URL, status=401)
+
+    with pytest.raises(patcher.GitHubTokenRejectedError):
+        patcher.check_and_download_release("own/src", sync_mpp(tmp_path), force=True)
+
+    assert patcher.github_token_permissions() == "unchecked"
+
+
+def test_permissions_is_unchecked_after_the_token_was_replaced(
+    transport, token, tmp_path, monkeypatch
+):
+    lookup_with_scopes(transport, "repo", tmp_path)
+    monkeypatch.setenv(secrets_store.GITHUB_TOKEN, "ghp_anotherfaketoken987654321")
+
+    assert patcher.github_token_permissions() == "unchecked"
+
+
+def test_status_reports_permissions_and_server_time(
+    transport, token, tmp_path, data_dir
+):
+    lookup_with_scopes(transport, None, tmp_path)
+
+    body = TestClient(main.app).get("/api/ui/tools_status").json()
+
+    assert body["github_token_permissions"] == "unverifiable"
+    assert body["github_token_warning"] is None
+    assert abs(body["server_time"] - time.time()) < 5
+    assert TOKEN not in json.dumps(body)

@@ -195,8 +195,7 @@ def test_incompatible_package_fails_naming_app_and_patch(run_patch):
     with pytest.raises(patcher.PatchSelectionError) as info:
         run_patch([("a/other", True)], ["One"], [])
 
-    assert "AppX" in str(info.value)
-    assert "One" in str(info.value)
+    assert str(info.value) == "No active patch source provides every selected patch"
 
 
 def test_exclusive_flag_is_always_passed(run_patch):
@@ -230,16 +229,14 @@ def test_unknown_name_fails_before_running_cli(run_patch):
     with pytest.raises(patcher.PatchSelectionError) as info:
         run_patch([("a/only", True)], ["One", "Ghost"], [])
 
-    assert "AppX" in str(info.value)
-    assert "Ghost" in str(info.value)
-    assert "One" not in str(info.value).replace("AppX", "")
+    assert str(info.value) == "No active patch source provides every selected patch"
 
 
 def test_no_bundle_at_all_with_selection_fails(run_patch):
     with pytest.raises(patcher.PatchSelectionError) as info:
         run_patch([], ["One"], [])
 
-    assert "One" in str(info.value)
+    assert str(info.value) == "No active patch source provides every selected patch"
 
 
 def test_zero_applied_patches_fails_and_removes_output(run_patch):
@@ -248,22 +245,18 @@ def test_zero_applied_patches_fails_and_removes_output(run_patch):
     with pytest.raises(patcher.PatchSelectionError) as info:
         run_patch([("a/only", True)], ["One"], [], cli_lines=["Applying 0 patches..."])
 
-    assert "AppX" in str(info.value)
-    assert "no patch was applied" in str(info.value)
+    assert str(info.value) == "Selected patches were not applied"
     assert not run_patch.output.exists()
 
 
-def test_zero_applied_error_quotes_last_cli_lines(run_patch):
+def test_zero_applied_error_does_not_reflect_cli_lines(run_patch):
     write_bundle("a/only", ["One"])
     lines = [f"line {n}" for n in range(1, 9)]
 
     with pytest.raises(patcher.PatchSelectionError) as info:
         run_patch([("a/only", True)], ["One"], [], cli_lines=lines)
 
-    message = str(info.value)
-    assert "line 8" in message
-    assert "line 4" in message
-    assert "line 2" not in message
+    assert str(info.value) == "Selected patches were not applied"
 
 
 @pytest.mark.parametrize(

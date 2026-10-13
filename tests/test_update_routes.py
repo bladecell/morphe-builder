@@ -104,6 +104,98 @@ def test_updates_fresh_cache_is_still_served_without_a_refresh(updates_env):
     assert updates_env.calls == 2
 
 
+def test_updates_detect_selected_source_missing_from_last_build(
+    data_dir, updates_env, monkeypatch
+):
+    repo = "new/source"
+    paths = patcher.get_source_paths(repo)
+    paths[".json"].parent.mkdir(parents=True, exist_ok=True)
+    paths[".json"].write_text(
+        '{"patches": [{"name": "Patch", "compatiblePackages": {"com.a": ["1.0"]}}]}'
+    )
+    paths[".mpp"].write_bytes(b"bundle")
+    filename = "com.a-1.0-v1-hash.apk"
+    patched_dir = data_dir / "apks" / "patched"
+    patched_dir.mkdir(parents=True)
+    (patched_dir / filename).write_bytes(b"old")
+    config = {
+        "sources": [
+            {"repo": "base/source", "active": True},
+            {"repo": repo, "active": True},
+        ],
+        "apps": [
+            {
+                "id": "com.a",
+                "name": "A",
+                "version": "1.0",
+                "include_patches": {repo: ["Patch"]},
+                "last_successful_build": {
+                    "app_version": "1.0",
+                    "filename": filename,
+                    "patches": {
+                        "include": {repo: ["Patch"]},
+                        "exclude": [],
+                    },
+                    "patch_versions": {"base/source": "v1"},
+                },
+            }
+        ],
+    }
+    monkeypatch.setattr(main, "load_config", lambda: config)
+    monkeypatch.setattr(
+        patcher,
+        "get_patch_versions",
+        lambda _config: {"base/source": "v1"},
+    )
+
+    result = main.check_updates()
+
+    assert result["com.a"]["has_update"] is True
+    assert result["com.a"]["latest"] == "1.0"
+
+
+def test_reenabled_inactive_selection_diagnostic_is_independent_of_patch_presence(
+    data_dir, updates_env, monkeypatch
+):
+    repo, alias = "a-b/c", "a/b-c"
+    paths = patcher.get_source_paths(repo)
+    paths[".json"].parent.mkdir(parents=True, exist_ok=True)
+    paths[".json"].write_text(
+        '{"patches": [{"name": "Other", "compatiblePackages": {"com.a": ["1.0"]}}]}'
+    )
+    paths[".mpp"].write_bytes(b"bundle")
+    config = {
+        "sources": [
+            {"repo": repo, "active": False},
+            {"repo": alias, "active": True},
+        ],
+        "apps": [],
+        "settings": {},
+    }
+    config_store.save_config(config)
+    main.add_app_to_config(
+        main.AddAppPayload(
+            package_id="com.a",
+            name="A",
+            include_patches={repo: ["private-candidate"]},
+        )
+    )
+    config_store.update_config(
+        lambda current: current["sources"][0].update(active=True)
+    )
+    config_store.update_config(lambda current: current["apps"][0].update(version="1.0"))
+
+    absent = main._refresh_updates()["com.a"]["error"]
+    paths[".json"].write_text(
+        '{"patches": [{"name": "private-candidate", '
+        '"compatiblePackages": {"com.a": ["1.0"]}}]}'
+    )
+    present = main._refresh_updates()["com.a"]["error"]
+
+    assert absent == present
+    assert "private-candidate" not in str(absent)
+
+
 def test_updates_request_that_waited_for_the_lock_reuses_the_fresh_result(
     updates_env, monkeypatch
 ):

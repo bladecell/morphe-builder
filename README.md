@@ -5,6 +5,7 @@ Morphe Builder is an automated Android application patcher with a Web UI and Obt
 ## Features
 
 - **Automated Pipeline:** Downloads raw APKs (including bundles/XAPKs), merges them, and applies patches using [Morphe CLI](https://github.com/MorpheApp/morphe-cli).
+- **HushFacebook compatibility:** Facebook builds that select `SysAdminDoc/HushFacebook` require APKs with `minSdkVersion` 30 or higher; cached APKs and manual uploads are checked before use. This enforces the Android minimum SDK, not DEX-variant identity.
 - **Web UI:** Manage your app pipeline, discover new compatible apps from patch sources, and monitor build logs in real-time.
 - **Update Tracking:** Automatically checks for new versions of apps and patches.
 - **Obtainium Integration:** Serves an API compatible with Obtainium for easy installation and updates on Android devices.
@@ -22,6 +23,12 @@ Morphe Builder is an automated Android application patcher with a Web UI and Obt
 ### Using Docker (Recommended)
 
 The easiest way to run Morphe Builder is with Docker. All persistent data (config, APKs, and tools) is stored in the `/data` directory.
+
+The Web UI and APIs have **no application authentication**. Do not expose the
+container directly to an untrusted network. Restrict access at the network or
+reverse-proxy layer and use HTTPS; otherwise credentials submitted through the
+UI cross the network without transport encryption. The request guards are not
+an authentication system.
 
 #### 1. Use Docker Hub Image (Easiest)
 
@@ -98,6 +105,128 @@ and `THIRD_PARTY_NOTICES`.
 
 Settings are managed via `config.yaml` in the root directory or through the Web UI's Settings tab.
 
+### Runtime environment
+
+Docker accepts runtime environment variables without rebuilding the image. For
+example, export any secrets in the deployment environment and pass them through
+by name (the command does not contain their values):
+
+```bash
+docker run -d \
+  -p 8000:8000 \
+  -v "$(pwd)/data:/data" \
+  -e GITHUB_TOKEN \
+  -e CLOAKBROWSER_LICENSE_KEY \
+  -e APPRISE_URLS \
+  -e ALLOWED_HOSTS='builder.example.net,https://builder.example.net' \
+  --name morphe-builder \
+  bladecell/morphe-builder:latest
+```
+
+Omit any of `GITHUB_TOKEN`, `CLOAKBROWSER_LICENSE_KEY`, or `APPRISE_URLS` when
+not configured. `APPRISE_URLS`, when supplied, must be a JSON array of strings.
+Use a deployment secret manager or a protected host environment to supply
+values; do not put real values in shell history, compose files committed to a
+repository, or this documentation.
+
+### Secrets
+
+`GITHUB_TOKEN`, `CLOAKBROWSER_LICENSE_KEY`, and notification URLs are
+write-only secret-store entries. The Settings Secrets card exposes the token
+and licence key; notification URL management is available through
+`PUT`/`DELETE /api/ui/secrets/apprise-urls`, with an explicit legacy import at
+`POST /api/ui/secrets/apprise-urls/migration`. Status endpoints report count,
+source and migration state, never URL values; other secret statuses report
+whether a value is set and its source, never the value. Changing the
+cloakbrowser key does not start browser work; the worker reads it before its
+next scraper task. A rejected-key indicator reports the last browser result,
+not a validation of the currently saved value. Only GitHub-token changes can
+schedule a source sync.
+
+Without an environment value, the app stores secrets in `DATA_DIR/.env`
+(`./.env` for a local install, `/data/.env` in Docker). It writes this file
+atomically with mode `0600`; notification URLs are stored as a JSON array under
+`APPRISE_URLS`. The file is plaintext, so protect the data directory and
+its backups. Do not configure this application file as Docker `--env-file`,
+Compose `env_file`, `uvicorn --env-file`, or `source` it in a shell. At startup
+the app absorbs environment values into memory and removes them from its process
+environment. Environment values take precedence over file values and cannot be
+changed through the UI. An invalid environment value is ignored, reported as
+invalid, and does **not** fall back to the file.
+
+The GitHub token is sent only as an authorization header to `api.github.com`;
+it is not used for APKMirror or passed to child processes. Prefer a token with
+no permissions: patch bundles run in subprocesses and can otherwise gain access
+to permissions held by the token. GitHub's scope header can report permissions
+for classic tokens; fine-grained and GitHub App token permissions are not
+verifiable by this status check.
+
+Cloakbrowser receives a configured licence key explicitly at browser launch.
+The app isolates its cache at `DATA_DIR/bin/cloakbrowser` so a key cached in the
+operator's default `~/.cloakbrowser` is not selected implicitly. If the
+app-owned cache contains `license.key`, startup refuses to use it; the app does
+not delete the file. Point the operator to back up/remove it deliberately before
+restarting. The isolated cache may need to download a browser binary again.
+Only an invalid-key code-77 denial falls back to keyless mode. A later code-77
+denial fails the current task; subsequent tasks use keyless mode until the
+configured key changes. Other licence failures do not trigger keyless fallback.
+
+### Host and reverse-proxy checks
+
+`ALLOWED_HOSTS` is a comma-separated list. A bare name such as
+`builder.example.net` permits that HTTP `Host` name. It does not add a separate
+Origin trust entry, though the normal same-host/same-port Origin check still
+applies. A full origin such as `https://builder.example.net` permits the
+matching host and that exact Origin (including scheme and port). Once a
+full-origin entry is present, `settings.server_url` is not a trust anchor;
+configure the full public origin explicitly. With `ALLOWED_HOSTS` unset, the
+configured `settings.server_url` continues to provide the host/origin trust
+anchor.
+
+Pass the original `Host` header through the reverse proxy (nginx example:
+`proxy_set_header Host $host;`; Caddy and Traefik do this by default). The app
+does not trust `X-Forwarded-Host`. For a TLS-terminating proxy, list the public
+HTTPS origin, as in the Docker example. `ALLOWED_HOSTS` helps reject unexpected
+Host/Origin requests; it does not replace TLS, network access controls, or
+authentication at the proxy.
+
+## Patch selection API
+
+`GET /api/ui/patches/{package_id}` keeps its legacy flat-list response by default.
+The UI opts into source groups with `?format=grouped`; the catalog reports source
+repo identity, patch entries and stored/resolved/unresolved selection state. A
+partially unreadable catalog returns HTTP 200 with per-source status and fixed
+selection messages. Unsupported `format` values return HTTP 400. An unreadable
+selected source may instead produce HTTP 502 with a fixed error.
+
+`POST /api/ui/add_app` accepts `include_patches` as either the legacy flat list
+or a repo-to-patch-name mapping. Flat lists remain flat and resolve duplicate
+names by the first active provider in config order. Mapping saves are full
+replacements: omitted entries are removed, so the UI includes retained inactive
+or deleted-source selections until the operator explicitly removes them. An
+existing app's exclusions are preserved when omitted from the request. Invalid
+or newly unresolvable active selections return HTTP 400 with
+`{"detail":"Invalid patch selection"}`. These unauthenticated UI endpoints
+have no API scopes or documented rate limit; protect access at the network or
+reverse-proxy layer as described above.
+
+Example mapped save:
+
+```json
+{
+  "package_id": "com.example.app",
+  "name": "Example",
+  "include_patches": {
+    "owner/patches": ["Patch A", "Patch B"]
+  }
+}
+```
+
+An inactive/deleted source or unchanged stale selection is retained and shown
+for explicit cleanup; builds warn and skip unavailable mappings and may fail if
+no applicable source remains. A partial catalog is not a guarantee that every
+patch was loaded.
+
 ## Obtainium Setup
 
 To add an app to Obtainium:
@@ -107,5 +236,3 @@ To add an app to Obtainium:
 
 Alternatively, add the following URL to Obtainium:
 `http://<your-server-ip>:8000/api/apps/<obtainium_id>`
-
-

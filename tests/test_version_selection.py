@@ -16,6 +16,7 @@ def write_source(repo: str, patch_name: str, versions: list[str]) -> None:
     path = patcher.get_source_paths(repo)[".json"]
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"patches": [patch]}))
+    path.with_suffix(".mpp").write_bytes(b"bundle")
 
 
 def pick(config: dict) -> list[str]:
@@ -36,7 +37,7 @@ def test_base_source_recognised_by_repo_not_display_name(data_dir):
     assert pick(config) == ["3.0"]
 
 
-def test_base_source_with_no_selected_patch_still_provides(data_dir):
+def test_only_sources_with_a_selected_patch_provide_versions(data_dir):
     write_source(BASE_REPO, "base-patch", ["1.0", "2.0"])
     write_source("other/patches", "other-patch", ["2.0", "3.0"])
     config = {
@@ -47,7 +48,7 @@ def test_base_source_with_no_selected_patch_still_provides(data_dir):
         "apps": [{"id": "com.app", "include_patches": ["other-patch"]}],
     }
 
-    assert pick(config) == ["2.0"]
+    assert pick(config) == ["3.0"]
 
 
 _SCRIPT = """
@@ -63,6 +64,7 @@ for index, name in enumerate(names):
     path.parent.mkdir(parents=True, exist_ok=True)
     patch = {"name": f"p{index}", "compatiblePackages": {"com.app": [f"{index}.0"]}}
     path.write_text(json.dumps([patch]))
+    path.with_suffix(".mpp").write_bytes(b"bundle")
     sources.append({"name": name, "repo": repo, "active": True})
 config = {
     "sources": sources,

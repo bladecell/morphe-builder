@@ -200,7 +200,7 @@ def test_dialog_route_still_lists_a_healthy_source(data_dir):
     assert [p["name"] for p in patches] == ["one"]
 
 
-def test_dialog_script_shows_the_error_instead_of_reading_it_as_patches():
+def test_dialog_checks_patch_response_before_parsing_grouped_catalog():
     template = main.templates.get_template("index.html")
     html = template.render(
         config=make_config(), available_apps=[], metadata={}, request=None
@@ -210,7 +210,10 @@ def test_dialog_script_shows_the_error_instead_of_reading_it_as_patches():
         start = html.index(opener)
         body = html[start : html.index("async ", start + 10)]
         assert "response.ok" in body
-        assert body.index("response.ok") < body.index("data.map")
+        assert body.index("response.ok") < body.index("response.json()")
+        assert body.index("response.json()") < body.index("initializePatchCatalog(data")
+        assert "const error = await this.responseDetail(response" in body
+        assert "this.patchError = error" in body
 
 
 # --- malformed entries that used to escape as a TypeError --------------------

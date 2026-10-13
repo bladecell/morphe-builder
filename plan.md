@@ -1,5 +1,18 @@
 # Plan
 
+## HushFacebook Android minimum SDK floor (2026-10-11)
+
+- [x] Apply API-30 eligibility only to Facebook builds with a resolved selected
+      HushFacebook patch provider; leave unrelated builds unchanged.
+- [x] Filter explicit APKMirror Android lower-bound labels before variant scoring;
+      validate cached, downloaded and uploaded artifacts before acceptance.
+- [x] Stage constrained downloads/uploads and atomically promote only after validation.
+- [x] Include the requirement in build freshness identity so old outputs rebuild.
+- [x] Synthetic HTML and mocked APKEditor-output tests cover selection and failure.
+- [x] APKEditor 1.4.9 returned `[{'MinSdkVersion': 28}]` on two cached Facebook
+      APKs; the read-only inspector integration test validates this JSON shape.
+- [ ] Validate a positive API-30 artifact through a complete real build and upload.
+
 Master plan for stabilising Morphe Builder. Comes out of the code review done on
 2026-10-01. Line references are to the working tree at that date.
 
@@ -14,7 +27,9 @@ Master plan for stabilising Morphe Builder. Comes out of the code review done on
 - [ ] A browser task that hangs forever still blocks the worker (no watchdog)
 - [x] Bump cloakbrowser 0.3.31 -> 0.5.12, keyless (done 2026-10-05; not yet run
       with a real browser or in Docker)
-- [ ] Use a cloakbrowser licence key when one is set in Settings (see step 5)
+- [x] Pass the effective cloakbrowser licence key explicitly; code-77 rejection
+      falls back keyless; worker relaunches at task boundaries on key change
+      (step 5; no real key/browser validation)
 - [ ] Find out why the page crashes inside the container (memory limit, `docker stats`)
 - [ ] Verify a full build (download + patch) and a run inside Docker (see step 7)
 
@@ -70,7 +85,7 @@ against a live server or inside Docker.
 
 ## 4. Other bugs from the review
 
-- [ ] Patches hidden across sources: dedup is by name only (decided 2026-10-05: the
+- [x] Patches hidden across sources: dedup is by name only (decided 2026-10-05: the
       saved selection carries the source of each patch; design under investigation)
 - [x] Obtainium misses patch updates: version string always uses the Morphe tag
       (now `<app version>-<patch tag>-<hash>` over the sources used and the selection)
@@ -100,9 +115,9 @@ against a live server or inside Docker.
 - [x] A corrupt patch JSON silently dropped that source in `get_supported_versions`
       (now `PatchListError`: error on the app's card, previous APK kept, 502 in the
       patch dialog; downloads are atomic)
-- [ ] One unreadable patch list stops every unpinned app and the patch dialog for
-      every app; narrow it to the apps that use the source once the selection names
-      its source
+- [x] One unreadable patch list stops every unpinned app and the patch dialog for
+       every app; narrow it to the apps that use the source once the selection names
+       its source
 - [x] A sync did not repair an unreadable patch list (now downloaded again on any
       sync; a list that is still unreadable afterwards is not reported as an update)
 - [x] `patch_app` passed all bundles before all `-e`/`-d` selectors (fixed
@@ -186,15 +201,18 @@ with a token the limit is 5,000 per hour.
 
 ## 7. Docker end-to-end test
 
-Added 2026-10-02 on request. Blocked on the development machine: no container runtime
-is installed (`docker`, `podman`). Run it before the next deploy; the build-path
-changes of steps 3 and 4 are so far covered only by tests with the patcher faked.
+Added 2026-10-02 on request. Docker validation started 2026-10-12 using the current
+worktree, a scoped build context, a loopback-only test container and a fresh named
+data volume. Startup and persistence checks passed. The real Facebook/HushFacebook
+build stopped before APK download; an isolated search probe reproduced APKMirror
+HTTP 403 with a Cloudflare verification page. Patching and artifact checks remain
+unverified; no production data or credentials were used.
 
-- [ ] Get a runtime: install Docker or Podman here, or run the test on the machine
-      that hosts the container
-- [ ] `docker build` succeeds and the image starts; scraper worker and tool sync come
-      up, Java and Scraper show green
-- [ ] `/data` mounted as a directory: `config.yaml` is created and survives a restart
+- [x] Docker daemon available to the development session (2026-10-12)
+- [x] `docker build` succeeds and the image starts; Java and scraper worker/browser
+      diagnostics report available; source sync works (2026-10-12)
+- [x] Fresh named volume mounted at `/data`: config creation and safe settings
+      persistence across restart verified (2026-10-12)
 - [ ] One real build through the API: download from APKMirror, patch with
       `morphe-cli`, APK lands in `apks/patched/` as
       `<pkg>-<version>-<tag>-<hash>.apk`, `apks/.building/` is empty afterwards
@@ -205,6 +223,13 @@ changes of steps 3 and 4 are so far covered only by tests with the patcher faked
 - [ ] A failing patch leaves the previous APK served
 - [ ] Add the result to Obtainium and confirm it offers the rebuilt APK as an update
 - [ ] Watch `docker stats` during the build to pin down the page crash (step 1)
+
+2026-10-12: UI/API/static smoke checks passed; unknown app/view/download requests
+returned 404. During the blocked build attempt, three `docker stats` samples showed
+observed maxima of 69.37% CPU and 631,242,752 bytes memory, not a complete-build
+peak. Test container `morphe-builder-check-20261012` is stopped; image
+`morphe-builder-check:20261012` and volume `morphe-builder-check-data-20261012` remain
+for inspection. No cleanup of existing Docker resources was performed.
 
 ## 8. Secrets, request guards, cloakbrowser key
 
@@ -231,13 +256,23 @@ branch `secrets-guards-worker`.
       `main`: stylesheet built ahead of time with the Tailwind
       3.4.17 standalone CLI and committed, Alpine 3.17.4 vendored, both served
       from `/static`; independently reviewed; not checked in a browser)
-- [ ] Step 4: Settings UI for both secrets, with the `environment_invalid` state
-      and the token-permissions warning
-- [ ] Step 5: licence key passed to the browser explicitly; keyless fallback when
-      rejected; relaunch on a key change; security review afterwards
-- [ ] Step 6: docs (README: `ALLOWED_HOSTS`, proxy must pass `Host`, both
-      variables, zero-permission token; codemaps; `architecture.md`)
-- [ ] Step 7: upload keeps the metadata when the icon is missing
+- [x] Step 4 backend: write-only Apprise URL secret storage, explicit legacy
+      migration, status metadata, effective test notification routing and log
+      redaction; write-only Settings editor and migration controls implemented.
+      Independent security review completed; representative worker-thread masking
+      and startup observers tested with delivery stubbed, not live transports.
+- [x] Step 5 code: isolated app-owned cloakbrowser cache, explicit effective
+      key, code-77 fallback (including post-handshake), task-boundary relaunch
+      on key change, safe rejection status; selector/static fallback, metadata,
+      version-refresh and build-task catches preserve late denials for worker
+      cleanup. Mocked regression coverage added; licence-key field is documented
+      in the later Settings UI decision.
+- [ ] Validate with a real licence key and browser; no real key used
+- [x] Independent static security review of corrected late-denial paths
+- [x] Step 6: document runtime secrets, untrusted-network/TLS limits,
+      `ALLOWED_HOSTS` and original-Host proxy requirements in README and
+      architecture; refresh root/backend codemaps.
+- [x] Step 7: upload keeps extracted metadata when icon lookup/download fails
 
 ## 9. Per-source patch selection
 
@@ -248,8 +283,9 @@ Approved 2026-10-05; design in `decisions.md`.
 - [ ] Step 2: backend reads both selection shapes; bare names resolved at build
       time; a source is a provider only when its own patches are selected; narrow
       "one unreadable list blocks every app"
-- [ ] Step 3: API and dialog per source, tabs keyed by repo, mapping saved and
-      validated
+- [x] Step 3: opt-in grouped API and source-aware dialog, repo-keyed mapping save
+      and validation (2026-10-10; code/security/UI async-guard reviews resolved).
+- [ ] Real `morphe-cli`/production and deployment E2E validation remain outstanding.
 
 ## 10. Verify with real tools
 
@@ -264,3 +300,8 @@ without a token in a scratch folder.
 - [ ] Browser check of the UI changes
 - [ ] Reverse proxy with the full origin in `ALLOWED_HOSTS`
 - [ ] Docker end-to-end test (section 7)
+
+## 11. Migrate the admin UI to shadcn
+
+Cancelled 2026-10-10 on request. Keep the existing frontend stack and improve the
+current UI instead; no framework migration or new component dependencies.

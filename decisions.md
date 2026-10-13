@@ -1,5 +1,20 @@
 # Decisions
 
+## 2026-10-11: HushFacebook requires Android API 30 artifacts
+
+Approved policy: constrain `com.facebook.katana` builds only when resolved,
+selected providers include `SysAdminDoc/HushFacebook`, matching repository
+identity case-insensitively. Filter APKMirror variants by the row's Android
+minimum-version label before existing architecture/DPI/bundle scoring, then
+verify the downloaded or cached APK's manifest `minSdkVersion` with APKEditor.
+Uploads use staged validation and atomic replacement, with the current source
+policy rechecked under the config write lock. Builds patch a private copy of the
+exact APK they inspected, rather than rereading the mutable raw-cache path.
+Missing or ambiguous variant metadata and uninspectable artifacts fail closed;
+cached inspection failures do not trigger silent redownload. Other apps retain
+legacy behavior. This validates the minimum SDK floor, not DEX-variant identity
+or complete patch compatibility.
+
 Record of important choices and why they were made.
 
 ## 2026-10-01: Relaunch the whole browser on any crash, not just the page
@@ -311,6 +326,20 @@ The stored format of the selection in `config.yaml` changes.
 - An app saved in the new shape rebuilds once and gets a new version string.
 - The grouping fix can change what existing multi-source builds produce.
 
+## 2026-10-10: Backend implementation of per-source selection (step 2)
+
+The approved shape and compatibility rules above are implemented in the backend;
+step 3's public API and dialog contract remain unchanged. Mapped selections for
+deleted or inactive sources remain stored and are warned/skipped, but a mapping
+with no applicable source fails before version lookup or APK download. Active
+providers whose repo names alias the same local source files are rejected when
+relevant to the selection; unrelated aliases do not block other mapped apps.
+Legacy lists are not rewritten. Version recommendations use selected source
+providers, aggregating the existing full compatible-version set per provider.
+
+Local pytest and static checks are recorded in `todo.md`. No real morphe-cli,
+live service, or browser validation was performed; independent review is pending.
+
 ## 2026-10-05: GitHub token is set through a Settings field that writes to `.env`
 
 Decided by the user, for plan step 5. The token is never stored in `config.yaml`,
@@ -344,7 +373,8 @@ GitHub for that source despite the 6-hour throttle.
 Decided by the user, for the GitHub token and the cloakbrowser licence key.
 
 - A new module `src/secrets_store.py` reads and writes `DATA_DIR/.env` (mode 0600,
-  atomic). Only `GITHUB_TOKEN` and `CLOAKBROWSER_LICENSE_KEY` are read from it.
+  atomic). GitHub and cloakbrowser values use the existing validated secret
+  reader; `APPRISE_URLS` uses its bounded JSON-array reader.
   Values are never copied into the process environment.
 - Routes separate from "Save Settings": `GET /api/ui/secrets` returns only set /
   not set and the source; `PUT` and `DELETE /api/ui/secrets/{name}` set and clear.
@@ -360,12 +390,25 @@ Decided by the user, for the GitHub token and the cloakbrowser licence key.
 - CORS is tightened from `*` to same-origin. With `*`, any web page the user
   visits could overwrite or clear the secrets. This changes the 2026-10-05 "CORS
   left as is" note; the app still has no authentication.
-- The upload route's lost-metadata bug (missing icon) is fixed in the same work.
+- The upload route's lost-metadata bug (missing icon) was identified for follow-up;
+  fixed 2026-10-10 as described below.
 
 Known limits: the secret crosses the network in cleartext unless the app is
 behind TLS; anyone on the network can overwrite or clear a secret that is not set
 in the environment, but cannot read one back. Nothing with a real licence key
 has been verified.
+
+## 2026-10-10: Optional icon retrieval does not gate APK metadata
+
+`extract_app_metadata` persists APKEditor name/version metadata independently of
+optional APKMirror icon lookup/download. An icon miss or retrieval failure is
+non-fatal. Icon downloads use a unique temporary path and are promoted with
+`os.replace` only after success, so a partial file cannot block a retry; an
+existing icon is left untouched. Cloakbrowser code-77 license denials still
+propagate so the worker can reject the current task and recover.
+The upload filename continues to use the submitted version; metadata continues
+to use the APK's extracted version. Reason: failure to retrieve a display asset
+must not discard valid metadata from a successfully inspected APK.
 
 ## 2026-10-05: Selectors follow their bundle; one forced rebuild; empty builds fail
 
@@ -524,8 +567,24 @@ Decided by the user after three independent reviews of the branch.
   kept up to 32. A refused or failed write adds nothing.
 - Error texts and the build log no longer contain request input. Reason: masked
   output showed whether the input was a known secret.
-- Later, with the Settings UI: Apprise notification URLs handled as secrets, and
-  "permissions cannot be verified" for fine-grained tokens.
+- Apprise URL handling is implemented separately as a write-only secret list in
+  `APPRISE_URLS`; legacy `config.yaml` values remain runtime fallback until
+  explicit migration or a secret-list mutation persists and removes them.
+
+## 2026-10-10: Apprise destinations are write-only secrets
+
+- Store a bounded JSON array as `APPRISE_URLS` in environment or `.env`, with
+  environment ownership taking precedence even when invalid.
+- Import legacy config only on explicit migration. Never overwrite a different
+  file value; after a successful secret write, cleanup failures leave that
+  secret authoritative for retry.
+- URL mutation and migration share a coordinator lock. The UI page omits legacy
+  URL values; test notifications use the effective stored list and never accept
+  destinations from the request body.
+- Validate supported URLs locally with Apprise and temporarily mask URL and
+  credential components around parser/delivery logging; do not register refused
+  request values as process-lifetime secrets.
+- The existing Settings Secrets UI does not yet edit notification URLs.
 
 ## 2026-10-06: The page loads nothing from a third party
 
@@ -550,3 +609,115 @@ CDNs or vendoring the in-browser Tailwind script.
   sends no cache header for static files.
 - A missing stylesheet is logged and the page still renders, unstyled.
 - Licences are in `THIRD_PARTY_NOTICES`.
+
+## 2026-10-07: Settings UI for the GitHub token
+
+Decided by the user: state field for fine-grained tokens, automatic sync after a
+token change, real-token trial after this step. The rest are the recommendations.
+
+- A Secrets card in the Settings tab with its own buttons, independent of Save
+  Settings. Status is fetched from `GET /api/ui/secrets`, never rendered into
+  the page. Errors show inline, not in `alert()`. The typed value is kept on a
+  failed write except 409, and cleared when leaving the tab.
+- The licence key has no field until it reaches the browser (plan section 8,
+  step 5). A "Set" badge for a key that does nothing would mislead.
+- `tools_status` gains `github_token_permissions` (`none`, `present`,
+  `unverifiable`, `unchecked`, null when no token) and `server_time`.
+  `unverifiable` also covers GitHub App tokens, so the wording is generic.
+  Not verified against a real token.
+- Saving or clearing the token queues one forced sync through the scheduler, as
+  `trigger_build` does. The answer carries `X-Sync`: `queued`,
+  `already-running`, `not-needed` or `unavailable`; the card's message follows
+  it. A header, not a body key, so the slug-keyed body is unchanged. A sync that
+  is already running is not re-run.
+- The Scraper pill is amber for starting and stopping. A task running over 10
+  minutes shows a note. The Settings tab shows a dot for a rejected token (red)
+  or a warning (amber).
+- `refreshDiscovery` and `checkToolsStatus` check `response.ok`; before, a
+  refused sync left the Discovery list undefined.
+- At the time, left for later: Apprise URLs as secrets (still rendered into the page), moving
+  `sync_discovery` to the scheduler (a skipped background task can leave its
+  claim held), a follow-up sync when one is already running.
+
+## 2026-10-08: Pass cloakbrowser key explicitly and downgrade only code 77
+
+- The downloader passes a configured effective key as `launch(license_key=...)`
+  and omits that argument when unset. Cloakbrowser 0.5.12 maps exit code 77 to
+  its invalid/expired/missing-key message; only that specific error retries
+  keyless. Seat exhaustion (76), verification failure (78), and local
+  configuration failure (79) remain launch failures.
+- The scraper worker compares the effective key before each task, closes the
+  old downloader and launches with the new key before dispatch. Browser status
+  exposes only `license_key_rejected`, never the key. A late code-77 denial
+  closes the browser and fails that task; later tasks launch keyless until the
+  effective configured key changes.
+- Code-77 denials encountered by `search()` or `download_file()` are marked on
+  the downloader and re-raised through their ordinary error handling; version
+  lookup and pipeline catches also re-raise code 77 so `ScraperWorker` can close
+  the browser and fail the task. The release/variant/download selectors,
+  static-download fallback, `extract_app_metadata`, and build task boundary also
+  preserve the denial. The version-refresh task retains its existing degraded
+  error response after the worker closes the browser. Failed keyless relaunches
+  retain rejection status through cooldown. Mocked regression tests cover these
+  paths; no live browser validation was performed.
+- At process startup, `CLOAKBROWSER_CACHE_DIR` is set to the app-owned
+  `DATA_DIR/bin/cloakbrowser` cache. This prevents cloakbrowser from finding a
+  key in the operator's default `~/.cloakbrowser/license.key`; startup and each
+  launch refuse an unmanaged `license.key` in the app cache without reading it.
+  This bypasses the Docker build-time default cache and can require a fresh
+  binary download. The existing app cache must be cleared manually if it
+  contains that file. Keyless launch also fails closed if a
+  `CLOAKBROWSER_LICENSE_KEY` environment value reappears after startup.
+- No licence UI until integration is usable. Mocked tests only; no real key or
+  browser validation has been performed.
+- Final corrective validation: `uv run pytest -q` passed 1528 tests with 1
+  expected failure; focused Ruff, formatting and diff checks passed. Full
+  `mypy src tests scripts` reports 9 pre-existing issues outside the new licence
+  test (missing YAML/APScheduler stubs, one annotation, and one test request
+  type mismatch). No type errors remain in `tests/test_cloakbrowser_license.py`.
+  Independent static security review is complete; live browser/key validation is
+  still outstanding.
+
+## 2026-10-10: Operator documentation for secrets and request trust
+
+- Document deployment through runtime environment variables without baking
+  values into the image or examples. `DATA_DIR/.env` is described as plaintext,
+  mode `0600`, and must not be sourced or loaded as a process environment file.
+- Document no application authentication, trusted-network/TLS requirements,
+  `ALLOWED_HOSTS` bare-host versus full-origin behavior, and preserving Host at
+  the reverse proxy. Refresh root/backend maps for `.env`, the app-owned browser
+  cache and request/secret modules.
+- State the implemented token limitations, no licence-key UI, and key-77-only
+  fallback/task recovery; do not imply live browser validation.
+- Cross-check documentation examples and local links against the implementation;
+  Docker command syntax and `git diff --check` pass. This was documentation-only,
+  so no test suite was run.
+
+## 2026-10-10: Cloakbrowser licence-key Settings field
+
+- Add the existing `cloakbrowser-license-key` secret to the generic Secrets card;
+  keep environment ownership, invalid-environment state, password input, and
+  inline failure behavior shared with the GitHub-token field.
+- A saved value means stored/configured, not validated or currently active. Show
+  `browser.license_key_rejected` only as the distinct last browser result. The
+  worker applies changed keys before its next scraper task; saving does not
+  trigger a browser call, build, or GitHub sync. Only GitHub-token writes use
+  `X-Sync`.
+- Keep API routes and response shapes unchanged; secret values remain absent
+  from rendered HTML and status responses.
+
+## 2026-10-10: Per-source selection API and UI contract
+
+- Keep the default patch GET and legacy flat-list POST behavior; grouped GET is
+  opt-in. New UI saves use repo-keyed mappings as full replacements. Omitted
+  exclusions remain preserved by the backend.
+- Repo is source identity. Legacy duplicate names resolve to the first active
+  provider in config order; mapped selections distinguish same-name patches.
+- Retain and display inactive/deleted selections until explicitly removed.
+  Builds warn and skip unavailable mappings, and can fail if no applicable
+  source remains. A partial catalog reports source errors rather than hiding
+  healthy groups.
+- Step 3 UI request-ownership fix is documented as implementation, not a new
+  API contract or architecture decision. Review findings were resolved. The
+  recorded full-suite result is 1684 passed, 1 xfailed; real CLI, production,
+  and deployment E2E remain unverified.
