@@ -49,12 +49,15 @@ class _AssetTags(HTMLParser):
         super().__init__()
         self.scripts: list[str] = []
         self.links: list[str] = []
+        self.preloads: list[str] = []
         self.images: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         values = dict(attrs)
         if tag == "script" and values.get("src"):
             self.scripts.append(values["src"] or "")
+        elif tag == "link" and values.get("rel") == "preload":
+            self.preloads.append(values["href"] or "")
         elif tag == "link" and values.get("href"):
             self.links.append(values["href"] or "")
         elif tag == "img" and values.get("src"):
@@ -85,6 +88,7 @@ def test_page_links_the_stylesheet_with_its_content_token_and_alpine_by_version(
 
     assert tags.links == [main.asset_url("app.css")]
     assert tags.scripts == ["/static/alpine-3.17.4.min.js"]
+    assert tags.preloads == ["/static/fonts/space-grotesk-latin-700-normal.woff2"]
 
 
 # --- serving ------------------------------------------------------------------------
@@ -223,17 +227,17 @@ def test_stylesheet_url_changes_when_the_file_bytes_change(tmp_path, monkeypatch
     assert third == first
 
 
-def test_admin_ui_keeps_glass_to_header_and_dialog_surfaces():
+def test_admin_ui_surfaces_are_flat_and_follow_the_system_theme():
     html = INDEX.read_text()
     stylesheet = STYLESHEET.read_text()
 
-    assert html.count('class="glass-surface ') == 3
-    assert "backdrop-blur" not in html
+    assert "glass-surface" not in html and "glass-surface" not in stylesheet
+    assert "backdrop-filter" not in stylesheet and "backdrop-blur" not in html
     assert "purple" not in html and "pink" not in html
-    assert "glass-surface" in stylesheet
-    assert "@supports not ((-webkit-backdrop-filter:blur(1px)) or" in stylesheet
+    assert '<html lang="en">' in html
+    assert "@media (prefers-color-scheme:dark)" in stylesheet
     assert "@media (prefers-reduced-motion:reduce)" in stylesheet
-    assert ":focus-visible{outline:2px" in stylesheet
+    assert ":focus-visible{outline:3px" in stylesheet
 
 
 def test_admin_ui_style_tokens_keep_controls_tappable_and_radii_compact():
@@ -242,14 +246,10 @@ def test_admin_ui_style_tokens_keep_controls_tappable_and_radii_compact():
     assert "--tap-target:44px" in stylesheet
     assert "min-height:var(--tap-target)" in stylesheet
     assert "a.p-2{align-items:center;display:inline-flex;justify-content:center" in stylesheet
-    assert "input,select,textarea{border-color:#74839a}" in stylesheet
-    assert "border-radius:8px" in stylesheet
+    assert "border-radius" not in stylesheet.replace("border-radius:0", "")
     assert "font-size:2.25rem" in stylesheet
     assert "@media (max-width:767px)" in stylesheet
-    assert "transition-duration:.2s" in stylesheet
     assert ".max-w-7xl{max-width:80rem}" in stylesheet
-    assert ".text-slate-500{color:#b0bfd3}" in stylesheet
-    assert ".text-slate-600{color:#9aadc5}" in stylesheet
 
 
 def test_templates_render_without_a_request_or_extra_context():
@@ -696,17 +696,9 @@ NOT_CLASS_LITERALS = {
 }
 # Class tokens that legitimately have no CSS rule of their own. Keep each justified.
 NO_RULE_TOKENS: dict[str, str] = {
-    "dark": (
-        "marker on <html>; no dark: variant is used and darkMode is left at the "
-        "default (media), so Tailwind emits nothing for it, same as the CDN"
-    ),
     "group": (
         "Tailwind marker class; it exists only as the ancestor in "
         "`.group:hover .group-hover\\:...` rules, never as a rule of its own"
-    ),
-    "peer": (
-        "Tailwind marker class; it exists only as the sibling-selector ancestor in "
-        "`.peer:checked~.peer-checked\\:...` rules, never as a rule of its own"
     ),
 }
 
@@ -723,9 +715,8 @@ NO_RULE_TOKENS: dict[str, str] = {
 #   URLs and keys, so finding them needs a large hand-kept allow-list. Tailwind's
 #   own scanner cannot see runtime-assembled names either. The one place the
 #   page builds class names in script is the set of class-returning getters and
-#   methods of index.html (scraperTextClass, scraperDotClass, secretBadgeClass,
-#   secretMessageClass); they return whole literal strings, which Tailwind finds
-#   in the raw file, and `test_every_class_the_script_can_return_has_a_rule`
+#   methods of index.html (secretBadgeClass, secretMessageClass); they return
+#   whole literal strings, which Tailwind finds in the raw file, and `test_every_class_the_script_can_return_has_a_rule`
 #   runs them in node and checks each returned class. The always-on digest test
 #   fails on any edit that is not rebuilt.
 # - Classes added by Jinja, e.g. `class="a {{ x }}"`: raises, so it cannot pass
@@ -880,8 +871,8 @@ def test_the_allow_lists_are_not_stale():
 @pytest.mark.parametrize(
     "token",
     [
-        "after:content-['']",
-        "hover:bg-white/[0.02]",
+        "z-[110]",
+        "h-[550px]",
     ],
 )
 def test_the_arbitrary_value_classes_the_page_relies_on_are_in_the_stylesheet(token):
@@ -992,14 +983,31 @@ def test_a_jinja_expression_inside_a_static_class_attribute_fails_loudly(
         missing_classes(template_copy, STYLESHEET.read_text())
 
 
-def test_page_uses_no_tailwind_plugin_classes_and_no_dark_variants():
+def test_fonts_are_vendored_served_and_licensed():
+    stylesheet = STYLESHEET.read_text()
+    urls = re.findall(r"url\(\"?(fonts/[^)\"]+)", stylesheet)
+
+    assert len(urls) == 2
+    for url in urls:
+        assert (STATIC_DIR / url).is_file()
+        assert "SIL OPEN FONT LICENSE" in (STATIC_DIR / "fonts" / "OFL.txt").read_text()
+    assert "font-display:swap" in stylesheet
+    assert "http" not in "".join(re.findall(r"@font-face\{[^}]*\}", stylesheet))
+
+
+def test_page_uses_no_tailwind_plugin_classes_and_dark_follows_the_system():
     static, bound = used_tokens()
 
     plugin_hits = sorted(t for t in static | bound if PLUGIN_CLASS.search(t))
     dark_hits = sorted(t for t in static | bound if t.startswith("dark:"))
+    css = STYLESHEET.read_text()
 
     assert plugin_hits == []
     assert dark_hits == []
+    assert '"dark"' not in (ROOT / "tailwind" / "tailwind.config.js").read_text()
+    assert "darkMode" in (ROOT / "tailwind" / "tailwind.config.js").read_text()
+    assert "@media (prefers-color-scheme:dark){" in css
+    assert ".dark " not in css
 
 
 def test_every_class_the_script_can_return_has_a_rule(tmp_path):
@@ -1012,12 +1020,6 @@ def test_every_class_the_script_can_return_has_a_rule(tmp_path):
     )
     steps = """
       const out = [];
-      for (const state of ['available', 'starting', 'stopping', 'unavailable', 'stopped']) {
-        for (const scraper of [true, false]) {
-          app.browser = {state}; app.diagnostics = {scraper};
-          out.push(app.scraperTextClass, app.scraperDotClass);
-        }
-      }
       for (const source of ['environment', 'environment_invalid', 'file', null]) {
         app.secretsLoaded = true;
         app.secrets = {s: {set: source === 'file', source}};
@@ -1035,5 +1037,5 @@ def test_every_class_the_script_can_return_has_a_rule(tmp_path):
 
     tokens = {token for text in returned for token in text.split()}
     css = STYLESHEET.read_text()
-    assert len(tokens) > 15
+    assert len(tokens) > 5
     assert sorted(t for t in tokens if not has_own_rule(t, css)) == []

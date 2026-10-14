@@ -1,20 +1,17 @@
 <!DOCTYPE html>
-<html lang="en" class="dark">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Morphe Builder</title>
+    <link rel="preload" href="/static/fonts/space-grotesk-latin-700-normal.woff2" as="font" type="font/woff2" crossorigin>
     <link rel="stylesheet" href="{{ asset_url('app.css') }}">
     <script defer src="/static/alpine-3.17.4.min.js"></script>
     <style>
         [x-cloak] { display: none !important; }
-        ::-webkit-scrollbar { width: 6px; }
-        ::-webkit-scrollbar-track { background: #0f172a; }
-        ::-webkit-scrollbar-thumb { background: #334155; border-radius: 10px; }
-        ::-webkit-scrollbar-thumb:hover { background: #475569; }
     </style>
 </head>
-<body class="bg-slate-950 text-slate-200 font-sans antialiased" x-data="morphe"
+<body class="nb-page font-sans antialiased" x-data="morphe"
       @keydown.escape.window="closeActiveDialog()" @keydown.tab.window="trapDialogFocus($event)">
 
     <script>
@@ -30,6 +27,7 @@
                 metadata: {{ metadata | tojson | safe }},
                 settings: {{ (config.settings if config.settings else {"server_url": "", "cron_schedule": "0 0 * * *"}) | tojson | safe }},
                 updates: {},
+                iconFailed: {},
                 lastRun: '{{ metadata.last_run if metadata and metadata.last_run else "Never" }}',
                 selectedApps: [],
                 showModal: false,
@@ -723,31 +721,17 @@
                     return 'red';
                 },
 
-                get scraperTextClass() {
-                    return {emerald: 'text-emerald-500', amber: 'text-amber-500', red: 'text-red-500'}[this.scraperTone];
-                },
-
-                get scraperDotClass() {
-                    return {
-                        emerald: 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.4)]',
-                        amber: 'bg-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.4)]',
-                        red: 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.4)]'
-                    }[this.scraperTone];
-                },
-
                 secretBadgeClass(slug) {
                     return {
-                        file: 'bg-emerald-500/10 text-emerald-500 border-emerald-500/20',
-                        environment: 'bg-indigo-500/10 text-indigo-400 border-indigo-500/20',
-                        environment_invalid: 'bg-red-500/10 text-red-400 border-red-500/20'
-                    }[this.secretState(slug)] || 'bg-slate-800 text-slate-500 border-slate-700';
+                        file: 'nb-badge-green',
+                        environment: 'nb-badge-blue',
+                        environment_invalid: 'nb-badge-red'
+                    }[this.secretState(slug)] || 'nb-badge-neutral';
                 },
 
                 secretMessageClass(slug) {
                     const kind = this.secretMessage[slug] && this.secretMessage[slug].kind;
-                    return 'px-4 py-3 border rounded-xl text-[11px] font-bold ' + (kind === 'error'
-                        ? 'bg-red-500/10 border-red-500/20 text-red-400'
-                        : 'bg-emerald-500/10 border-emerald-500/20 text-emerald-400');
+                    return kind === 'error' ? 'nb-alert nb-alert-error' : 'nb-alert nb-alert-success';
                 },
 
                 get busySeconds() {
@@ -868,7 +852,7 @@
                 },
 
                 feedbackClass(message) {
-                    return message && message.kind === 'error' ? 'text-red-400' : 'text-emerald-400';
+                    return message && message.kind === 'error' ? 'nb-alert nb-alert-error' : 'nb-alert nb-alert-success';
                 },
 
                 async finishAppriseFailure(result) {
@@ -1035,311 +1019,314 @@
 
 
     <!-- Upload Modal -->
-    <div x-cloak x-show="showUploadModal" class="fixed inset-0 z-[110] flex w-screen min-h-screen items-center justify-center p-4 bg-slate-950/80">
-        <div @click.away="closeDialog('upload')" x-ref="uploadDialog" role="dialog" aria-modal="true" aria-labelledby="upload-dialog-title" tabindex="-1" class="glass-surface bg-slate-900 border border-slate-800 w-full max-w-lg rounded-lg shadow-2xl overflow-hidden flex flex-col">
-            <div class="p-8 border-b border-slate-800 flex justify-between items-center">
-                <div>
-                    <h2 id="upload-dialog-title" class="text-2xl font-bold text-white">Upload Manual APK</h2>
-                    <p class="text-slate-500 text-sm mt-1" x-text="selectedPkg"></p>
+    <div x-cloak x-show="showUploadModal" class="fixed inset-0 z-[110] flex w-screen min-h-screen items-center justify-center p-4 bg-black/70">
+        <div @click.away="closeDialog('upload')" x-ref="uploadDialog" role="dialog" aria-modal="true" aria-labelledby="upload-dialog-title" tabindex="-1" class="nb-dialog w-full max-w-lg overflow-hidden flex flex-col max-h-[90vh]">
+            <div class="p-5 sm:p-8 nb-head flex justify-between items-center gap-3">
+                <div class="min-w-0">
+                    <h2 id="upload-dialog-title" class="text-2xl font-black uppercase tracking-tighter">Upload Manual APK</h2>
+                    <p class="nb-muted text-sm mt-1 break-all" x-text="selectedPkg"></p>
                 </div>
-                <button @click="closeDialog('upload')" class="text-slate-500 hover:text-white transition-colors" aria-label="Close upload dialog">
+                <button @click="closeDialog('upload')" class="nb-btn-icon shrink-0" aria-label="Close upload dialog">
                     <svg xmlns="http://www.w3.org/2000/svg" class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" /></svg>
                 </button>
             </div>
 
-            <div class="p-8 space-y-6">
-                <p x-show="uploadError" x-cloak role="alert" class="px-4 py-3 border border-red-500/20 rounded-lg bg-red-500/10 text-red-400 text-sm">
+            <div class="p-5 sm:p-8 space-y-6 overflow-y-auto">
+                <p x-show="uploadError" x-cloak role="alert" class="nb-alert nb-alert-error">
                     <span x-text="uploadError"></span>
                 </p>
                 <div class="space-y-2">
-                    <label class="text-xs font-bold text-slate-500 uppercase tracking-widest">Version Name</label>
-                    <input type="text" x-model="uploadVersion" placeholder="e.g. 1.2.3" class="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-white focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500 outline-none transition-all">
-                    <p class="text-[10px] text-slate-600">This should match a version supported by the patches.</p>
+                    <label for="upload-version" class="nb-label block">Version Name</label>
+                    <input id="upload-version" type="text" x-model="uploadVersion" placeholder="e.g. 1.2.3" class="nb-input">
+                    <p class="nb-muted text-xs">This should match a version supported by the patches.</p>
                 </div>
 
                 <div class="space-y-2">
-                    <label class="text-xs font-bold text-slate-500 uppercase tracking-widest">APK File</label>
-                    <input type="file" x-ref="fileInput" class="w-full text-sm text-slate-400 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-xs file:font-bold file:bg-indigo-600 file:text-white hover:file:bg-indigo-500 transition-all cursor-pointer">
+                    <label for="upload-file" class="nb-label block">APK File</label>
+                    <input id="upload-file" type="file" x-ref="fileInput" class="nb-input cursor-pointer text-sm file:mr-4 file:py-1 file:px-3 file:border-4 file:border-ink file:bg-pop-yellow file:text-black file:text-sm file:font-bold file:uppercase">
                 </div>
             </div>
 
-            <div class="p-8 bg-slate-950/50 border-t border-slate-800 flex gap-4">
-                <button @click="closeDialog('upload')" class="flex-1 px-6 py-3 rounded-xl font-bold text-slate-400 hover:bg-slate-800 transition-all">Cancel</button>
-                <button @click="uploadApk" class="flex-1 px-6 py-3 rounded-xl font-bold bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg shadow-emerald-600/20 transition-all">Upload APK</button>
+            <div class="p-5 sm:p-8 nb-foot flex flex-col-reverse sm:flex-row gap-4">
+                <button @click="closeDialog('upload')" class="nb-btn flex-1">Cancel</button>
+                <button @click="uploadApk" class="nb-btn-primary flex-1">Upload APK</button>
             </div>
         </div>
     </div>
 
     <!-- Modal Overlay -->
-    <div x-cloak x-show="showModal" class="fixed inset-0 z-[100] flex w-screen min-h-screen items-center justify-center p-4 bg-slate-950/80">
-        <div @click.away="closeDialog('patch')" x-ref="patchDialog" role="dialog" aria-modal="true" aria-labelledby="patch-dialog-title" tabindex="-1" class="glass-surface bg-slate-900 border border-slate-800 w-full max-w-2xl rounded-lg shadow-2xl overflow-hidden flex flex-col max-h-[90vh]">
-            <div class="p-8 border-b border-slate-800 flex justify-between items-center">
-                <div>
-                    <h2 id="patch-dialog-title" class="text-2xl font-bold text-white" x-text="isEditing ? 'Edit Configuration' : 'Configure Patch'"></h2>
-                    <p class="text-slate-500 text-sm mt-1" x-text="selectedPkg"></p>
+    <div x-cloak x-show="showModal" class="fixed inset-0 z-[100] flex w-screen min-h-screen items-center justify-center p-4 bg-black/70">
+        <div @click.away="closeDialog('patch')" x-ref="patchDialog" role="dialog" aria-modal="true" aria-labelledby="patch-dialog-title" tabindex="-1" class="nb-dialog w-full max-w-2xl overflow-hidden flex flex-col max-h-[90vh]">
+            <div class="p-5 sm:p-8 nb-head flex justify-between items-center gap-3">
+                <div class="min-w-0">
+                    <h2 id="patch-dialog-title" class="text-2xl font-black uppercase tracking-tighter" x-text="isEditing ? 'Edit Configuration' : 'Configure Patch'"></h2>
+                    <p class="nb-muted text-sm mt-1 break-all" x-text="selectedPkg"></p>
                 </div>
-                <button @click="closeDialog('patch')" class="text-slate-500 hover:text-white transition-colors" aria-label="Close patch dialog">
+                <button @click="closeDialog('patch')" class="nb-btn-icon shrink-0" aria-label="Close patch dialog">
                     <svg xmlns="http://www.w3.org/2000/svg" class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" /></svg>
                 </button>
             </div>
 
             <div class="p-5 sm:p-8 overflow-y-auto space-y-6">
                 <div class="space-y-2">
-                    <label for="patch-app-name" class="text-xs font-bold text-slate-500 uppercase tracking-widest">App Name</label>
-                    <input id="patch-app-name" type="text" x-model="selectedAppName" class="w-full min-h-11 bg-slate-950 border border-slate-800 rounded-lg px-4 py-3 text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400 transition-all">
+                    <label for="patch-app-name" class="nb-label block">App Name</label>
+                    <input id="patch-app-name" type="text" x-model="selectedAppName" class="nb-input">
                 </div>
 
                 <div class="space-y-4">
                     <div class="flex items-center justify-between gap-3">
-                        <h3 class="text-xs font-bold text-slate-300 uppercase tracking-widest">Patch sources</h3>
-                        <span class="text-xs text-slate-400" x-text="`${availablePatches.filter(p => p.selected).length} selected`"></span>
+                        <h3 class="text-base font-black uppercase tracking-tight">Patch sources</h3>
+                        <span class="nb-badge-neutral" x-text="`${availablePatches.filter(p => p.selected).length} selected`"></span>
                     </div>
 
                         <!-- Patch Source Tabs -->
                     <div x-show="!loadingPatches && patchTabs.length" role="tablist" aria-label="Patch sources" class="flex flex-wrap gap-2">
                         <template x-for="tab in patchTabs" :key="tab.key">
-                            <button type="button" role="tab" :id="patchTabId(tab.repo)" :data-repo="tab.repo" :aria-controls="patchPanelId(tab.repo)" :aria-selected="activePatchTab === tab.key" :tabindex="activePatchTab === tab.key ? 0 : -1" @click="activePatchTab = tab.key" @keydown="handlePatchTabKey($event, tab.repo)" :class="activePatchTab === tab.key ? 'bg-blue-700 text-white border-blue-500' : 'bg-slate-950 text-slate-300 hover:text-white border-slate-700'" class="min-h-11 max-w-full px-3 py-2 border rounded-lg text-left text-xs font-semibold focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400">
-                                <span class="block" x-text="tab.source"></span>
-                                <span class="block break-all font-normal text-[10px] opacity-80" x-text="`${tab.repo} · ${selectedPatchCount(tab.repo)} selected`"></span>
+                            <button type="button" role="tab" :id="patchTabId(tab.repo)" :data-repo="tab.repo" :aria-controls="patchPanelId(tab.repo)" :aria-selected="activePatchTab === tab.key" :tabindex="activePatchTab === tab.key ? 0 : -1" @click="activePatchTab = tab.key" @keydown="handlePatchTabKey($event, tab.repo)" :class="activePatchTab === tab.key ? 'nb-tab-active' : ''" class="nb-tab max-w-full !justify-start !px-3 text-left text-xs">
+                                <span class="block min-w-0">
+                                    <span class="block" x-text="tab.source"></span>
+                                    <span class="block break-all font-normal text-xs" x-text="`${tab.repo} · ${selectedPatchCount(tab.repo)} selected`"></span>
+                                </span>
                             </button>
                         </template>
                     </div>
 
-                        <p x-show="loadingPatches" role="status" class="py-8 text-center text-sm text-slate-300">Loading patch sources and saved selections...</p>
-                        <p x-show="!loadingPatches && !patchTabs.length" role="status" class="py-8 text-center text-sm text-slate-400">No patch sources are configured for this app.</p>
+                        <p x-show="loadingPatches" role="status" class="py-8 text-center text-sm">Loading patch sources and saved selections...</p>
+                        <p x-show="!loadingPatches && !patchTabs.length" role="status" class="nb-muted py-8 text-center text-sm">No patch sources are configured for this app.</p>
 
 
                     <template x-if="Array.isArray(patchSelection.stored) && isEditing && unresolvedLegacyPatches.length === 0">
-                        <p class="text-xs text-slate-400" role="status">This app uses a legacy patch list. Provider choices below come from the backend resolver. Saving explicitly converts this selection to source-keyed format.</p>
+                        <p class="nb-alert nb-alert-info" role="status">This app uses a legacy patch list. Provider choices below come from the backend resolver. Saving explicitly converts this selection to source-keyed format.</p>
                     </template>
                     <template x-if="patchSelection.error">
-                        <p class="px-3 py-2 border border-amber-700/60 rounded-lg bg-amber-950/40 text-amber-200 text-sm" role="status" x-text="patchSelection.error.message || 'Some saved selections need review.'"></p>
+                        <p class="nb-alert nb-alert-warning" role="status" x-text="patchSelection.error.message || 'Some saved selections need review.'"></p>
                     </template>
                     <template x-if="unresolvedLegacyPatches.length">
-                        <div class="space-y-2 border border-amber-700/60 rounded-lg bg-amber-950/30 p-3" aria-label="Unresolved legacy selections">
-                            <p class="text-sm text-amber-200">These legacy names have no resolved provider. Choose a replacement above, then explicitly remove each unresolved entry before saving.</p>
+                        <div class="nb-alert nb-alert-warning space-y-2" aria-label="Unresolved legacy selections">
+                            <p>These legacy names have no resolved provider. Choose a replacement above, then explicitly remove each unresolved entry before saving.</p>
                             <template x-for="item in unresolvedLegacyPatches" :key="item.draftId">
-                                <div class="flex flex-wrap items-center justify-between gap-2 text-sm text-slate-200">
+                                <div class="flex flex-wrap items-center justify-between gap-2">
                                     <span x-text="item.name"></span>
-                                    <button type="button" @click="unresolvedLegacyPatches = unresolvedLegacyPatches.filter(entry => entry.draftId !== item.draftId)" class="min-h-11 px-3 text-amber-200 underline decoration-amber-700 underline-offset-4 rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400">Remove unresolved selection</button>
+                                    <button type="button" @click="unresolvedLegacyPatches = unresolvedLegacyPatches.filter(entry => entry.draftId !== item.draftId)" class="nb-btn text-xs">Remove unresolved selection</button>
                                 </div>
                             </template>
                         </div>
                     </template>
 
                     <template x-for="tab in patchTabs" :key="'panel-' + tab.key">
-                        <section x-show="activePatchTab === tab.key" role="tabpanel" tabindex="0" :id="patchPanelId(tab.repo)" :aria-labelledby="patchTabId(tab.repo)" class="space-y-3 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400">
-                            <div x-show="tab.status !== 'available'" class="p-3 border border-amber-700/60 rounded-lg bg-amber-950/30 text-sm text-amber-200" role="status">
-                                <span class="font-semibold" x-text="tab.status"></span>
+                        <section x-show="activePatchTab === tab.key" role="tabpanel" tabindex="0" :id="patchPanelId(tab.repo)" :aria-labelledby="patchTabId(tab.repo)" class="space-y-3">
+                            <div x-show="tab.status !== 'available'" class="nb-alert nb-alert-warning" role="status">
+                                <span class="font-bold" x-text="tab.status"></span>
                                 <span x-text="tab.status === 'inactive' ? ': saved selections are retained but this source is disabled.' : tab.status === 'deleted' ? ': saved selections are retained until you remove them.' : tab.status === 'unreadable' ? ': this source list could not be read; other sources remain selectable.' : tab.status === 'missing' ? ': source files are missing; saved selections are retained.' : tab.status === 'ambiguous' ? ': some patch names are ambiguous within this source.' : tab.status === 'conflict' ? ': this source conflicts with another configured source.' : ': this source is not currently available.'"></span>
                             </div>
                             <div class="flex flex-wrap gap-2">
-                                <button type="button" @click="patchesForRepo(tab.repo).filter(p => p.source_status === 'available' && p.status !== 'patch_unavailable').forEach(p => p.selected = p.enabled_by_default === true)" :disabled="tab.status !== 'available'" class="min-h-11 px-3 text-xs font-semibold text-blue-300 hover:text-blue-200 disabled:opacity-50 rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400">Recommended</button>
-                                <button type="button" @click="patchesForRepo(tab.repo).filter(p => p.source_status === 'available' && p.status !== 'patch_unavailable').forEach(p => p.selected = true)" :disabled="tab.status !== 'available'" class="min-h-11 px-3 text-xs font-semibold text-blue-300 hover:text-blue-200 disabled:opacity-50 rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400">Select source</button>
-                                <button type="button" @click="patchesForRepo(tab.repo).forEach(p => p.selected = false)" class="min-h-11 px-3 text-xs font-semibold text-slate-300 hover:text-white rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400">Clear source</button>
+                                <button type="button" @click="patchesForRepo(tab.repo).filter(p => p.source_status === 'available' && p.status !== 'patch_unavailable').forEach(p => p.selected = p.enabled_by_default === true)" :disabled="tab.status !== 'available'" class="nb-btn-ghost text-xs underline underline-offset-4">Recommended</button>
+                                <button type="button" @click="patchesForRepo(tab.repo).filter(p => p.source_status === 'available' && p.status !== 'patch_unavailable').forEach(p => p.selected = true)" :disabled="tab.status !== 'available'" class="nb-btn-ghost text-xs underline underline-offset-4">Select source</button>
+                                <button type="button" @click="patchesForRepo(tab.repo).forEach(p => p.selected = false)" class="nb-btn-ghost text-xs underline underline-offset-4">Clear source</button>
                             </div>
                             <template x-for="patch in patchesForRepo(tab.repo)" :key="patch.patchKey">
-                                <label class="flex items-start gap-3 p-3 bg-slate-950 border border-slate-800 rounded-lg cursor-pointer hover:border-blue-500/60 transition-colors">
-                                    <input type="checkbox" :aria-label="`Select ${patch.name} from ${patch.repo}`" x-model="patch.selected" :disabled="patch.source_status !== 'available' && !patch.selected" class="mt-1 min-w-5 min-h-5 rounded border-slate-600 bg-slate-800 text-blue-600 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400">
+                                <label class="nb-surface flex items-start gap-3 p-3 cursor-pointer hover:bg-pop-yellow hover:text-black">
+                                    <input type="checkbox" :aria-label="`Select ${patch.name} from ${patch.repo}`" x-model="patch.selected" :disabled="patch.source_status !== 'available' && !patch.selected" class="nb-checkbox mt-0.5">
                                     <span class="min-w-0 flex-1">
-                                        <span class="flex flex-wrap items-center gap-2 font-semibold text-slate-100">
+                                        <span class="flex flex-wrap items-center gap-2 font-semibold">
                                             <span x-text="patch.name"></span>
-                                            <span x-show="patch.enabled_by_default" class="text-[10px] text-blue-300">Recommended</span>
-                                            <span x-show="patch.selected && (patch.source_status !== 'available' || patch.status === 'patch_unavailable')" class="text-[10px] text-amber-200" x-text="patch.status === 'patch_unavailable' ? 'Unavailable upstream, retained' : `Selected, source ${patch.source_status}`"></span>
+                                            <span x-show="patch.enabled_by_default" class="nb-badge-yellow">Recommended</span>
+                                            <span x-show="patch.selected && (patch.source_status !== 'available' || patch.status === 'patch_unavailable')" class="nb-badge-red" x-text="patch.status === 'patch_unavailable' ? 'Unavailable upstream, retained' : `Selected, source ${patch.source_status}`"></span>
                                         </span>
-                                        <span class="block mt-1 text-xs text-slate-400" x-text="patch.description"></span>
-                                        <span class="block break-all mt-1 text-[10px] text-slate-500" x-text="patch.repo"></span>
+                                        <span class="nb-muted block mt-1 text-sm" x-text="patch.description"></span>
+                                        <span class="nb-muted block break-all mt-1 text-xs" x-text="patch.repo"></span>
                                     </span>
                                 </label>
                             </template>
-                            <p x-show="patchesForRepo(tab.repo).length === 0" class="py-5 text-sm text-slate-400">No compatible patch entries are available from this source.</p>
+                            <p x-show="patchesForRepo(tab.repo).length === 0" class="nb-muted py-5 text-sm">No compatible patch entries are available from this source.</p>
                         </section>
                     </template>
                     <div x-show="patchTabs.length" class="flex flex-wrap gap-2">
-                        <button type="button" @click="availablePatches.filter(p => p.source_status === 'available' && p.status !== 'patch_unavailable').forEach(p => p.selected = p.enabled_by_default === true)" class="min-h-11 px-3 text-xs font-semibold text-blue-300 hover:text-blue-200 rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400">Recommended across available sources</button>
-                        <button type="button" @click="availablePatches.filter(p => p.source_status === 'available' && p.status !== 'patch_unavailable').forEach(p => p.selected = true)" class="min-h-11 px-3 text-xs font-semibold text-blue-300 hover:text-blue-200 rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400">Select all available</button>
+                        <button type="button" @click="availablePatches.filter(p => p.source_status === 'available' && p.status !== 'patch_unavailable').forEach(p => p.selected = p.enabled_by_default === true)" class="nb-btn-ghost text-xs underline underline-offset-4">Recommended across available sources</button>
+                        <button type="button" @click="availablePatches.filter(p => p.source_status === 'available' && p.status !== 'patch_unavailable').forEach(p => p.selected = true)" class="nb-btn-ghost text-xs underline underline-offset-4">Select all available</button>
                     </div>
                 </div>
             </div>
 
-            <p x-show="patchError" x-cloak role="alert" class="mx-8 mb-4 px-4 py-3 border border-red-500/20 rounded-lg bg-red-500/10 text-red-400 text-sm" x-text="patchError"></p>
-            <div class="p-5 sm:p-8 bg-slate-950/50 border-t border-slate-800 flex flex-col-reverse sm:flex-row gap-3">
-                <button type="button" @click="closeDialog('patch')" class="min-h-11 flex-1 px-6 py-3 rounded-lg font-semibold text-slate-300 hover:bg-slate-800 transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400">Cancel</button>
-                <button type="button" @click="saveApp" :disabled="loadingPatches || patchSaving || unresolvedLegacyPatches.length > 0" class="min-h-11 flex-1 px-6 py-3 rounded-lg font-semibold bg-blue-700 hover:bg-blue-600 disabled:opacity-50 text-white transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400" x-text="patchSaving ? 'Saving...' : 'Save Configuration'"></button>
+            <p x-show="patchError" x-cloak role="alert" class="nb-alert nb-alert-error mx-5 sm:mx-8 mb-4" x-text="patchError"></p>
+            <div class="p-5 sm:p-8 nb-foot flex flex-col-reverse sm:flex-row gap-3">
+                <button type="button" @click="closeDialog('patch')" class="nb-btn flex-1">Cancel</button>
+                <button type="button" @click="saveApp" :disabled="loadingPatches || patchSaving || unresolvedLegacyPatches.length > 0" class="nb-btn-primary flex-1" x-text="patchSaving ? 'Saving...' : 'Save Configuration'"></button>
             </div>
         </div>
     </div>
 
-    <header class="glass-surface sticky top-0 z-50 w-full border-b border-slate-800 bg-slate-950/80">
-        <div class="container mx-auto px-4 py-2 flex flex-col gap-2 md:h-16 md:flex-row md:items-center md:justify-between md:px-6 md:py-0">
+    <header class="nb-header sticky top-0 z-50 w-full">
+        <div class="container mx-auto px-4 py-2 flex flex-col gap-2 md:min-h-16 md:flex-row md:items-center md:justify-between md:px-6">
             <div class="flex w-full flex-wrap items-center justify-between gap-2">
                 <div class="flex items-center gap-3">
-                    <div class="w-10 h-10 bg-indigo-600 rounded-lg flex items-center justify-center">
-                        <svg xmlns="http://www.w3.org/2000/svg" class="w-6 h-6 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5">
+                    <div class="w-12 h-12 -rotate-3 bg-pop-red border-4 border-ink shadow-[4px_4px_0_0] shadow-ink flex items-center justify-center">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="w-6 h-6 text-black" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5">
                             <path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" />
                         </svg>
                     </div>
                     <div>
-                        <h1 class="text-lg font-bold text-white leading-none">Morphe Builder</h1>
+                        <h1 class="text-xl font-black uppercase leading-none tracking-tighter -rotate-1">Morphe Builder</h1>
                     </div>
                 </div>
 
-                <nav class="flex items-center gap-1 bg-slate-900 p-1 rounded-xl border border-slate-800">
-                    <button 
+                <nav aria-label="Sections" class="flex flex-wrap items-center gap-1 border-b-2 border-transparent">
+                    <button
                         @click="activeTab = 'discovery'"
-                        :class="activeTab === 'discovery' ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/20' : 'text-slate-400 hover:text-slate-200'"
-                        class="px-4 py-1.5 rounded-lg text-xs font-bold transition-all">
+                        :class="activeTab === 'discovery' ? 'nb-tab-active' : ''"
+                        class="nb-tab">
                         Discovery
                     </button>
-                    <button 
+                    <button
                         @click="activeTab = 'pipeline'"
-                        :class="activeTab === 'pipeline' ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/20' : 'text-slate-400 hover:text-slate-200'"
-                        class="px-4 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-2">
+                        :class="activeTab === 'pipeline' ? 'nb-tab-active' : ''"
+                        class="nb-tab">
                         Pipeline
                         <template x-if="building">
-                            <span class="flex h-2 w-2 relative">
-                                <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-indigo-400 opacity-75"></span>
-                                <span class="relative inline-flex rounded-full h-2 w-2 bg-indigo-500"></span>
+                            <span class="inline-flex h-3 w-3 border-2 border-ink bg-pop-yellow">
+                                <span class="sr-only">Build running</span>
                             </span>
                         </template>
                     </button>
-                    <button 
+                    <button
                         @click="activeTab = 'settings'"
-                        :class="activeTab === 'settings' ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/20' : 'text-slate-400 hover:text-slate-200'"
-                        class="px-4 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-2">
+                        :class="activeTab === 'settings' ? 'nb-tab-active' : ''"
+                        class="nb-tab">
                         Settings
                         <template x-if="githubTokenRejected || githubTokenWarning">
-                            <span class="inline-flex rounded-full h-2 w-2" :class="githubTokenRejected ? 'bg-red-500' : 'bg-amber-500'">
+                            <span class="inline-flex h-3 w-3 border-2 border-ink" :class="githubTokenRejected ? 'bg-pop-red' : 'bg-pop-yellow'">
                                 <span class="sr-only">GitHub token needs attention</span>
                             </span>
                         </template>
                     </button>
                 </nav>
             </div>
-            
+
         </div>
     </header>
 
-    <main class="container mx-auto px-6 py-10 max-w-7xl">
-        
+    <main class="container mx-auto px-4 sm:px-6 py-10 max-w-7xl">
+
         <!-- Tab 1: Discovery -->
         <div x-show="activeTab === 'discovery'" x-cloak class="space-y-10">
             <div class="grid grid-cols-1 lg:grid-cols-12 gap-10">
                 <div class="lg:col-span-4 space-y-6">
                     <div class="flex items-center justify-between">
-                        <h2 class="text-sm font-semibold text-slate-500 uppercase tracking-widest">Sources</h2>
+                        <h2 class="text-xl font-black uppercase tracking-tighter">Sources</h2>
                         <template x-if="toolsUpdating">
-                            <div class="flex items-center gap-2 text-[10px] text-indigo-400 font-bold animate-pulse">
-                                <svg class="animate-spin h-3 w-3" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                            <div class="flex items-center gap-2 text-xs font-bold">
+                                <svg class="animate-spin h-4 w-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
                                 Syncing...
                             </div>
                         </template>
                     </div>
                     <template x-if="syncError && syncError !== githubTokenRejected">
-                        <div class="px-4 py-3 bg-red-500/10 border border-red-500/20 rounded-xl text-[11px] font-bold text-red-400">
+                        <div class="nb-alert nb-alert-error break-words">
                             Sync failed: <span x-text="syncError"></span>
                         </div>
                     </template>
                     <template x-if="syncRefused">
-                        <div class="px-4 py-3 bg-red-500/10 border border-red-500/20 rounded-xl text-[11px] font-bold text-red-400">
+                        <div class="nb-alert nb-alert-error break-words">
                             Sync not started: <span x-text="syncRefused"></span>
                         </div>
                     </template>
                     <template x-if="syncNotice">
-                        <div class="px-4 py-3 bg-slate-800 border border-slate-700 rounded-xl text-[11px] font-bold text-slate-300" x-text="syncNotice"></div>
+                        <div class="nb-alert nb-alert-info" x-text="syncNotice"></div>
                     </template>
-                    <div class="p-6 bg-slate-900 border border-slate-800 rounded-2xl space-y-4">
+                    <div class="nb-card p-4 sm:p-6 space-y-4">
                         <template x-for="source in sources" :key="source.repo">
-                            <div class="flex flex-wrap items-center justify-between p-3 bg-slate-950 rounded-xl border border-slate-800 group relative overflow-hidden">
-                                <div class="flex flex-col">
+                            <div class="nb-surface flex flex-wrap items-center justify-between gap-2 p-3 relative overflow-hidden">
+                                <div class="flex flex-col min-w-0">
                                     <div class="flex items-center gap-2">
-                                        <span class="text-xs font-bold text-white" x-text="source.name"></span>
+                                        <span class="text-sm font-bold break-words" x-text="source.name"></span>
                                     </div>
                                     <div class="flex items-center gap-2 mt-0.5">
-                                        <span class="text-[9px] font-mono text-slate-500" x-text="source.version || 'Unknown'"></span>
-                                        <span class="text-[9px] text-slate-700">•</span>
-                                        <span class="text-[9px] text-slate-600 truncate max-w-[100px]" x-text="source.repo"></span>
+                                        <span class="nb-muted text-xs font-mono" x-text="source.version || 'Unknown'"></span>
+                                        <span class="nb-muted text-xs" aria-hidden="true">/</span>
+                                        <span class="nb-muted text-xs truncate max-w-[120px]" x-text="source.repo"></span>
                                     </div>
                                 </div>
                                 <div class="flex items-center gap-2">
-                                    <button 
+                                    <button
                                         @click="toggleSource(source)"
-                                        :class="source.active ? 'bg-emerald-500/10 text-emerald-500 border-emerald-500/20' : 'bg-slate-800 text-slate-500 border-slate-700'"
-                                        class="px-2 py-0.5 rounded text-[9px] font-bold border transition-all" 
+                                        :class="source.active ? 'nb-badge-green' : 'nb-badge-neutral'"
+                                        class="min-h-11"
                                         x-text="source.active ? 'Active' : 'Disabled'">
                                     </button>
-                                    <button 
+                                    <button
                                         @click="deleteSource(source)"
-                                        class="p-1 text-slate-600 hover:text-red-500 transition-colors">
-                                        <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                                        class="nb-btn-danger min-h-11 min-w-11 p-2"
+                                        :aria-label="'Delete source ' + source.name">
+                                        <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
                                     </button>
                                 </div>
-                                <p x-show="sourceErrors[source.repo]" x-cloak role="alert" class="basis-full px-3 py-2 text-sm text-red-400" x-text="sourceErrors[source.repo]"></p>
+                                <p x-show="sourceErrors[source.repo]" x-cloak role="alert" class="nb-text-error basis-full px-1 py-2 text-sm font-semibold" x-text="sourceErrors[source.repo]"></p>
                             </div>
                         </template>
-                        <p x-show="sourceError" x-cloak role="alert" class="px-3 py-2 text-sm text-red-400" x-text="sourceError"></p>
-                        <button @click="addSource()" class="w-full py-3 border-2 border-dashed border-slate-800 rounded-xl text-slate-600 hover:text-slate-400 hover:border-slate-700 text-xs font-bold transition-all">+ Add Custom Source</button>
+                        <p x-show="sourceError" x-cloak role="alert" class="nb-text-error px-1 py-2 text-sm font-semibold" x-text="sourceError"></p>
+                        <button @click="addSource()" class="nb-btn-dashed">+ Add Custom Source</button>
                     </div>
                 </div>
 
                 <div class="lg:col-span-8 space-y-6">
                     <div class="flex flex-col md:flex-row md:items-center justify-between gap-4">
                         <div class="flex items-center gap-4">
-                            <h2 class="text-sm font-semibold text-slate-500 uppercase tracking-widest">Discovery</h2>
-                            <div class="h-4 w-[1px] bg-slate-800"></div>
-                            <span class="text-[10px] font-bold text-slate-400" x-text="`${discoveryApps.length} Apps Found`"></span>
+                            <h2 class="text-xl font-black uppercase tracking-tighter">Discovery</h2>
+                            <div class="h-5 w-0.5 bg-ink" aria-hidden="true"></div>
+                            <span class="nb-badge-neutral -rotate-2" x-text="`${discoveryApps.length} Apps Found`"></span>
                         </div>
-                        
-                        <div class="flex items-center gap-3 w-full md:w-auto">
-                            <div class="relative flex-1 md:w-64 group">
+
+                        <div class="flex flex-col sm:flex-row sm:items-center gap-3 w-full md:w-auto">
+                            <div class="relative flex-1 md:w-64">
                                 <div class="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none">
-                                    <svg class="h-3.5 w-3.5 text-slate-500 group-focus-within:text-indigo-400 transition-colors" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <svg class="h-4 w-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
                                     </svg>
                                 </div>
-                                <input 
-                                    type="text" 
+                                <input
+                                    type="text"
+                                    aria-label="Search packages"
                                     x-model="search"
-                                    placeholder="Search packages..." 
-                                    class="block w-full pl-10 pr-4 py-2 bg-slate-900/50 border border-slate-800 rounded-xl focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500/50 outline-none transition-all text-xs placeholder-slate-600"
+                                    placeholder="Search packages..."
+                                    class="nb-input pl-10"
                                 >
                             </div>
-                            <button 
+                            <button
                                 @click="refreshDiscovery(true)"
                                 :disabled="refreshing"
-                                class="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-800 text-white disabled:text-slate-500 rounded-xl text-[11px] font-black transition-all shadow-lg shadow-indigo-600/20 flex items-center gap-2 whitespace-nowrap">
-                                <svg :class="refreshing ? 'animate-spin' : ''" xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2v6h-6"></path><path d="M3 12a9 9 0 0 1 15-6.7L21 8"></path><path d="M3 22v-6h6"></path><path d="M21 12a9 9 0 0 1-15 6.7L3 16"></path></svg>
+                                class="nb-btn-primary whitespace-nowrap">
+                                <svg :class="refreshing ? 'animate-spin' : ''" xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2v6h-6"></path><path d="M3 12a9 9 0 0 1 15-6.7L21 8"></path><path d="M3 22v-6h6"></path><path d="M21 12a9 9 0 0 1-15 6.7L3 16"></path></svg>
                                 <span x-text="refreshing ? 'Syncing...' : 'Sync Sources'"></span>
                             </button>
                         </div>
                     </div>
 
-                    <div class="bg-slate-900 border border-slate-800 rounded-3xl overflow-hidden shadow-2xl relative">
-                        <div class="overflow-y-auto h-[550px] divide-y divide-slate-800/30 scroll-smooth">
+                    <div class="nb-card overflow-hidden relative">
+                        <div class="overflow-y-auto h-[550px] divide-y-2 divide-ink scroll-smooth">
                             <template x-for="app in discoveryApps.filter(i => i.name.toLowerCase().includes(search.toLowerCase()) || i.pkg.toLowerCase().includes(search.toLowerCase()))" :key="app.pkg">
-                                <div class="flex items-center justify-between px-6 py-5 hover:bg-white/[0.02] transition-all group">
-                                    <div class="flex items-center gap-5">
-                                        <div class="w-10 h-10 bg-slate-950 rounded-xl flex items-center justify-center text-indigo-400 font-black text-sm border border-slate-800 group-hover:border-indigo-500/30 transition-all" x-text="app.name[0]"></div>
-                                        <div class="flex flex-col">
-                                            <span class="text-[13px] font-bold text-slate-100 group-hover:text-white transition-colors" x-text="app.name"></span>
-                                            <span class="text-[10px] font-medium text-slate-500 font-mono tracking-tight" x-text="app.pkg"></span>
+                                <div class="flex flex-wrap items-center justify-between gap-3 px-4 sm:px-6 py-4 hover:bg-pop-yellow hover:text-black">
+                                    <div class="flex min-w-0 items-center gap-4">
+                                        <div class="w-10 h-10 shrink-0 bg-pop-yellow text-black border-4 border-ink flex items-center justify-center font-black text-sm" x-text="app.name[0]"></div>
+                                        <div class="flex min-w-0 flex-col">
+                                            <span class="text-sm font-bold break-words" x-text="app.name"></span>
+                                            <span class="nb-muted text-xs font-mono break-all" x-text="app.pkg"></span>
                                         </div>
                                     </div>
-                                    
-                                    <button 
+
+                                    <button
                             @click="openAddModal(app, $event.currentTarget)"
-                                        class="px-5 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest bg-slate-800 hover:bg-white text-slate-400 hover:text-slate-950 transition-all border border-slate-700 hover:border-white shadow-sm">
+                                        class="nb-btn">
                                         Configure
                                     </button>
                                 </div>
                             </template>
                             <template x-if="discoveryApps.length === 0 && !refreshing">
                                 <div class="h-full flex flex-col items-center justify-center p-12 text-center">
-                                    <div class="w-16 h-16 bg-slate-800 rounded-3xl flex items-center justify-center mb-4">
-                                        <svg xmlns="http://www.w3.org/2000/svg" class="w-8 h-8 text-slate-600" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" /></svg>
+                                    <div class="w-16 h-16 bg-pop-yellow border-4 border-ink flex items-center justify-center mb-4">
+                                        <svg xmlns="http://www.w3.org/2000/svg" class="w-8 h-8" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" /></svg>
                                     </div>
-                                    <h3 class="text-white font-bold">No apps found</h3>
-                                    <p class="text-slate-500 text-xs mt-1">Try syncing your sources to find compatible packages.</p>
+                                    <h3 class="font-black uppercase tracking-tight">No apps found</h3>
+                                    <p class="nb-muted text-sm mt-1">Try syncing your sources to find compatible packages.</p>
                                 </div>
                             </template>
                         </div>
@@ -1350,18 +1337,17 @@
 
         <!-- Tab 2: Pipeline -->
         <div x-show="activeTab === 'pipeline'" x-cloak class="space-y-8">
-            <div class="flex items-center justify-between">
+            <div class="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
                 <div>
-                    <h2 class="text-2xl font-bold text-white">Active Pipeline</h2>
-                    <p class="text-slate-500 text-sm mt-1">Manage and build your patched applications.</p>
+                    <h2 class="text-3xl sm:text-4xl font-black uppercase leading-none tracking-tighter -rotate-1">Active Pipeline</h2>
+                    <p class="nb-muted text-sm mt-1">Manage and build your patched applications.</p>
                 </div>
-                
-                <div class="flex flex-col items-end gap-2">
-                    <button 
+
+                <div class="flex flex-col sm:items-end gap-2">
+                    <button
                         @click="triggerBuild()"
                         :disabled="building"
-                        :class="building ? 'bg-slate-800 text-slate-500 border-slate-700' : 'bg-white hover:bg-slate-200 text-slate-950'"
-                        class="px-8 py-3 rounded-2xl font-bold transition-all flex items-center gap-3 border border-transparent disabled:cursor-not-allowed shadow-xl shadow-white/5">
+                        class="nb-btn-primary px-6 py-3 text-base">
                         <template x-if="!building">
                             <svg xmlns="http://www.w3.org/2000/svg" class="w-5 h-5" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
                         </template>
@@ -1370,56 +1356,55 @@
                         </template>
                         <span x-text="building ? buildMessage : (selectedApps.length > 0 ? 'Build Selected (' + selectedApps.length + ')' : 'Build All Apps')"></span>
                     </button>
-                    <div x-show="lastRun !== 'Never'" class="text-[10px] text-slate-500 font-bold uppercase tracking-widest px-2">
-                        Last Run: <span class="text-slate-400" x-text="lastRun"></span>
+                    <div x-show="lastRun !== 'Never'" class="nb-muted text-xs font-semibold">
+                        Last Run: <span class="font-bold" x-text="lastRun"></span>
                     </div>
-                    <p x-show="buildError" x-cloak role="alert" class="max-w-sm text-right text-sm text-red-400" x-text="buildError"></p>
+                    <p x-show="buildError" x-cloak role="alert" class="nb-alert nb-alert-error max-w-sm" x-text="buildError"></p>
                 </div>
             </div>
 
             <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
                 {% for app in config.apps %}
-                <div 
-                    :class="selectedApps.includes('{{ app.id }}') ? 'border-indigo-500 bg-indigo-500/5 ring-1 ring-indigo-500/20' : 'border-slate-800 bg-slate-900'"
-                    class="p-4 sm:p-6 border rounded-lg hover:border-slate-700 transition-colors group shadow-sm">
+                <div
+                    :class="selectedApps.includes('{{ app.id }}') ? 'nb-card-selected' : 'nb-card'"
+                    class="nb-lift p-4 sm:p-6 group">
                     <div class="flex flex-col gap-4">
                     <div role="group" aria-label="App actions" class="order-2 flex flex-wrap items-center justify-center gap-2">
-                        <button 
+                        <button
                             @click="addToObtainium('{{ app.id }}')"
                             :disabled="updates['{{ app.id }}'] && !updates['{{ app.id }}'].file_exists"
-                            :class="updates['{{ app.id }}'] && !updates['{{ app.id }}'].file_exists ? 'bg-slate-800 text-slate-700 cursor-not-allowed' : 'bg-slate-800 hover:bg-emerald-600 text-slate-400 hover:text-white'"
-                            class="inline-flex min-w-11 min-h-11 items-center justify-center p-2 rounded-lg transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400"
+                            class="nb-btn-icon"
                             aria-label="Add to Obtainium (App API)"
                             title="Add to Obtainium (App API)">
                             <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" /></svg>
                         </button>
-                        <a 
+                        <a
                             :href="'/view/' + '{{ app.id }}'"
                             target="_blank"
                             :disabled="updates['{{ app.id }}'] && !updates['{{ app.id }}'].file_exists"
-                            :class="updates['{{ app.id }}'] && !updates['{{ app.id }}'].file_exists ? 'bg-slate-800 text-slate-700 cursor-not-allowed pointer-events-none' : 'bg-slate-800 hover:bg-indigo-600 text-slate-400 hover:text-white'"
-                            class="inline-flex min-w-11 min-h-11 items-center justify-center p-2 rounded-lg transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400"
+                            :class="updates['{{ app.id }}'] && !updates['{{ app.id }}'].file_exists ? 'opacity-55 shadow-none cursor-not-allowed pointer-events-none' : ''"
+                            class="nb-btn-icon"
                             aria-label="Open Download Page"
                             title="Open Download Page">
                             <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" /></svg>
                         </a>
-                        <button 
+                        <button
                             @click="openUploadDialog('{{ app.id }}', $event.currentTarget)"
-                            class="inline-flex min-w-11 min-h-11 items-center justify-center bg-slate-800 hover:bg-amber-600 p-2 rounded-lg text-slate-400 hover:text-white transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400"
+                            class="nb-btn-icon"
                             aria-label="Upload Manual APK"
                             title="Upload Manual APK">
                             <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" /></svg>
                         </button>
-                        <button 
+                        <button
                             @click="openEditModal(pipelineApps[{{ loop.index0 }}], $event.currentTarget)"
-                            class="inline-flex min-w-11 min-h-11 items-center justify-center bg-slate-800 hover:bg-indigo-600 p-2 rounded-lg text-slate-400 hover:text-white transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400"
+                            class="nb-btn-icon"
                             aria-label="Edit Configuration"
                             title="Edit Configuration">
                             <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" /></svg>
                         </button>
-                        <button 
+                        <button
                             @click="deleteApp(pipelineApps[{{ loop.index0 }}], '{{ app.id }}')"
-                            class="inline-flex min-w-11 min-h-11 items-center justify-center bg-slate-800 hover:bg-red-600 p-2 rounded-lg text-slate-400 hover:text-white transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400"
+                            class="nb-btn-icon"
                             aria-label="Remove App"
                             title="Remove App">
                             <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
@@ -1428,53 +1413,52 @@
 
                     <div class="contents">
                         <div class="order-1 flex min-w-0 items-start gap-3">
-                        <div class="w-12 h-12 shrink-0 bg-slate-800 rounded-lg flex items-center justify-center text-indigo-400 font-bold text-xl overflow-hidden border border-slate-700">
-                            <template x-if="updates['{{ app.id }}'] && !updates['{{ app.id }}'].icon_exists">
+                        <div class="w-12 h-12 shrink-0 bg-pop-yellow text-black border-4 border-ink flex items-center justify-center font-bold text-xl overflow-hidden">
+                            <template x-if="iconFailed['{{ app.id }}'] || (updates['{{ app.id }}'] && !updates['{{ app.id }}'].icon_exists)">
                                 <span x-text="(metadata['{{ app.id }}'] ? metadata['{{ app.id }}'].real_name : pipelineApps[{{ loop.index0 }}].name)[0]"></span>
                             </template>
-                            <img :src="'/icons/' + '{{ app.id }}' + '.png'" 
+                            <img :src="'/icons/' + '{{ app.id }}' + '.png'"
                                  alt=""
                                  class="w-full h-full object-cover"
-                                 x-show="updates['{{ app.id }}'] && updates['{{ app.id }}'].icon_exists">
+                                 @error="iconFailed['{{ app.id }}'] = true"
+                                 x-show="!iconFailed['{{ app.id }}'] && updates['{{ app.id }}'] && updates['{{ app.id }}'].icon_exists">
                         </div>
                         <div class="min-w-0 flex-1 pt-0.5">
-                            <h3 class="font-bold text-lg text-white group-hover:text-indigo-400 transition-colors break-words" x-text="metadata['{{ app.id }}'] ? metadata['{{ app.id }}'].real_name : pipelineApps[{{ loop.index0 }}].name"></h3>
-                            <code class="text-[10px] text-slate-500 block mt-1 break-all">{{ app.id }}</code>
+                            <h3 class="font-bold text-lg break-words group-hover:underline" x-text="metadata['{{ app.id }}'] ? metadata['{{ app.id }}'].real_name : pipelineApps[{{ loop.index0 }}].name"></h3>
+                            <code class="text-xs block mt-1 break-all">{{ app.id }}</code>
                         </div>
                         </div>
 
                         <div class="order-3 min-w-0 flex-1 space-y-2">
                                 <template x-if="updates['{{ app.id }}'] && updates['{{ app.id }}'].has_update">
                                     <div class="flex items-center gap-2">
-                                        <span class="flex h-2 w-2 shrink-0 rounded-full bg-amber-500"></span>
-                                        <span class="text-xs font-semibold text-amber-300 break-words" x-text="updates['{{ app.id }}'].current === 'None' ? 'New App: v' + updates['{{ app.id }}'].latest : 'Update Available: v' + updates['{{ app.id }}'].latest"></span>
+                                        <span class="nb-badge-yellow max-w-full break-words" x-text="updates['{{ app.id }}'].current === 'None' ? 'New App: v' + updates['{{ app.id }}'].latest : 'Update Available: v' + updates['{{ app.id }}'].latest"></span>
                                     </div>
                                 </template>
                                 <template x-if="updates['{{ app.id }}'] && !updates['{{ app.id }}'].has_update">
                                     <div class="flex items-center gap-2">
-                                        <div class="flex h-3 w-3 items-center justify-center rounded-full bg-emerald-500/20 text-emerald-500">
-                                            <svg xmlns="http://www.w3.org/2000/svg" class="h-2 w-2" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd" /></svg>
-                                        </div>
-                                        <span class="text-xs font-medium text-slate-300">Up to date</span>
+                                        <span class="nb-badge-green gap-1.5">
+                                            <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd" /></svg>
+                                            Up to date
+                                        </span>
                                     </div>
                                 </template>
                                 <template x-if="updates['{{ app.id }}'] && updates['{{ app.id }}'].status === 'Error' && updates['{{ app.id }}'].error">
-                                    <p class="text-xs text-red-300 break-words" x-text="updates['{{ app.id }}'].error"></p>
+                                    <p class="nb-alert nb-alert-error py-2 text-xs break-words" x-text="updates['{{ app.id }}'].error"></p>
                                 </template>
                         </div>
 
-                        <div class="order-4 flex flex-col gap-3 border-t border-slate-800 pt-3 sm:flex-row sm:items-end sm:justify-between">
-                            <span class="inline-flex text-xs font-medium text-slate-300 bg-slate-800 px-2 py-1 rounded">
+                        <div class="order-4 flex flex-col gap-3 border-t-2 border-ink pt-3 sm:flex-row sm:items-center sm:justify-between">
+                            <span class="nb-badge-neutral self-start">
                                 {{ app.include_patches | length if app.include_patches else 0 }} Patches
                             </span>
-                            <label class="min-h-11 shrink-0 inline-flex items-center gap-3 px-2 cursor-pointer rounded focus-within:outline focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-blue-400">
-                                <input type="checkbox" value="{{ app.id }}" aria-label="Select app for build" x-model="selectedApps" class="sr-only peer">
-                                <span aria-hidden="true" class="relative w-9 h-5 shrink-0 bg-slate-800 rounded-full peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-slate-500 peer-checked:after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-indigo-600 border border-slate-700 peer-checked:border-indigo-400"></span>
-                                <span class="text-xs font-semibold text-slate-300" x-text="selectedApps.includes('{{ app.id }}') ? 'Selected for build' : 'Select app for build'"></span>
+                            <label class="min-h-11 shrink-0 inline-flex items-center gap-3 px-2 cursor-pointer">
+                                <input type="checkbox" value="{{ app.id }}" aria-label="Select app for build" x-model="selectedApps" class="nb-checkbox">
+                                <span class="text-sm font-semibold" x-text="selectedApps.includes('{{ app.id }}') ? 'Selected for build' : 'Select app for build'"></span>
                             </label>
                         </div>
                     </div>
-                    <p x-show="appErrors['{{ app.id }}']" x-cloak role="alert" class="mt-3 text-sm text-red-400" x-text="appErrors['{{ app.id }}']"></p>
+                    <p x-show="appErrors['{{ app.id }}']" x-cloak role="alert" class="nb-alert nb-alert-error mt-3" x-text="appErrors['{{ app.id }}']"></p>
                     </div>
                 </div>
                 {% endfor %}
@@ -1482,17 +1466,17 @@
 
             <!-- Console -->
             <div class="mt-12">
-                <div class="bg-slate-900 border border-slate-800 rounded-3xl overflow-hidden shadow-2xl">
-                    <div class="px-6 py-4 border-b border-slate-800 flex items-center justify-between bg-slate-900/50">
+                <div class="nb-card overflow-hidden">
+                    <div class="px-4 sm:px-6 py-3 nb-head flex items-center justify-between gap-3">
                         <div class="flex items-center gap-3">
-                            <div class="w-2 h-2 rounded-full" :class="building ? 'bg-amber-500 animate-pulse' : 'bg-slate-700'"></div>
-                            <h3 class="text-xs font-bold text-slate-400 uppercase tracking-widest">Build Console</h3>
+                            <div class="w-3 h-3 border-2 border-ink" :class="building ? 'bg-pop-yellow' : 'bg-paper'" aria-hidden="true"></div>
+                            <h3 class="text-base font-black uppercase tracking-tight">Build Console</h3>
                         </div>
-                        <button @click="buildLogs = ''; fetch('/api/ui/logs').then(r => r.json()).then(d => buildLogs = d.logs)" class="text-[10px] text-slate-500 hover:text-white transition-colors uppercase font-bold tracking-tighter">Refresh Logs</button>
+                        <button @click="buildLogs = ''; fetch('/api/ui/logs').then(r => r.json()).then(d => buildLogs = d.logs)" class="nb-btn-ghost text-xs">Refresh Logs</button>
                     </div>
-                    <div id="log-container" class="p-6 h-80 overflow-y-auto font-mono text-[11px] text-slate-400 bg-black/40 selection:bg-indigo-500/30">
+                    <div id="log-container" class="nb-console p-4 sm:p-6 h-80 overflow-y-auto border-0 selection:bg-pop-yellow selection:text-black">
                         <template x-if="!buildLogs">
-                            <p class="text-slate-700 italic">No logs available. Start a build to see output...</p>
+                            <p>No logs available. Start a build to see output...</p>
                         </template>
                         <pre x-text="buildLogs" class="whitespace-pre-wrap break-all"></pre>
                     </div>
@@ -1503,43 +1487,43 @@
         <!-- Tab 3: Settings -->
         <div x-show="activeTab === 'settings'" x-cloak class="max-w-2xl mx-auto space-y-8">
             <!-- Secrets card -->
-            <div class="bg-slate-900 border border-slate-800 rounded-3xl overflow-hidden shadow-2xl">
-                <div class="p-8 border-b border-slate-800">
-                    <h2 class="text-xl font-bold text-white">Secrets</h2>
-                    <p class="text-slate-500 text-sm mt-1">Stored on the server. A saved value is never shown again.</p>
+            <div class="nb-card overflow-hidden">
+                <div class="p-5 sm:p-8 nb-head">
+                    <h2 class="text-2xl font-black uppercase tracking-tighter">Secrets</h2>
+                    <p class="nb-muted text-sm mt-1">Stored on the server. A saved value is never shown again.</p>
                 </div>
-                <div class="p-8 space-y-6">
+                <div class="p-5 sm:p-8 space-y-6">
                     <template x-if="plainHttp">
-                        <div class="px-4 py-3 bg-amber-500/10 border border-amber-500/20 rounded-xl text-[11px] font-bold text-amber-400">
+                        <div class="nb-alert nb-alert-warning">
                             This page is served over plain HTTP, so a value you save crosses the network unencrypted.
                         </div>
                     </template>
                     <template x-if="secretsLoadError">
-                        <div class="flex items-center justify-between gap-3 px-4 py-3 bg-red-500/10 border border-red-500/20 rounded-xl text-[11px] font-bold text-red-400" role="alert">
+                        <div class="nb-alert nb-alert-error flex flex-wrap items-center justify-between gap-3" role="alert">
                             <span x-text="'Could not load the secret status: ' + secretsLoadError"></span>
-                            <button @click="loadSecrets()" class="px-3 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg text-xs font-bold transition-all">Retry</button>
+                            <button @click="loadSecrets()" class="nb-btn text-xs">Retry</button>
                         </div>
                     </template>
                     <template x-for="field in secretFields" :key="field.slug">
                         <div class="space-y-3">
-                            <div class="flex items-center justify-between">
-                                <h3 class="text-xs font-bold text-slate-500 uppercase tracking-widest" x-text="field.label"></h3>
-                                <span class="px-2 py-0.5 rounded text-[9px] font-bold border"
+                            <div class="flex items-center justify-between gap-3">
+                                <h3 class="text-base font-black uppercase tracking-tight" x-text="field.label"></h3>
+                                <span class="shrink-0"
                                     :class="secretBadgeClass(field.slug)"
                                     x-text="secretState(field.slug) === 'file' ? 'Saved' : secretState(field.slug) === 'environment' ? 'Set by environment' : secretState(field.slug) === 'environment_invalid' ? 'Environment value invalid' : secretState(field.slug) === 'unset' ? 'Not set' : 'Loading...'"></span>
                             </div>
                             <template x-if="secretState(field.slug) === 'loading'">
-                                <p class="text-[10px] text-slate-600">Loading the status...</p>
+                                <p class="nb-muted text-xs">Loading the status...</p>
                             </template>
                             <template x-if="secretState(field.slug) === 'environment'">
-                                <p class="text-[10px] text-slate-500">Set by the environment variable <code x-text="field.env"></code>. Change it where the app is started; it cannot be changed here.</p>
+                                <p class="nb-muted text-xs">Set by the environment variable <code x-text="field.env"></code>. Change it where the app is started; it cannot be changed here.</p>
                             </template>
                             <template x-if="secretState(field.slug) === 'environment_invalid'">
-                                <p class="text-[10px] text-red-400">The environment variable <code x-text="field.env"></code> is set but its value is not valid, so it is ignored. Fix or remove it and restart the app.</p>
+                                <p class="nb-text-error text-xs font-semibold">The environment variable <code x-text="field.env"></code> is set but its value is not valid, so it is ignored. Fix or remove it and restart the app.</p>
                             </template>
                             <div class="space-y-2" x-show="secretState(field.slug) === 'unset' || secretState(field.slug) === 'file'">
                                     <label :for="'secret-' + field.slug" class="sr-only" x-text="(secretState(field.slug) === 'file' ? 'New value for ' : 'Value for ') + field.label"></label>
-                                    <div class="flex gap-3">
+                                    <div class="flex flex-col sm:flex-row gap-3">
                                         <input
                                             type="password"
                                             :id="'secret-' + field.slug"
@@ -1551,19 +1535,19 @@
                                             :aria-describedby="'secret-hint-' + field.slug + ' secret-msg-' + field.slug"
                                             :placeholder="secretState(field.slug) === 'file' ? 'Enter a new value to replace the stored one' : 'Paste the value'"
                                             @keydown.enter="saveSecret(field.slug)"
-                                            class="flex-1 min-w-0 bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-white focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500 outline-none transition-all font-mono text-sm">
+                                            class="nb-input flex-1 min-w-0 font-mono">
                                         <button
                                             @click="saveSecret(field.slug)"
                                             :disabled="secretBusy[field.slug] || !secretInput[field.slug]"
-                                            class="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold transition-all disabled:opacity-50 disabled:cursor-not-allowed focus:ring-2 focus:ring-indigo-500/50 outline-none"
+                                            class="nb-btn-primary"
                                             x-text="secretBusy[field.slug] ? 'Saving...' : (secretState(field.slug) === 'file' ? 'Replace' : 'Save')"></button>
                                         <button
                                             x-show="secretState(field.slug) === 'file'"
                                             @click="clearSecret(field.slug)"
                                             :disabled="secretBusy[field.slug]"
-                                            class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl text-xs font-bold transition-all disabled:opacity-50 disabled:cursor-not-allowed focus:ring-2 focus:ring-indigo-500/50 outline-none">Clear</button>
+                                            class="nb-btn">Clear</button>
                                     </div>
-                                    <p :id="'secret-hint-' + field.slug" class="text-[10px] text-slate-600" x-text="field.hint"></p>
+                                    <p :id="'secret-hint-' + field.slug" class="nb-muted text-xs" x-text="field.hint"></p>
                             </div>
                             <p :id="'secret-msg-' + field.slug" role="alert"
                                 x-show="secretMessage[field.slug]"
@@ -1571,10 +1555,10 @@
                                 x-text="secretMessage[field.slug] && secretMessage[field.slug].text"></p>
                             <template x-if="field.slug === 'github-token' && (secretState(field.slug) === 'file' || secretState(field.slug) === 'environment')">
                                 <div class="space-y-2">
-                                    <p x-show="githubTokenRejected" class="px-4 py-3 bg-red-500/10 border border-red-500/20 rounded-xl text-[11px] font-bold text-red-400" x-text="githubTokenRejected"></p>
-                                    <p x-show="githubTokenWarning && !githubTokenRejected" class="px-4 py-3 bg-amber-500/10 border border-amber-500/20 rounded-xl text-[11px] font-bold text-amber-400" x-text="githubTokenWarning"></p>
+                                    <p x-show="githubTokenRejected" class="nb-alert nb-alert-error" x-text="githubTokenRejected"></p>
+                                    <p x-show="githubTokenWarning && !githubTokenRejected" class="nb-alert nb-alert-warning" x-text="githubTokenWarning"></p>
                                     <template x-if="!githubTokenRejected && githubTokenPermissions">
-                                        <p class="text-[10px] text-slate-500">
+                                        <p class="nb-muted text-xs">
                                             <span x-show="githubTokenPermissions === 'none'">The last check found no permissions on this token.</span>
                                             <span x-show="githubTokenPermissions === 'present'">The last check found permissions on this token.</span>
                                             <span x-show="githubTokenPermissions === 'unverifiable'">This kind of token does not report its permissions, so they cannot be checked here.</span>
@@ -1590,93 +1574,93 @@
             </div>
 
             <!-- System settings card -->
-            <div class="bg-slate-900 border border-slate-800 rounded-3xl overflow-hidden shadow-2xl">
-                <div class="p-8 border-b border-slate-800">
-                    <h2 class="text-xl font-bold text-white">System Settings</h2>
-                    <p class="text-slate-500 text-sm mt-1">Configure global builder environment variables.</p>
+            <div class="nb-card overflow-hidden">
+                <div class="p-5 sm:p-8 nb-head">
+                    <h2 class="text-2xl font-black uppercase tracking-tighter">System Settings</h2>
+                    <p class="nb-muted text-sm mt-1">Configure global builder environment variables.</p>
                 </div>
-                
-                <div class="p-8 space-y-6">
+
+                <div class="p-5 sm:p-8 space-y-6">
                     <div class="space-y-2">
-                        <label class="text-xs font-bold text-slate-500 uppercase tracking-widest">Server URL</label>
+                        <label for="settings-server-url" class="nb-label block">Server URL</label>
                         <div class="flex gap-3">
-                            <input type="text" x-model="settings.server_url" placeholder="https://morphe.yourdomain.com" class="flex-1 bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-white focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500 outline-none transition-all font-mono text-sm">
+                            <input id="settings-server-url" type="text" x-model="settings.server_url" placeholder="https://morphe.yourdomain.com" class="nb-input flex-1 min-w-0 font-mono">
                         </div>
-                        <p class="text-[10px] text-slate-600">The public URL of this server. Used to generate download links for Obtainium.</p>
+                        <p class="nb-muted text-xs">The public URL of this server. Used to generate download links for Obtainium.</p>
                     </div>
 
                     <div class="space-y-2">
-                        <label class="text-xs font-bold text-slate-500 uppercase tracking-widest">Background Build Schedule (Cron)</label>
+                        <label for="settings-cron" class="nb-label block">Background Build Schedule (Cron)</label>
                         <div class="flex gap-3">
-                            <input type="text" x-model="settings.cron_schedule" placeholder="0 */4 * * * (Every 4 hours)" class="flex-1 bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-white focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500 outline-none transition-all font-mono text-sm">
+                            <input id="settings-cron" type="text" x-model="settings.cron_schedule" placeholder="0 */4 * * * (Every 4 hours)" class="nb-input flex-1 min-w-0 font-mono">
                         </div>
-                        <p class="text-[10px] text-slate-600">Use standard crontab format: <code>minute hour day month day_of_week</code>. Use <a href="https://crontab.guru" target="_blank" class="text-indigo-400 hover:text-indigo-300 transition-colors underline">crontab.guru</a> to format your schedule. Leave empty to disable.</p>
+                        <p class="nb-muted text-xs">Use standard crontab format: <code>minute hour day month day_of_week</code>. Use <a href="https://crontab.guru" target="_blank" class="inline-flex min-h-11 items-center font-bold underline underline-offset-4 hover:bg-pop-yellow hover:text-black">crontab.guru</a> to format your schedule. Leave empty to disable.</p>
                     </div>
 
-                    <div class="pt-6 border-t border-slate-800 space-y-4">
-                        <div class="flex items-center justify-between">
-                            <label class="text-xs font-bold text-slate-500 uppercase tracking-widest">Apprise Notifications</label>
-                            <a href="https://github.com/caronc/apprise/wiki" target="_blank" class="text-[10px] text-indigo-400 hover:text-indigo-300 transition-colors font-bold uppercase tracking-tight">Setup Guide</a>
+                    <div class="pt-6 border-t-2 nb-rule space-y-4">
+                        <div class="flex items-center justify-between gap-3">
+                            <label class="nb-label">Apprise Notifications</label>
+                            <a href="https://github.com/caronc/apprise/wiki" target="_blank" class="inline-flex min-h-11 items-center text-sm font-bold underline underline-offset-4 hover:bg-pop-yellow hover:text-black">Setup Guide</a>
                         </div>
 
-                        <div class="flex flex-wrap items-center gap-2 text-xs text-slate-300" role="status">
+                        <div class="flex flex-wrap items-center gap-2 text-sm" role="status">
                             <span x-show="appriseLoaded"><span x-text="appriseStatus.count"></span> destination<span x-show="appriseStatus.count !== 1">s</span></span>
                             <span x-show="!appriseLoaded">Loading notification status...</span>
-                            <span x-show="appriseLoaded" class="text-slate-500" x-text="appriseStatus.source === 'environment' ? 'Set by environment' : appriseStatus.source === 'environment_invalid' ? 'Environment value invalid' : appriseStatus.source === 'file_invalid' ? 'Stored value invalid' : appriseStatus.source === 'legacy' ? 'Legacy settings' : appriseStatus.source === 'file' ? 'Stored on server' : 'Not set'"></span>
+                            <span x-show="appriseLoaded" class="nb-badge-neutral" x-text="appriseStatus.source === 'environment' ? 'Set by environment' : appriseStatus.source === 'environment_invalid' ? 'Environment value invalid' : appriseStatus.source === 'file_invalid' ? 'Stored value invalid' : appriseStatus.source === 'legacy' ? 'Legacy settings' : appriseStatus.source === 'file' ? 'Stored on server' : 'Not set'"></span>
                         </div>
-                        <p class="text-[10px] text-slate-500">Destination values are never shown again. Saving replaces the complete list. Add every destination you want to keep before saving.</p>
+                        <p class="nb-muted text-xs">Destination values are never shown again. Saving replaces the complete list. Add every destination you want to keep before saving.</p>
                         <template x-if="appriseStatus.source === 'environment' || appriseStatus.source === 'environment_invalid'">
-                            <p class="text-xs text-amber-400" role="status" x-text="appriseStatus.source === 'environment_invalid' ? 'APPRISE_URLS is set but invalid. It blocks file and legacy fallback; fix it where the app is started.' : 'APPRISE_URLS is supplied by the environment and cannot be changed here.'"></p>
+                            <p class="nb-alert nb-alert-warning" role="status" x-text="appriseStatus.source === 'environment_invalid' ? 'APPRISE_URLS is set but invalid. It blocks file and legacy fallback; fix it where the app is started.' : 'APPRISE_URLS is supplied by the environment and cannot be changed here.'"></p>
                         </template>
                         <template x-if="appriseStatus.source === 'file_invalid'">
-                            <p class="text-xs text-red-400" role="status">The stored APPRISE_URLS value is invalid. Replace or clear it to restore notification settings.</p>
+                            <p class="nb-alert nb-alert-error" role="status">The stored APPRISE_URLS value is invalid. Replace or clear it to restore notification settings.</p>
                         </template>
                         <template x-if="appriseStatus.migration_state === 'pending'">
                             <div class="space-y-2">
-                                <p class="text-xs text-amber-300">Legacy destinations are still in general settings. Import them to move them into write-only secret storage.</p>
-                                <button @click="migrateAppriseUrls()" :disabled="appriseBusy || appriseLocked" class="min-h-11 px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-100 rounded-lg text-xs font-bold disabled:opacity-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400">Import legacy destinations</button>
+                                <p class="nb-alert nb-alert-warning">Legacy destinations are still in general settings. Import them to move them into write-only secret storage.</p>
+                                <button @click="migrateAppriseUrls()" :disabled="appriseBusy || appriseLocked" class="nb-btn">Import legacy destinations</button>
                             </div>
                         </template>
                         <template x-if="appriseStatus.migration_state === 'retry'">
                             <div class="space-y-2">
-                                <p class="text-xs text-amber-300">The destinations were stored, but removing the old settings entry did not finish.</p>
-                                <button @click="migrateAppriseUrls()" :disabled="appriseBusy || appriseLocked" class="min-h-11 px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-100 rounded-lg text-xs font-bold disabled:opacity-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400">Retry legacy cleanup</button>
+                                <p class="nb-alert nb-alert-warning">The destinations were stored, but removing the old settings entry did not finish.</p>
+                                <button @click="migrateAppriseUrls()" :disabled="appriseBusy || appriseLocked" class="nb-btn">Retry legacy cleanup</button>
                             </div>
                         </template>
                         <template x-if="appriseStatus.migration_state === 'conflict'">
-                            <p class="text-xs text-red-400" role="status">Legacy destinations conflict with the stored or environment-owned list. Resolve the owner before importing; saving a replacement or clearing destinations removes the legacy entry.</p>
+                            <p class="nb-alert nb-alert-error" role="status">Legacy destinations conflict with the stored or environment-owned list. Resolve the owner before importing; saving a replacement or clearing destinations removes the legacy entry.</p>
                         </template>
 
                         <div class="flex flex-col sm:flex-row gap-3">
                             <label for="apprise-url-input" class="sr-only">Notification destination URL</label>
-                            <input id="apprise-url-input" type="password" x-model="appriseInput" autocomplete="off" spellcheck="false" autocapitalize="off" autocorrect="off" maxlength="2048" placeholder="Paste one destination URL" @keydown.enter.prevent="addAppriseDestination()" :disabled="appriseLocked || appriseBusy" class="flex-1 min-w-0 bg-slate-950 border border-slate-700 rounded-lg px-4 py-3 text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400 disabled:opacity-50 text-sm">
-                            <button @click="addAppriseDestination()" :disabled="appriseLocked || appriseBusy || !appriseInput" class="min-h-11 px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-100 rounded-lg text-xs font-bold disabled:opacity-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400">Add destination</button>
+                            <input id="apprise-url-input" type="password" x-model="appriseInput" autocomplete="off" spellcheck="false" autocapitalize="off" autocorrect="off" maxlength="2048" placeholder="Paste one destination URL" @keydown.enter.prevent="addAppriseDestination()" :disabled="appriseLocked || appriseBusy" class="nb-input flex-1 min-w-0">
+                            <button @click="addAppriseDestination()" :disabled="appriseLocked || appriseBusy || !appriseInput" class="nb-btn">Add destination</button>
                         </div>
                         <ol x-show="appriseDraft.length" class="space-y-2" aria-label="Destinations staged for replacement">
                             <template x-for="(url, index) in appriseDraft" :key="index">
-                                <li class="flex items-center justify-between gap-3 p-3 bg-slate-950 rounded-lg border border-slate-800 text-xs text-slate-300">
+                                <li class="nb-surface flex items-center justify-between gap-3 p-3 text-sm">
                                     <span>Destination <span x-text="index + 1"></span></span>
-                                    <button @click="appriseDraft.splice(index, 1)" :aria-label="'Remove destination ' + (index + 1)" :disabled="appriseBusy" class="min-h-11 px-3 text-slate-300 hover:text-red-300 rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400 disabled:opacity-50">Remove</button>
+                                    <button @click="appriseDraft.splice(index, 1)" :aria-label="'Remove destination ' + (index + 1)" :disabled="appriseBusy" class="nb-btn-ghost">Remove</button>
                                 </li>
                             </template>
                         </ol>
-                        <p x-show="appriseMessage" role="alert" class="text-xs" :class="feedbackClass(appriseMessage)" x-text="appriseMessage && appriseMessage.text"></p>
+                        <p x-show="appriseMessage" role="alert" :class="feedbackClass(appriseMessage)" x-text="appriseMessage && appriseMessage.text"></p>
                         <div class="flex flex-wrap gap-3">
-                            <button @click="saveAppriseUrls()" :disabled="appriseBusy || appriseLocked || !appriseDraft.length" class="min-h-11 px-5 py-2 bg-blue-700 hover:bg-blue-600 text-white rounded-lg text-xs font-bold disabled:opacity-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400" x-text="appriseBusy ? 'Saving...' : 'Save destinations'"></button>
-                            <button x-show="appriseStatus.set || appriseStatus.legacy_available || appriseStatus.source === 'file_invalid'" @click="clearAppriseUrls()" :disabled="appriseBusy || appriseLocked" class="min-h-11 px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg text-xs font-bold disabled:opacity-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-400">Clear all destinations</button>
+                            <button @click="saveAppriseUrls()" :disabled="appriseBusy || appriseLocked || !appriseDraft.length" class="nb-btn-primary" x-text="appriseBusy ? 'Saving...' : 'Save destinations'"></button>
+                            <button x-show="appriseStatus.set || appriseStatus.legacy_available || appriseStatus.source === 'file_invalid'" @click="clearAppriseUrls()" :disabled="appriseBusy || appriseLocked" class="nb-btn">Clear all destinations</button>
                         </div>
-                        <p x-show="notificationMessage" role="alert" class="text-sm" :class="feedbackClass(notificationMessage)" x-text="notificationMessage && notificationMessage.text"></p>
+                        <p x-show="notificationMessage" role="alert" :class="feedbackClass(notificationMessage)" x-text="notificationMessage && notificationMessage.text"></p>
                     </div>
                 </div>
 
-                <div class="p-8 bg-slate-950/50 border-t border-slate-800 flex flex-wrap justify-between items-center gap-4">
+                <div class="p-5 sm:p-8 nb-foot flex flex-wrap justify-between items-center gap-4">
                     <button
                         @click="testNotifications()"
                         :disabled="testingNotifications || !appriseStatus.set"
-                        class="px-6 py-3 rounded-xl font-bold text-slate-400 hover:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed transition-all text-sm">
+                        class="nb-btn">
                         <span x-text="testingNotifications ? 'Sending...' : 'Test Notifications'"></span>
                     </button>
-                    <button @click="saveSettings()" class="px-8 py-3 rounded-xl font-bold bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg shadow-indigo-600/20 transition-all">Save Settings</button>
+                    <button @click="saveSettings()" class="nb-btn-primary px-6 py-3 text-base">Save Settings</button>
                 </div>
             </div>
         </div>

@@ -1,22 +1,21 @@
 /** Tailwind 3.4.17 build for the admin page. Run through scripts/build_css.py. */
 module.exports = {
   content: ["./src/templates/*.html"],
+  // Light or dark follows the system setting; there is no toggle. The theme swap is
+  // done by the CSS variables in input.css, so the markup carries no dark: variants.
+  darkMode: "media",
   theme: {
     extend: {
       colors: {
-        indigo: {
-          50: "#eff6ff",
-          100: "#dbeafe",
-          200: "#bfdbfe",
-          300: "#93c5fd",
-          400: "#60a5fa",
-          500: "#0080ff",
-          600: "#0057b8",
-          700: "#00458f",
-          800: "#073b70",
-          900: "#0c3155",
-          950: "#08223b",
-        },
+        ink: "var(--ink)",
+        paper: "var(--paper)",
+        canvas: "var(--canvas)",
+        "pop-red": "var(--red)",
+        "pop-yellow": "var(--yellow)",
+        "pop-violet": "var(--violet)",
+      },
+      fontFamily: {
+        sans: ['"Space Grotesk"', "ui-sans-serif", "system-ui", "sans-serif"],
       },
     },
   },
