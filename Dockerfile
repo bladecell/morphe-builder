@@ -1,8 +1,11 @@
 FROM python:3.12-slim-bookworm
 
-# Install Java 17 and essential system dependencies
+# Java 21 for Morphe CLI (class file 65); bookworm only packages 17
+COPY --from=eclipse-temurin:21-jre /opt/java/openjdk /opt/java/openjdk
+ENV JAVA_HOME=/opt/java/openjdk PATH=/opt/java/openjdk/bin:$PATH
+
+# Essential system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    openjdk-17-jre-headless \
     curl \
     ca-certificates \
     unzip \

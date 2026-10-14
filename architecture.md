@@ -21,7 +21,7 @@ Morphe patch bundles, and serves the result to Obtainium.
 | Obtainium page | `src/templates/obtainium.html` | Minimal HTML page Obtainium parses for version and link |
 
 External tools, downloaded at runtime: `morphe-cli.jar` (patcher) and `APKEditor.jar`
-(merges split bundles, reads APK info). Both need Java 17.
+(merges split bundles, reads APK info). Both need Java 21.
 
 ## Data directory
 
@@ -144,7 +144,7 @@ relaunches the browser and retries once if the page or browser has died.
 
 ## Deployment
 
-Docker image on `python:3.12-slim` with Java 17, dependencies installed by `uv`.
+Docker image on `python:3.12-slim` with Java 21 (Temurin), dependencies installed by `uv`.
 Runs as root with Chromium unsandboxed; ShardX engine and `apkeep` are fetched at build time. Runtime variables such as `GITHUB_TOKEN`,
 JSON-array `APPRISE_URLS`, and `ALLOWED_HOSTS` can be passed with Docker `-e`
 without rebuilding the image. See [README deployment guidance](README.md#runtime-environment)
