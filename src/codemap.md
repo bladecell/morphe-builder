@@ -12,7 +12,7 @@ and Jinja templates:
 | `config_store.py` | Persistence | All `config.yaml` I/O: `load_config`, `update_config`, atomic write, `DATA_DIR`, `DEFAULT_CONFIG` |
 | `secrets_store.py` | Secret persistence | Environment/file precedence for GitHub and Apprise secrets, plus `discard_legacy_license_key`; atomic `DATA_DIR/.env`, redaction, child-environment stripping |
 | `request_guards.py` | Request security | Host, Origin, and Fetch Metadata checks; no authentication |
-| `apkmirror_downloader.py` | Gateway | `ApkMirror_Downloader`: drives one headless ShardX engine (sync Playwright over CDP) page through APKMirror and Uptodown; Morphe API variant resolver |
+| `apkmirror_downloader.py` | Gateway | `ApkMirror_Downloader`: drives one headless ShardX engine (sync Playwright over CDP) page through APKMirror and Uptodown; Morphe API variant resolver; `search()` rejects pages whose package or version differs from the request (`_accept_if_requested`) |
 | `templates/` | View | See [templates/codemap.md](templates/codemap.md) |
 
 ## Design
@@ -235,7 +235,7 @@ trusted. See [README host/proxy guidance](../README.md#host-and-reverse-proxy-ch
 ### External
 
 - GitHub REST (`/releases/latest`) and `raw.githubusercontent.com`, unauthenticated.
-- APKMirror through ShardX; Morphe API (`api.morphe.software`, `resolve_variant_url` returns a `ResolvedVariant` tagged APKMirror or Uptodown) for variant resolution; Uptodown (`*.uptodown.com`, files from `uptodown.com`/`.net`) through the same browser as second source; APKPure via `apkeep` as last fallback.
+- APKMirror through ShardX; Morphe API (`api.morphe.software`, `resolve_variant_url` returns a `ResolvedVariant` tagged APKMirror, Uptodown or APKPure; APKPure is a label only, `apkeep` does the download) for variant resolution; Uptodown (`*.uptodown.com`, files from `uptodown.com`/`.net`) through the same browser as second source; APKPure via `apkeep` as last fallback.
 - `java` subprocesses for `morphe-cli.jar` and `APKEditor.jar` (`settings.java_path`
   overrides the binary).
 - Apprise for notifications, resolving `APPRISE_URLS` before the legacy

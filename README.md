@@ -175,7 +175,9 @@ exact version. If APKMirror cannot be downloaded from, it uses the Uptodown page
 API resolved, but only when that page states the exact requested version, and then
 falls back to APKPure through `apkeep` (pinned by SHA-256 in the Dockerfile). Uptodown
 and APKPure are unsigned third-party mirrors; the app checks the package id but not the
-signing certificate.
+signing certificate. APKCombo is not used: `apkcombo.com` and `apkcombo.app` do not
+resolve in DNS, and the Morphe API currently redirects to a Google search rather than to
+any APKPure or APKCombo page.
 
 ### Host and reverse-proxy checks
 

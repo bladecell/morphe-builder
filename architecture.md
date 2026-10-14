@@ -138,7 +138,12 @@ removes the profile. The engine is fetched at Docker build time, never at runtim
 Source order in `patcher.download_apk`: APKMirror; then Uptodown, using the page the
 Morphe API resolved (`ApkMirror_Downloader.download_from_uptodown`: exact page version
 required, file host and type checked, package id re-read after merge); then APKPure via
-`apkeep`. Uptodown and APKPure files are unsigned third-party copies.
+`apkeep`. Uptodown and APKPure files are unsigned third-party copies. The resolver also
+recognises https `apkpure.com`/`apkpure.net` page URLs (`VariantSource.APKPURE`) but only
+as a label; the APKPure download always goes through `apkeep` by package and version.
+APKCombo is not implemented. `search()` accepts a final APKMirror page only when its
+package id equals the requested one and, if a version was requested, its version equals it
+(`_accept_if_requested`), so a fallback search hit for another app yields no icon or APK.
 Risk: the ~170 MB Chromium engine comes from a ProxyShard CDN and is unsigned;
 see the Dockerfile for how the build verifies it.
 

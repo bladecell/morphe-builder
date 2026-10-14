@@ -75,7 +75,7 @@ def test_returns_none_on_http_error_without_redirect(monkeypatch):
 def test_search_uses_resolved_metadata(monkeypatch):
     instance = object.__new__(downloader.ApkMirror_Downloader)
     monkeypatch.setattr(downloader, "resolve_variant_url", lambda *a: RESOLVED)
-    metadata = MagicMock()
+    metadata = MagicMock(package_name="com.a", version="1")
     instance._goto = MagicMock()
     instance.page = MagicMock()
     instance.page.content.return_value = "<html></html>"
@@ -93,14 +93,16 @@ def _resolved_instance(monkeypatch, spec_text: str):
     instance.page.content.return_value = (
         f'<html><div class="appspec-value">{spec_text}</div></html>'
     )
-    instance._extract_final_metadata = MagicMock(return_value="metadata")
+    instance._extract_final_metadata = MagicMock(
+        return_value=MagicMock(package_name="com.a", version="1")
+    )
     return instance
 
 
 def test_resolved_variant_meeting_minimum_sdk_is_used(monkeypatch):
     instance = _resolved_instance(monkeypatch, "Min: Android 11 (API 30)Target: 16")
 
-    assert instance.search("com.a", "1", minimum_sdk=30) == "metadata"
+    assert instance.search("com.a", "1", minimum_sdk=30) is not None
 
 
 @pytest.mark.parametrize("spec_text", ["Min: Android 9 (API 28)", "no spec here"])
@@ -185,4 +187,66 @@ def test_morphe_search_ignores_uptodown_result(monkeypatch):
     instance._goto = MagicMock()
 
     assert instance._search_via_morphe("com.a", "1", "arm64-v8a") is None
+    instance._goto.assert_not_called()
+
+
+APKPURE = "https://apkpure.com/flashscore/eu.app/download/26.10.2"
+
+
+def test_returns_apkpure_url_tagged_as_apkpure(monkeypatch):
+    _opener(monkeypatch, _redirect(APKPURE))
+
+    result = downloader.resolve_variant_url("com.a", "1", "x")
+
+    assert result == downloader.ResolvedVariant(
+        downloader.VariantSource.APKPURE, APKPURE
+    )
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "https://apkpure.net/app/eu.app",
+        "https://m.apkpure.com/app/eu.app",
+    ],
+)
+def test_accepts_apkpure_family_hosts(monkeypatch, location):
+    _opener(monkeypatch, _redirect(location))
+
+    result = downloader.resolve_variant_url("com.a", "1", "x")
+
+    assert result is not None
+    assert result.source is downloader.VariantSource.APKPURE
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "http://apkpure.com/app/eu.app",
+        "https://apkpure.com.evil.test/app/eu.app",
+        "https://evil-apkpure.com/app/eu.app",
+        "https://apkpure.com@evil.test/app/eu.app",
+        "https://apkpure.com:8443/app/eu.app",
+        "https://apkcombo.com/app/eu.app",
+    ],
+)
+def test_rejects_lookalike_apkpure_hosts(monkeypatch, location):
+    _opener(monkeypatch, _redirect(location))
+
+    assert downloader.resolve_variant_url("com.a", "1", "x") is None
+
+
+def test_morphe_search_and_uptodown_ignore_apkpure_result(monkeypatch):
+    instance = object.__new__(downloader.ApkMirror_Downloader)
+    monkeypatch.setattr(
+        downloader,
+        "resolve_variant_url",
+        lambda *a: downloader.ResolvedVariant(
+            downloader.VariantSource.APKPURE, APKPURE
+        ),
+    )
+    instance._goto = MagicMock()
+
+    assert instance._search_via_morphe("com.a", "1", "x") is None
+    assert instance.download_from_uptodown("com.a", "1", "/nowhere") is None
     instance._goto.assert_not_called()

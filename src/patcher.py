@@ -2410,14 +2410,17 @@ def download_apk(
                 candidate_path = Path(downloaded_path)
                 print(f"Successfully downloaded standalone APK to {final_path}")
 
-            if source_name == "Uptodown":
+            if source_name in ("Uptodown", "APKPure"):
                 actual_package = _read_package_id(java_bin, candidate_path, "")
                 if actual_package != package_name:
                     raise Exception(
-                        "Uptodown file does not verifiably contain package "
+                        f"{source_name} file does not verifiably contain package "
                         f"{package_name} (found {actual_package or 'unreadable'})"
                     )
-                print(f"    [+] Package id {package_name} confirmed in Uptodown file.")
+                print(
+                    f"    [+] Package id {package_name} confirmed in "
+                    f"{source_name} file."
+                )
 
             if minimum_sdk is not None:
                 actual_minimum_sdk = _read_minimum_sdk(java_bin, candidate_path)

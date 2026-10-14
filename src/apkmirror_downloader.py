@@ -191,6 +191,7 @@ MORPHE_RESOLVER_URL = "https://api.morphe.software"
 
 UPTODOWN_DOWNLOAD_HOSTS = ("uptodown.com", "uptodown.net")
 UPTODOWN_FILE_SUFFIXES = {".apk", ".xapk", ".apks"}
+APKPURE_PAGE_HOSTS = ("apkpure.com", "apkpure.net")
 
 
 class VariantSource(str, Enum):
@@ -198,6 +199,7 @@ class VariantSource(str, Enum):
 
     APKMIRROR = "apkmirror"
     UPTODOWN = "uptodown"
+    APKPURE = "apkpure"
 
 
 @dataclass(frozen=True)
@@ -232,6 +234,8 @@ def _classify_variant_url(url: str) -> VariantSource | None:
         return VariantSource.APKMIRROR
     if _is_https_host_under(url, ("uptodown.com",)):
         return VariantSource.UPTODOWN
+    if _is_https_host_under(url, APKPURE_PAGE_HOSTS):
+        return VariantSource.APKPURE
     return None
 
 
@@ -251,7 +255,9 @@ def resolve_variant_url(
 
     Returns:
         The page URL tagged with its source: an https www.apkmirror.com URL, or
-        an https URL on uptodown.com or one of its subdomains. None when the API
+        an https URL on uptodown.com or one of its subdomains, or an https URL
+        on apkpure.com or apkpure.net (only a signal that APKPure lists the
+        version; nothing is fetched from that page). None when the API
         has no match, is unreachable, or redirects anywhere else.
     """
     opener = urllib.request.build_opener(_NoRedirect)
@@ -518,7 +524,41 @@ class ApkMirror_Downloader:
         logger.info(
             "Successfully extracted complete validated package payload asset target info."
         )
-        return self._extract_final_metadata(parser)
+        return self._accept_if_requested(
+            self._extract_final_metadata(parser), package_name, version
+        )
+
+    @staticmethod
+    def _accept_if_requested(
+        metadata: AppMetadata, package_name: str, version: str | None
+    ) -> AppMetadata | None:
+        """Return metadata only if its page is the requested package and version.
+
+        APKMirror's search answers with unrelated apps when it has no match, and
+        a row title only has to contain the version as text ("1.2.3" is inside
+        "1.2.34"), so the final page's own package and version are compared.
+
+        Args:
+            metadata: Metadata read from the final page.
+            package_name: Requested Android package id.
+            version: Requested exact version, or None for any.
+
+        Returns:
+            The metadata, or None when the page does not verifiably match.
+        """
+        if metadata.package_name != package_name:
+            logger.warning(
+                f"APKMirror page is for {metadata.package_name!r}, "
+                f"not {package_name!r}; ignoring it."
+            )
+            return None
+        if version and metadata.version != version:
+            logger.warning(
+                f"APKMirror page is version {metadata.version!r}, not {version!r}; "
+                "ignoring it."
+            )
+            return None
+        return metadata
 
     def _search_via_morphe(
         self,
@@ -564,7 +604,9 @@ class ApkMirror_Downloader:
                     f"{minimum_sdk}; searching instead."
                 )
                 return None
-        return self._extract_final_metadata(parser)
+        return self._accept_if_requested(
+            self._extract_final_metadata(parser), package_name, version
+        )
 
     def latest_version(
         self, package_name: str, only_release: bool = True

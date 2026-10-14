@@ -784,8 +784,28 @@ token change, real-token trial after this step. The rest are the recommendations
   is no "latest" substitution. The file must come from `uptodown.com`/`.net` over
   https, be `.apk`/`.xapk`/`.apks` and be a zip. Bundles go through the existing
   APKEditor merge, and the merged APK's package id must equal the requested id.
+  The same package-id check now applies to files fetched through `apkeep` (APKPure).
 - Trade-off: Uptodown is an unsigned third-party mirror. Nothing in the pipeline
   verifies the APK signing certificate (APKMirror copies are not verified either), so
   a compromised mirror that keeps the package id would be accepted. Accepted because
   the alternative is a failed build for those apps. Revisit with certificate
   pinning if this matters.
+
+## 2026-10-14: APKPure URLs recognised, APKCombo left out, search results verified
+
+- The resolver accepts https `apkpure.com`/`apkpure.net` (and subdomains, no port or
+  credentials) as `VariantSource.APKPURE`, same strictness as Uptodown. No such URL
+  was observed. Direct requests (redirects not followed) show the API acts as a
+  per-version database: known versions redirect straight to an APKMirror or Uptodown
+  page, unknown ones to `/v2/web-search-fallback/` and then a Google search, so a
+  fallback means a miss. Path shapes of APKPure URLs are unknown and nothing is
+  parsed from the URL. The label
+  does not gate anything; `apkeep` keeps trying APKPure by package and version.
+- APKCombo is not implemented: `apkcombo.com` and `apkcombo.app` return NXDOMAIN from
+  public resolvers, so no page, challenge or file host could be studied. The resolver
+  rejects `apkcombo.*` URLs like any other foreign host. Revisit if the domain returns.
+- `ApkMirror_Downloader.search` now returns a page only if its own package id equals the
+  requested one and, when a version is requested, its version equals it exactly. Before,
+  a fallback search hit for another app (CapCut for a Flashscore build) supplied the
+  icon, and a row title only had to contain the version text ("1.2.3" in "1.2.34").
+  Trade-off: a page whose package id cannot be read is now rejected too.
