@@ -2,7 +2,7 @@
 
 ## Project Responsibility
 
-Self-hosted web app that downloads Android APKs from APKMirror, patches them with
+Self-hosted web app that downloads Android APKs from APKMirror (Uptodown and APKPure as fallbacks), patches them with
 Morphe patch bundles (`.mpp`) using `morphe-cli`, and serves the results to Obtainium.
 The user adds patch sources (GitHub repos), picks an app and its patches, and builds on
 demand or on a cron schedule.

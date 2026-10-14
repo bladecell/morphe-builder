@@ -12,7 +12,7 @@ and Jinja templates:
 | `config_store.py` | Persistence | All `config.yaml` I/O: `load_config`, `update_config`, atomic write, `DATA_DIR`, `DEFAULT_CONFIG` |
 | `secrets_store.py` | Secret persistence | Environment/file precedence for GitHub and Apprise secrets, plus `discard_legacy_license_key`; atomic `DATA_DIR/.env`, redaction, child-environment stripping |
 | `request_guards.py` | Request security | Host, Origin, and Fetch Metadata checks; no authentication |
-| `apkmirror_downloader.py` | Gateway | `ApkMirror_Downloader`: drives one headless ShardX engine (sync Playwright over CDP) page through APKMirror; Morphe API variant resolver |
+| `apkmirror_downloader.py` | Gateway | `ApkMirror_Downloader`: drives one headless ShardX engine (sync Playwright over CDP) page through APKMirror and Uptodown; Morphe API variant resolver |
 | `templates/` | View | See [templates/codemap.md](templates/codemap.md) |
 
 ## Design
@@ -166,7 +166,8 @@ returns as `sync_error`.
 
 `get_app_preferences` reads `apkFileType` from the patch lists to choose bundle or
 standalone (default bundle) -> `scraper.search` -> `scraper.download_file` into a temp
-dir -> icon download -> if the file is a zip containing `.apk` entries, merge with
+dir (if APKMirror yields nothing: `scraper.download_from_uptodown`, then `apkeep`;
+an Uptodown file must contain the requested package id) -> icon download -> if the file is a zip containing `.apk` entries, merge with
 `java -jar APKEditor.jar m` -> `extract_app_metadata` (`APKEditor.jar info`).
 
 ### Patch (`patch_app`)
@@ -234,7 +235,7 @@ trusted. See [README host/proxy guidance](../README.md#host-and-reverse-proxy-ch
 ### External
 
 - GitHub REST (`/releases/latest`) and `raw.githubusercontent.com`, unauthenticated.
-- APKMirror through ShardX; Morphe API (`api.morphe.software`) for variant resolution; APKPure via `apkeep` as fallback.
+- APKMirror through ShardX; Morphe API (`api.morphe.software`, `resolve_variant_url` returns a `ResolvedVariant` tagged APKMirror or Uptodown) for variant resolution; Uptodown (`*.uptodown.com`, files from `uptodown.com`/`.net`) through the same browser as second source; APKPure via `apkeep` as last fallback.
 - `java` subprocesses for `morphe-cli.jar` and `APKEditor.jar` (`settings.java_path`
   overrides the binary).
 - Apprise for notifications, resolving `APPRISE_URLS` before the legacy

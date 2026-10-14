@@ -2330,6 +2330,7 @@ def download_apk(
         with tempfile.TemporaryDirectory(dir=Path(final_path).parent) as temp_dir:
             temp_file_name = f"{package_name}_{target_version}_download.tmp"
 
+            source_name = "APKMirror"
             if app_data:
                 downloaded_path = scraper.download_file(
                     target_url=app_data.download_url,
@@ -2339,16 +2340,31 @@ def download_apk(
             else:
                 print(
                     f"    [~] APKMirror unavailable for {package_name} "
-                    f"v{target_version}. Trying APKPure via apkeep..."
+                    f"v{target_version}. Trying Uptodown..."
                 )
-                downloaded_path = download_apk_via_apkeep(
+                downloaded_path = scraper.download_from_uptodown(
                     package_name, target_version, temp_dir
                 )
-                if not downloaded_path:
-                    raise Exception(
-                        f"Could not find {package_name} v{target_version} "
-                        "on APKMirror or APKPure"
+                if downloaded_path:
+                    source_name = "Uptodown"
+                    print(
+                        f"    [+] Using Uptodown for {package_name} v{target_version}: "
+                        "unsigned third-party mirror, checking the package id."
                     )
+                else:
+                    print(
+                        f"    [~] Uptodown has no verified v{target_version}. "
+                        "Trying APKPure via apkeep..."
+                    )
+                    source_name = "APKPure"
+                    downloaded_path = download_apk_via_apkeep(
+                        package_name, target_version, temp_dir
+                    )
+                    if not downloaded_path:
+                        raise Exception(
+                            f"Could not find {package_name} v{target_version} "
+                            "on APKMirror, Uptodown or APKPure"
+                        )
 
             if not downloaded_path or not os.path.exists(downloaded_path):
                 raise Exception("Download failed or file not found.")
@@ -2393,6 +2409,15 @@ def download_apk(
             else:
                 candidate_path = Path(downloaded_path)
                 print(f"Successfully downloaded standalone APK to {final_path}")
+
+            if source_name == "Uptodown":
+                actual_package = _read_package_id(java_bin, candidate_path, "")
+                if actual_package != package_name:
+                    raise Exception(
+                        "Uptodown file does not verifiably contain package "
+                        f"{package_name} (found {actual_package or 'unreadable'})"
+                    )
+                print(f"    [+] Package id {package_name} confirmed in Uptodown file.")
 
             if minimum_sdk is not None:
                 actual_minimum_sdk = _read_minimum_sdk(java_bin, candidate_path)

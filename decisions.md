@@ -29,7 +29,7 @@
   rejection status and keyless fallback were removed. Startup strips a stale key
   from `.env`/environment and deletes `DATA_DIR/bin/cloakbrowser`.
 - Also in tree: Morphe API variant resolver and an `apkeep` APKPure fallback
-  (hash-pinned in the Dockerfile).
+  (hash-pinned in the Dockerfile). Uptodown was added later; see 2026-10-14.
 - Risk: the ~170 MB Chromium engine comes from a ProxyShard CDN and is unsigned.
   It is fetched at build time only; see the Dockerfile for the verification done.
 - Earlier cloakbrowser entries below are kept as history and marked superseded.
@@ -773,3 +773,19 @@ token change, real-token trial after this step. The rest are the recommendations
   API contract or architecture decision. Review findings were resolved. The
   recorded full-suite result is 1684 passed, 1 xfailed; real CLI, production,
   and deployment E2E remain unverified.
+
+## 2026-10-14: Uptodown as second download source
+
+- The Morphe API sometimes resolves a version to an Uptodown page instead of
+  APKMirror. The resolver now returns a typed result and accepts https URLs on
+  `uptodown.com` or its subdomains, with no port or credentials; the hop limit is
+  unchanged. Order: APKMirror, the resolved Uptodown page, then APKPure.
+- Uptodown downloads only when the page states exactly the requested version; there
+  is no "latest" substitution. The file must come from `uptodown.com`/`.net` over
+  https, be `.apk`/`.xapk`/`.apks` and be a zip. Bundles go through the existing
+  APKEditor merge, and the merged APK's package id must equal the requested id.
+- Trade-off: Uptodown is an unsigned third-party mirror. Nothing in the pipeline
+  verifies the APK signing certificate (APKMirror copies are not verified either), so
+  a compromised mirror that keeps the package id would be accepted. Accepted because
+  the alternative is a failed build for those apps. Revisit with certificate
+  pinning if this matters.

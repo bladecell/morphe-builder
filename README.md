@@ -171,8 +171,11 @@ An old `CLOAKBROWSER_LICENSE_KEY` is removed from `.env` and the environment at
 startup, and the retired `DATA_DIR/bin/cloakbrowser` cache is deleted.
 
 The app first asks the Morphe API to resolve the APKMirror variant page for an
-exact version. If APKMirror cannot be downloaded from, it falls back to APKPure
-through `apkeep` (pinned by SHA-256 in the Dockerfile).
+exact version. If APKMirror cannot be downloaded from, it uses the Uptodown page the
+API resolved, but only when that page states the exact requested version, and then
+falls back to APKPure through `apkeep` (pinned by SHA-256 in the Dockerfile). Uptodown
+and APKPure are unsigned third-party mirrors; the app checks the package id but not the
+signing certificate.
 
 ### Host and reverse-proxy checks
 

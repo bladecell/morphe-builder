@@ -57,6 +57,7 @@ def test_apkeep_fallback_returns_none_on_failed_download(tmp_path, monkeypatch):
 def test_download_apk_uses_apkeep_when_scraper_finds_nothing(tmp_path, monkeypatch):
     scraper = MagicMock()
     scraper.search.return_value = None
+    scraper.download_from_uptodown.return_value = None
     monkeypatch.setattr(patcher, "get_app_preferences", lambda *a: None)
     monkeypatch.setattr(patcher, "extract_app_metadata", lambda *a, **k: None)
     monkeypatch.setattr(patcher, "DATA_DIR", tmp_path)
@@ -76,10 +77,11 @@ def test_download_apk_uses_apkeep_when_scraper_finds_nothing(tmp_path, monkeypat
 def test_download_apk_raises_when_both_sources_fail(tmp_path, monkeypatch):
     scraper = MagicMock()
     scraper.search.return_value = None
+    scraper.download_from_uptodown.return_value = None
     monkeypatch.setattr(patcher, "get_app_preferences", lambda *a: None)
     monkeypatch.setattr(patcher, "download_apk_via_apkeep", lambda *a: None)
 
-    with pytest.raises(Exception, match="APKMirror or APKPure"):
+    with pytest.raises(Exception, match="APKMirror, Uptodown or APKPure"):
         patcher.download_apk(
             "com.example", "1.2.3", tmp_path / "final.apk", {}, {}, scraper=scraper
         )

@@ -135,7 +135,10 @@ Browser: `_launch` starts the ShardX engine headless through its SDK with `cdp=T
 and attaches sync Playwright via `connect_over_cdp`, using a throwaway profile in a
 temp dir (`--no-sandbox` when root); `_teardown` stops Playwright, the engine and
 removes the profile. The engine is fetched at Docker build time, never at runtime.
-If APKMirror cannot be reached, `patcher` falls back to APKPure via `apkeep`.
+Source order in `patcher.download_apk`: APKMirror; then Uptodown, using the page the
+Morphe API resolved (`ApkMirror_Downloader.download_from_uptodown`: exact page version
+required, file host and type checked, package id re-read after merge); then APKPure via
+`apkeep`. Uptodown and APKPure files are unsigned third-party copies.
 Risk: the ~170 MB Chromium engine comes from a ProxyShard CDN and is unsigned;
 see the Dockerfile for how the build verifies it.
 

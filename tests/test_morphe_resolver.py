@@ -9,6 +9,8 @@ import pytest
 from src import apkmirror_downloader as downloader
 
 VARIANT = "https://www.apkmirror.com/apk/a/b/b-1-release/b-1-android-apk-download/"
+RESOLVED = downloader.ResolvedVariant(downloader.VariantSource.APKMIRROR, VARIANT)
+UPTODOWN = "https://flashscore.en.uptodown.com/android/download/1223075994-x"
 
 
 def _redirect(location: str, code: int = 302) -> urllib.error.HTTPError:
@@ -31,7 +33,7 @@ def test_returns_apkmirror_variant_url(monkeypatch):
 
     result = downloader.resolve_variant_url("com.a", "1", "arm64-v8a")
 
-    assert result == VARIANT
+    assert result == RESOLVED
     sent = opener.open.call_args.args[0]
     assert sent.full_url.endswith("/v2/web-search/com.a~1~arm64-v8a")
 
@@ -41,7 +43,7 @@ def test_follows_relative_fallback_route(monkeypatch):
         monkeypatch, _redirect("/v2/web-search-fallback/com.a~1~x"), _redirect(VARIANT)
     )
 
-    assert downloader.resolve_variant_url("com.a", "1", "x") == VARIANT
+    assert downloader.resolve_variant_url("com.a", "1", "x") == RESOLVED
 
 
 @pytest.mark.parametrize(
@@ -72,7 +74,7 @@ def test_returns_none_on_http_error_without_redirect(monkeypatch):
 
 def test_search_uses_resolved_metadata(monkeypatch):
     instance = object.__new__(downloader.ApkMirror_Downloader)
-    monkeypatch.setattr(downloader, "resolve_variant_url", lambda *a: VARIANT)
+    monkeypatch.setattr(downloader, "resolve_variant_url", lambda *a: RESOLVED)
     metadata = MagicMock()
     instance._goto = MagicMock()
     instance.page = MagicMock()
@@ -85,7 +87,7 @@ def test_search_uses_resolved_metadata(monkeypatch):
 
 def _resolved_instance(monkeypatch, spec_text: str):
     instance = object.__new__(downloader.ApkMirror_Downloader)
-    monkeypatch.setattr(downloader, "resolve_variant_url", lambda *a: VARIANT)
+    monkeypatch.setattr(downloader, "resolve_variant_url", lambda *a: RESOLVED)
     instance._goto = MagicMock()
     instance.page = MagicMock()
     instance.page.content.return_value = (
@@ -111,3 +113,76 @@ def test_resolved_variant_below_or_without_minimum_sdk_falls_back(
 
     assert instance.search("com.a", "1", minimum_sdk=30) is None
     assert instance._goto.call_args_list[-1].args == ("search-url",)
+
+
+def test_returns_uptodown_url_tagged_as_uptodown(monkeypatch):
+    _opener(monkeypatch, _redirect(UPTODOWN))
+
+    result = downloader.resolve_variant_url("com.a", "1", "arm64-v8a")
+
+    assert result == downloader.ResolvedVariant(
+        downloader.VariantSource.UPTODOWN, UPTODOWN
+    )
+
+
+def test_uptodown_reached_through_fallback_route(monkeypatch):
+    _opener(
+        monkeypatch,
+        _redirect("/v2/web-search-fallback/com.a~1~x"),
+        _redirect(UPTODOWN),
+    )
+
+    result = downloader.resolve_variant_url("com.a", "1", "x")
+
+    assert result is not None
+    assert result.source is downloader.VariantSource.UPTODOWN
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "http://flashscore.en.uptodown.com/android/download/1-x",
+        "https://uptodown.com.evil.test/android/download/1-x",
+        "https://evil-uptodown.com/android/download/1-x",
+        "https://notuptodown.com/android/download/1-x",
+        "https://uptodown.com@evil.test/android/download/1-x",
+        "https://flashscore.en.uptodown.com:8443/android/download/1-x",
+        "https://uptodown.net/android/download/1-x",
+    ],
+)
+def test_rejects_lookalike_uptodown_hosts(monkeypatch, location):
+    _opener(monkeypatch, _redirect(location))
+
+    assert downloader.resolve_variant_url("com.a", "1", "x") is None
+
+
+def test_accepts_bare_uptodown_domain(monkeypatch):
+    _opener(monkeypatch, _redirect("https://uptodown.com/android/download/1-x"))
+
+    result = downloader.resolve_variant_url("com.a", "1", "x")
+
+    assert result is not None
+    assert result.source is downloader.VariantSource.UPTODOWN
+
+
+def test_hop_limit_still_applies_to_uptodown(monkeypatch):
+    hop = _redirect("/v2/web-search-fallback/com.a~1~x")
+    opener = _opener(monkeypatch, hop, hop, hop, _redirect(UPTODOWN))
+
+    assert downloader.resolve_variant_url("com.a", "1", "x") is None
+    assert opener.open.call_count == 3
+
+
+def test_morphe_search_ignores_uptodown_result(monkeypatch):
+    instance = object.__new__(downloader.ApkMirror_Downloader)
+    monkeypatch.setattr(
+        downloader,
+        "resolve_variant_url",
+        lambda *a: downloader.ResolvedVariant(
+            downloader.VariantSource.UPTODOWN, UPTODOWN
+        ),
+    )
+    instance._goto = MagicMock()
+
+    assert instance._search_via_morphe("com.a", "1", "arm64-v8a") is None
+    instance._goto.assert_not_called()

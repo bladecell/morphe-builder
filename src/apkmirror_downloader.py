@@ -6,6 +6,7 @@ import shutil
 import tempfile
 import urllib.error
 import urllib.request
+import zipfile
 from dataclasses import asdict, dataclass
 from enum import Enum
 from pathlib import Path
@@ -188,11 +189,56 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 MORPHE_RESOLVER_URL = "https://api.morphe.software"
 
+UPTODOWN_DOWNLOAD_HOSTS = ("uptodown.com", "uptodown.net")
+UPTODOWN_FILE_SUFFIXES = {".apk", ".xapk", ".apks"}
+
+
+class VariantSource(str, Enum):
+    """The site a resolved variant page belongs to."""
+
+    APKMIRROR = "apkmirror"
+    UPTODOWN = "uptodown"
+
+
+@dataclass(frozen=True)
+class ResolvedVariant:
+    """A variant page URL together with the site it lives on."""
+
+    source: VariantSource
+    url: str
+
+
+def _is_https_host_under(url: str, domains: tuple[str, ...]) -> bool:
+    """Whether url is plain https on one of domains or a subdomain of one.
+
+    Ports and credentials are refused, and the host is taken from the parsed URL,
+    so `https://uptodown.com@evil.test/` and `https://uptodown.com.evil.test/` fail.
+    """
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return False
+    if parsed.scheme != "https" or not host or port or parsed.username:
+        return False
+    return any(host == domain or host.endswith(f".{domain}") for domain in domains)
+
+
+def _classify_variant_url(url: str) -> VariantSource | None:
+    """Return the accepted source for a variant URL, or None for anything else."""
+    parsed = urlparse(url)
+    if parsed.scheme == "https" and parsed.netloc == "www.apkmirror.com":
+        return VariantSource.APKMIRROR
+    if _is_https_host_under(url, ("uptodown.com",)):
+        return VariantSource.UPTODOWN
+    return None
+
 
 def resolve_variant_url(
     package_name: str, version: str, arch: str, timeout: float = 20
-) -> str | None:
-    """Ask the Morphe API which APKMirror variant page matches an exact version.
+) -> ResolvedVariant | None:
+    """Ask the Morphe API which variant page matches an exact version.
 
     The API answers with a redirect to the variant page, or to its own fallback
     route, which is followed for at most two hops.
@@ -204,8 +250,9 @@ def resolve_variant_url(
         timeout: Seconds to wait per request.
 
     Returns:
-        An https www.apkmirror.com URL, or None when the API has no match, is
-        unreachable, or redirects anywhere else.
+        The page URL tagged with its source: an https www.apkmirror.com URL, or
+        an https URL on uptodown.com or one of its subdomains. None when the API
+        has no match, is unreachable, or redirects anywhere else.
     """
     opener = urllib.request.build_opener(_NoRedirect)
     url = (
@@ -229,13 +276,19 @@ def resolve_variant_url(
             return None
         else:
             return None
-        parsed = urlparse(url)
-        if parsed.scheme == "https" and parsed.netloc == "www.apkmirror.com":
-            return url
-        if parsed.netloc != urlparse(MORPHE_RESOLVER_URL).netloc:
+        source = _classify_variant_url(url)
+        if source is not None:
+            return ResolvedVariant(source, url)
+        if urlparse(url).netloc != urlparse(MORPHE_RESOLVER_URL).netloc:
             logger.warning("Morphe resolver redirected to an unexpected host")
             return None
     return None
+
+
+def _uptodown_page_version(html: str) -> str | None:
+    """Read the version an Uptodown download page states for its app."""
+    node = HTMLParser(html).css_first("div.info > div.version")
+    return node.text(strip=True) if node else None
 
 
 class ApkMirror_Downloader:
@@ -491,9 +544,10 @@ class ApkMirror_Downloader:
         arch = (
             preferred_arch.value if isinstance(preferred_arch, Enum) else preferred_arch
         )
-        variant_url = resolve_variant_url(package_name, version, arch)
-        if not variant_url:
+        resolved = resolve_variant_url(package_name, version, arch)
+        if resolved is None or resolved.source is not VariantSource.APKMIRROR:
             return None
+        variant_url = resolved.url
         logger.info(f"Morphe API resolved {package_name} {version}: {variant_url}")
         try:
             self._goto(variant_url)
@@ -778,6 +832,70 @@ class ApkMirror_Downloader:
         except Exception as e:  # noqa: BLE001 - fall back to the browser
             logger.error(f"Direct browser download extraction sequence failed: {e}")
             return None
+
+    def download_from_uptodown(
+        self,
+        package_name: str,
+        version: str,
+        dest_directory: str,
+        arch: str = Arch.ARM64_V8A.value,
+    ) -> Path | None:
+        """Download an exact version from the Uptodown page the Morphe API names.
+
+        The page must state exactly `version` before anything is downloaded; a
+        newer or older build is never substituted. The download button is
+        clicked through script because cookie and ad overlays cover it.
+
+        Args:
+            package_name: Android package id.
+            version: Exact app version.
+            dest_directory: Existing directory the file is written into.
+            arch: ABI to ask the API for.
+
+        Returns:
+            The saved .apk, .xapk or .apks, or None when the API names no
+            Uptodown page, the version differs, the file comes from outside
+            Uptodown, or the browser fails.
+        """
+        resolved = resolve_variant_url(package_name, version, arch)
+        if resolved is None or resolved.source is not VariantSource.UPTODOWN:
+            return None
+        try:
+            self._goto(resolved.url)
+            if not _is_https_host_under(self.page.url, ("uptodown.com",)):
+                logger.warning("Uptodown page redirected to an unexpected host.")
+                return None
+            self.page.wait_for_selector("#detail-download-button", timeout=15000)
+            page_version = _uptodown_page_version(self.page.content())
+            if page_version != version:
+                logger.warning(
+                    f"Uptodown offers version {page_version!r}, not {version!r}."
+                )
+                return None
+            with self.page.expect_download(timeout=90000) as download_info:
+                self.page.evaluate(
+                    "document.querySelector('#detail-download-button').click()"
+                )
+            download = download_info.value
+            suffix = Path(download.suggested_filename).suffix.lower()
+            if (
+                not _is_https_host_under(download.url, UPTODOWN_DOWNLOAD_HOSTS)
+                or suffix not in UPTODOWN_FILE_SUFFIXES
+            ):
+                logger.warning("Uptodown download rejected: unexpected host or type.")
+                return None
+            dest_path = (
+                Path(dest_directory) / f"{package_name}_{version}_uptodown{suffix}"
+            )
+            download.save_as(str(dest_path))
+        except (PlaywrightError, OSError) as error:
+            logger.warning(f"Uptodown download failed: {error}")
+            return None
+        if not zipfile.is_zipfile(dest_path):
+            logger.warning("Uptodown file is not a zip archive; discarding it.")
+            dest_path.unlink(missing_ok=True)
+            return None
+        return dest_path
 
     def close(self) -> None:
         """Close the page connection, stop the engine and delete its profile."""
