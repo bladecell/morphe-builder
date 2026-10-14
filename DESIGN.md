@@ -49,7 +49,10 @@ uppercase. Alerts: error red, warning yellow, success violet, info outlined.
 7xl content width, gaps 24 to 40px. Rotation (1 to 3 degrees) only on the logo, the
 Active Pipeline heading and badges; tables, forms, patch lists and dialogs stay
 straight. Motion is 100 to 200ms, linear or ease-out, no loops except the existing
-spinners. `prefers-reduced-motion` removes transitions and hover/press transforms.
+spinners. `prefers-reduced-motion` removes animation (spinners stop) and all hover/press
+transforms; colour, border and shadow changes stay instant so hover, press and
+focus remain visible. Controls keep a 44px hit area: the checkbox draws its 28px box
+inside a 44px input, and inline links use `min-h-11`.
 
 ## Accessibility
 

@@ -715,9 +715,8 @@ NO_RULE_TOKENS: dict[str, str] = {
 #   URLs and keys, so finding them needs a large hand-kept allow-list. Tailwind's
 #   own scanner cannot see runtime-assembled names either. The one place the
 #   page builds class names in script is the set of class-returning getters and
-#   methods of index.html (scraperTextClass, scraperDotClass, secretBadgeClass,
-#   secretMessageClass); they return whole literal strings, which Tailwind finds
-#   in the raw file, and `test_every_class_the_script_can_return_has_a_rule`
+#   methods of index.html (secretBadgeClass, secretMessageClass); they return
+#   whole literal strings, which Tailwind finds in the raw file, and `test_every_class_the_script_can_return_has_a_rule`
 #   runs them in node and checks each returned class. The always-on digest test
 #   fails on any edit that is not rebuilt.
 # - Classes added by Jinja, e.g. `class="a {{ x }}"`: raises, so it cannot pass
@@ -1021,12 +1020,6 @@ def test_every_class_the_script_can_return_has_a_rule(tmp_path):
     )
     steps = """
       const out = [];
-      for (const state of ['available', 'starting', 'stopping', 'unavailable', 'stopped']) {
-        for (const scraper of [true, false]) {
-          app.browser = {state}; app.diagnostics = {scraper};
-          out.push(app.scraperTextClass, app.scraperDotClass);
-        }
-      }
       for (const source of ['environment', 'environment_invalid', 'file', null]) {
         app.secretsLoaded = true;
         app.secrets = {s: {set: source === 'file', source}};
@@ -1044,5 +1037,5 @@ def test_every_class_the_script_can_return_has_a_rule(tmp_path):
 
     tokens = {token for text in returned for token in text.split()}
     css = STYLESHEET.read_text()
-    assert len(tokens) > 15
+    assert len(tokens) > 5
     assert sorted(t for t in tokens if not has_own_rule(t, css)) == []

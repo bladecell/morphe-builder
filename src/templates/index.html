@@ -27,6 +27,7 @@
                 metadata: {{ metadata | tojson | safe }},
                 settings: {{ (config.settings if config.settings else {"server_url": "", "cron_schedule": "0 0 * * *"}) | tojson | safe }},
                 updates: {},
+                iconFailed: {},
                 lastRun: '{{ metadata.last_run if metadata and metadata.last_run else "Never" }}',
                 selectedApps: [],
                 showModal: false,
@@ -720,18 +721,6 @@
                     return 'red';
                 },
 
-                get scraperTextClass() {
-                    return {emerald: 'text-emerald-500', amber: 'text-amber-500', red: 'text-red-500'}[this.scraperTone];
-                },
-
-                get scraperDotClass() {
-                    return {
-                        emerald: 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.4)]',
-                        amber: 'bg-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.4)]',
-                        red: 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.4)]'
-                    }[this.scraperTone];
-                },
-
                 secretBadgeClass(slug) {
                     return {
                         file: 'nb-badge-green',
@@ -1047,14 +1036,14 @@
                     <span x-text="uploadError"></span>
                 </p>
                 <div class="space-y-2">
-                    <label class="nb-label block">Version Name</label>
-                    <input type="text" x-model="uploadVersion" placeholder="e.g. 1.2.3" class="nb-input">
+                    <label for="upload-version" class="nb-label block">Version Name</label>
+                    <input id="upload-version" type="text" x-model="uploadVersion" placeholder="e.g. 1.2.3" class="nb-input">
                     <p class="nb-muted text-xs">This should match a version supported by the patches.</p>
                 </div>
 
                 <div class="space-y-2">
-                    <label class="nb-label block">APK File</label>
-                    <input type="file" x-ref="fileInput" class="nb-input cursor-pointer text-sm file:mr-4 file:py-1 file:px-3 file:border-4 file:border-ink file:bg-pop-yellow file:text-black file:text-sm file:font-bold file:uppercase">
+                    <label for="upload-file" class="nb-label block">APK File</label>
+                    <input id="upload-file" type="file" x-ref="fileInput" class="nb-input cursor-pointer text-sm file:mr-4 file:py-1 file:px-3 file:border-4 file:border-ink file:bg-pop-yellow file:text-black file:text-sm file:font-bold file:uppercase">
                 </div>
             </div>
 
@@ -1296,6 +1285,7 @@
                                 </div>
                                 <input
                                     type="text"
+                                    aria-label="Search packages"
                                     x-model="search"
                                     placeholder="Search packages..."
                                     class="nb-input pl-10"
@@ -1424,13 +1414,14 @@
                     <div class="contents">
                         <div class="order-1 flex min-w-0 items-start gap-3">
                         <div class="w-12 h-12 shrink-0 bg-pop-yellow text-black border-4 border-ink flex items-center justify-center font-bold text-xl overflow-hidden">
-                            <template x-if="updates['{{ app.id }}'] && !updates['{{ app.id }}'].icon_exists">
+                            <template x-if="iconFailed['{{ app.id }}'] || (updates['{{ app.id }}'] && !updates['{{ app.id }}'].icon_exists)">
                                 <span x-text="(metadata['{{ app.id }}'] ? metadata['{{ app.id }}'].real_name : pipelineApps[{{ loop.index0 }}].name)[0]"></span>
                             </template>
                             <img :src="'/icons/' + '{{ app.id }}' + '.png'"
                                  alt=""
                                  class="w-full h-full object-cover"
-                                 x-show="updates['{{ app.id }}'] && updates['{{ app.id }}'].icon_exists">
+                                 @error="iconFailed['{{ app.id }}'] = true"
+                                 x-show="!iconFailed['{{ app.id }}'] && updates['{{ app.id }}'] && updates['{{ app.id }}'].icon_exists">
                         </div>
                         <div class="min-w-0 flex-1 pt-0.5">
                             <h3 class="font-bold text-lg break-words group-hover:underline" x-text="metadata['{{ app.id }}'] ? metadata['{{ app.id }}'].real_name : pipelineApps[{{ loop.index0 }}].name"></h3>
@@ -1591,25 +1582,25 @@
 
                 <div class="p-5 sm:p-8 space-y-6">
                     <div class="space-y-2">
-                        <label class="nb-label block">Server URL</label>
+                        <label for="settings-server-url" class="nb-label block">Server URL</label>
                         <div class="flex gap-3">
-                            <input type="text" x-model="settings.server_url" placeholder="https://morphe.yourdomain.com" class="nb-input flex-1 min-w-0 font-mono">
+                            <input id="settings-server-url" type="text" x-model="settings.server_url" placeholder="https://morphe.yourdomain.com" class="nb-input flex-1 min-w-0 font-mono">
                         </div>
                         <p class="nb-muted text-xs">The public URL of this server. Used to generate download links for Obtainium.</p>
                     </div>
 
                     <div class="space-y-2">
-                        <label class="nb-label block">Background Build Schedule (Cron)</label>
+                        <label for="settings-cron" class="nb-label block">Background Build Schedule (Cron)</label>
                         <div class="flex gap-3">
-                            <input type="text" x-model="settings.cron_schedule" placeholder="0 */4 * * * (Every 4 hours)" class="nb-input flex-1 min-w-0 font-mono">
+                            <input id="settings-cron" type="text" x-model="settings.cron_schedule" placeholder="0 */4 * * * (Every 4 hours)" class="nb-input flex-1 min-w-0 font-mono">
                         </div>
-                        <p class="nb-muted text-xs">Use standard crontab format: <code>minute hour day month day_of_week</code>. Use <a href="https://crontab.guru" target="_blank" class="font-bold underline underline-offset-4 hover:bg-pop-yellow hover:text-black">crontab.guru</a> to format your schedule. Leave empty to disable.</p>
+                        <p class="nb-muted text-xs">Use standard crontab format: <code>minute hour day month day_of_week</code>. Use <a href="https://crontab.guru" target="_blank" class="inline-flex min-h-11 items-center font-bold underline underline-offset-4 hover:bg-pop-yellow hover:text-black">crontab.guru</a> to format your schedule. Leave empty to disable.</p>
                     </div>
 
                     <div class="pt-6 border-t-2 nb-rule space-y-4">
                         <div class="flex items-center justify-between gap-3">
                             <label class="nb-label">Apprise Notifications</label>
-                            <a href="https://github.com/caronc/apprise/wiki" target="_blank" class="text-sm font-bold underline underline-offset-4 hover:bg-pop-yellow hover:text-black">Setup Guide</a>
+                            <a href="https://github.com/caronc/apprise/wiki" target="_blank" class="inline-flex min-h-11 items-center text-sm font-bold underline underline-offset-4 hover:bg-pop-yellow hover:text-black">Setup Guide</a>
                         </div>
 
                         <div class="flex flex-wrap items-center gap-2 text-sm" role="status">

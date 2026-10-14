@@ -235,21 +235,11 @@ def test_rejected_token_is_not_shown_twice_on_the_discovery_tab(page):
 def test_scraper_diagnostic_tones_remain_without_header_badges(page):
     body = method_body(page, "scraperTone")
     header = page[page.index("<header") : page.index("</header>")]
-    text = method_body(page, "scraperTextClass")
-    dot = method_body(page, "scraperDotClass")
 
     assert "'available'" in body
     assert "'starting'" in body and "'stopping'" in body
     assert "'amber'" in body and "'emerald'" in body and "'red'" in body
-    assert (
-        "text-emerald-500" in text
-        and "text-amber-500" in text
-        and "text-red-500" in text
-    )
-    assert "bg-amber-500" in dot
-    assert "bg-emerald-500" in dot and "bg-red-500" in dot
     assert "Java" not in header and "Scraper" not in header
-    assert "scraperTextClass" not in header and "scraperDotClass" not in header
 
 
 def test_busy_task_older_than_ten_minutes_is_flagged_using_server_time(page):
@@ -438,12 +428,10 @@ def test_scraper_tone_by_worker_state(page, tmp_path, state, diagnostics, tone):
         page,
         tmp_path,
         f"app.browser = {{state: '{state}'}}; app.diagnostics = {{scraper: {json.dumps(diagnostics)}}};"
-        " return [app.scraperTone, app.scraperTextClass, app.scraperDotClass];",
+        " return app.scraperTone;",
     )
 
-    assert result[0] == tone
-    assert f"text-{tone}-500" in result[1]
-    assert f"bg-{tone}-500" in result[2]
+    assert result == tone
 
 
 @needs_node
