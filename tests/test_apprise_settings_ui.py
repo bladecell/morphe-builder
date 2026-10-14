@@ -97,7 +97,6 @@ UNSET_STATUS = {
 def apprise_map():
     return {
         "github-token": {"set": False, "source": None},
-        "cloakbrowser-license-key": {"set": False, "source": None},
         "apprise-urls": UNSET_STATUS,
     }
 
@@ -352,7 +351,6 @@ def test_malformed_apprise_status_success_preserves_existing_status_and_draft(
 ):
     response = {
         "github-token": {"set": False, "source": None},
-        "cloakbrowser-license-key": {"set": False, "source": None},
         "apprise-urls": {
             "set": True,
             "count": "one",

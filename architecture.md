@@ -13,10 +13,10 @@ Morphe patch bundles, and serves the result to Obtainium.
 |---|---|---|
 | Web app and API | `src/main.py` | FastAPI app, UI routes, Obtainium routes, scheduling, build orchestration |
 | Config store | `src/config_store.py` | All `config.yaml` I/O: lock, atomic write, `update_config` |
-| Secret store | `src/secrets_store.py` | GitHub and cloakbrowser secrets plus write-only Apprise URLs: environment/file precedence, validation, redaction and atomic file updates |
+| Secret store | `src/secrets_store.py` | GitHub secret plus write-only Apprise URLs: environment/file precedence, validation, redaction and atomic file updates |
 | Request guards | `src/request_guards.py` | Host, Origin and Fetch Metadata checks for the unauthenticated app |
 | Pipeline | `src/patcher.py` | Tool and source sync, version selection, APK download, patching |
-| Scraper | `src/apkmirror_downloader.py` | Drives a stealth Chromium (cloakbrowser) through APKMirror |
+| Scraper | `src/apkmirror_downloader.py` | Drives headless ShardX Chromium (Playwright over CDP) through APKMirror; resolves variant pages via the Morphe API |
 | UI | `src/templates/index.html` | Single page, three tabs; vendored Alpine.js and a prebuilt Tailwind stylesheet from `src/static/` |
 | Obtainium page | `src/templates/obtainium.html` | Minimal HTML page Obtainium parses for version and link |
 
@@ -32,7 +32,6 @@ Everything persistent lives under `DATA_DIR` (`/data` in Docker, project root ot
 | `config.yaml` | Sources, apps, settings, last successful build per app |
 | `.env` | Optional plaintext secrets file, mode `0600`; environment values override it |
 | `bin/` | Tool jars, per-source `.mpp` and `.json`, `versions.json`, `version_cache.json`, `metadata.json`, `build.log` |
-| `bin/cloakbrowser/` | App-owned cloakbrowser cache selected at startup; an existing `license.key` blocks startup/launch and is never automatically removed |
 | `apks/raw/` | Downloaded original APKs, `<package>-<version>.apk` |
 | `apks/patched/` | Patched APKs, `<package>-<version>-<patch tag>-<hash>.apk` |
 | `apks/.building/` | Scratch output of the patch in progress; never served |
@@ -83,7 +82,7 @@ The default catalog response and legacy flat selections remain supported; see
 
 ## Secrets and request trust
 
-`GITHUB_TOKEN`, `CLOAKBROWSER_LICENSE_KEY`, and `APPRISE_URLS` are stored by
+`GITHUB_TOKEN` and `APPRISE_URLS` are stored by
 `secrets_store`. Apprise URLs are a bounded JSON array, are write-only through
 `PUT`/`DELETE /api/ui/secrets/apprise-urls`, and can be imported from the legacy
 `config.yaml` setting only through `POST /api/ui/secrets/apprise-urls/migration`.
@@ -105,27 +104,17 @@ them from `os.environ`; a set environment value takes precedence over the file
 and locks that secret against UI changes. An invalid environment value is
 reported as invalid and does not fall back to the file. Secret status endpoints
 return source/set state only, never values. Notification status additionally
-reports count, legacy availability and migration state. The Settings Secrets card exposes
-both secrets independently. Cloakbrowser key updates do not start browser work;
-the worker reads the effective key before its next scraper task. Its rejected
-flag is the last browser result, not validation of the currently saved key.
-Only GitHub-token changes schedule a source sync.
+reports count, legacy availability and migration state. Only GitHub-token changes schedule a source sync.
 
 The GitHub token is used as an authorization header only for `api.github.com`;
-child processes receive an environment with all three secrets removed. Patch bundles
+child processes receive an environment with the secrets removed. Patch bundles
 execute in those child processes, so a token without permissions is
 recommended. Scope reporting is available for classic tokens; fine-grained and
 GitHub App token permissions may be unverifiable.
 
-Startup sets `CLOAKBROWSER_CACHE_DIR` to `DATA_DIR/bin/cloakbrowser`, isolating
-cloakbrowser from a key cached under the operator's home directory. An existing
-`license.key` in the app-owned cache causes refusal; it is neither read nor
-deleted automatically. The isolated cache can require a fresh browser-binary
-download. Configured licence keys are passed explicitly. Only code 77 falls back
-keyless; a late code-77 denial fails the current worker task, closes the browser,
-and leaves later tasks keyless until the effective configured key changes.
-Browser status exposes only whether the key was rejected. No real licence key
-or browser validation is implied by these code-path guarantees.
+At startup `secrets_store.discard_legacy_license_key()` strips a stale
+`CLOAKBROWSER_LICENSE_KEY` from `.env` and the environment, and
+`main.remove_legacy_cloakbrowser_cache()` deletes `DATA_DIR/bin/cloakbrowser`.
 
 The app has no authentication on its UI, APIs, or Obtainium routes. It has
 Host/Origin/Fetch Metadata request guards, not an authentication boundary. Keep
@@ -142,14 +131,22 @@ original `Host`; the app ignores `X-Forwarded-Host`.
 Flow for a download: search page -> release page -> variant page -> download page ->
 tokenised file link. Variants are scored for arm64, nodpi and bundle preference.
 
+Browser: `_launch` starts the ShardX engine headless through its SDK with `cdp=True`
+and attaches sync Playwright via `connect_over_cdp`, using a throwaway profile in a
+temp dir (`--no-sandbox` when root); `_teardown` stops Playwright, the engine and
+removes the profile. The engine is fetched at Docker build time, never at runtime.
+If APKMirror cannot be reached, `patcher` falls back to APKPure via `apkeep`.
+Risk: the ~170 MB Chromium engine comes from a ProxyShard CDN and is unsigned;
+see the Dockerfile for how the build verifies it.
+
 Version lookups only load the search page. Navigation goes through `_goto`, which
 relaunches the browser and retries once if the page or browser has died.
 
 ## Deployment
 
 Docker image on `python:3.12-slim` with Java 17, dependencies installed by `uv`.
-Runs as root with Chromium unsandboxed. Runtime variables such as `GITHUB_TOKEN`,
-`CLOAKBROWSER_LICENSE_KEY`, JSON-array `APPRISE_URLS`, and `ALLOWED_HOSTS` can be passed with Docker `-e`
+Runs as root with Chromium unsandboxed; ShardX engine and `apkeep` are fetched at build time. Runtime variables such as `GITHUB_TOKEN`,
+JSON-array `APPRISE_URLS`, and `ALLOWED_HOSTS` can be passed with Docker `-e`
 without rebuilding the image. See [README deployment guidance](README.md#runtime-environment)
 and [host/proxy guidance](README.md#host-and-reverse-proxy-checks). No application
 authentication is provided.

@@ -251,7 +251,6 @@ def patch_dialog_page():
                 "/api/ui/updates": {},
                 "/api/ui/secrets": {
                     "github-token": {"set": False, "source": None},
-                    "cloakbrowser-license-key": {"set": False, "source": None},
                     "apprise-urls": {
                         "set": False,
                         "count": 0,

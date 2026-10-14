@@ -11,9 +11,9 @@ from fastapi.testclient import TestClient
 from src import main, secrets_store
 
 FAKE_TOKEN = "fake-token-for-tests-0001"
-FAKE_KEY = "fake-licence-for-tests-0002"
+FAKE_KEY = "fake-token-b-for-tests-0002"
 GITHUB = "/api/ui/secrets/github-token"
-LICENCE = "/api/ui/secrets/cloakbrowser-license-key"
+RETIRED = "/api/ui/secrets/cloakbrowser-license-key"
 UNSET = {"set": False, "source": None}
 
 
@@ -29,7 +29,6 @@ def test_status_when_nothing_is_set(client):
     assert response.status_code == 200
     assert response.json() == {
         "github-token": UNSET,
-        "cloakbrowser-license-key": UNSET,
         "apprise-urls": {
             "set": False,
             "count": 0,
@@ -40,12 +39,19 @@ def test_status_when_nothing_is_set(client):
     }
 
 
+def test_the_retired_license_key_slug_is_gone(client):
+    put = client.put(RETIRED, json={"value": FAKE_KEY})
+    delete = client.delete(RETIRED)
+
+    assert put.status_code == delete.status_code == 404
+    assert "cloakbrowser-license-key" not in client.get("/api/ui/secrets").json()
+
+
 def test_put_then_delete_round_trip(client):
     put = client.put(GITHUB, json={"value": FAKE_TOKEN})
 
     assert put.status_code == 200
     assert put.json()["github-token"] == {"set": True, "source": "file"}
-    assert put.json()["cloakbrowser-license-key"] == UNSET
     assert client.get("/api/ui/secrets").json() == put.json()
 
     deleted = client.delete(GITHUB)
@@ -236,7 +242,7 @@ def test_read_failure_gives_fixed_500_without_the_value(client, monkeypatch):
 
     for response in (
         client.get("/api/ui/secrets"),
-        client.put(LICENCE, json={"value": FAKE_KEY}),
+        client.put(GITHUB, json={"value": FAKE_KEY}),
         client.delete(GITHUB),
     ):
         assert response.status_code == 500
@@ -262,14 +268,14 @@ def test_no_response_or_log_contains_the_value(client, isolated_data_dir, caplog
     caplog.set_level(logging.DEBUG)
     responses = [
         client.put(GITHUB, json={"value": FAKE_TOKEN}),
-        client.put(LICENCE, json={"value": FAKE_KEY}),
+        client.put(GITHUB, json={"value": FAKE_KEY}),
         client.get("/api/ui/secrets"),
         client.put(GITHUB, json={"value": FAKE_TOKEN + "\n"}),
         client.get("/"),
         client.get("/api/apps"),
         client.get("/api/ui/discovery"),
         client.get("/api/ui/logs"),
-        client.delete(LICENCE),
+        client.delete(GITHUB),
     ]
 
     for response in responses:

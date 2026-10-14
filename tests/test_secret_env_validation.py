@@ -8,7 +8,6 @@ from fastapi.testclient import TestClient
 from src import main, secrets_store
 
 GITHUB = secrets_store.GITHUB_TOKEN
-LICENCE = secrets_store.CLOAKBROWSER_LICENSE_KEY
 FAKE_FILE_TOKEN = "fake-file-token-for-tests-0003"
 INVALID_VALUES = [
     "fake-env\x07-token-0004",
@@ -40,10 +39,7 @@ def test_invalid_environment_value_is_reported_as_invalid(monkeypatch, value):
     monkeypatch.setenv(GITHUB, value)
 
     assert secrets_store.secret_source(GITHUB) == "environment_invalid"
-    assert secrets_store.get_status() == {
-        GITHUB: "environment_invalid",
-        LICENCE: None,
-    }
+    assert secrets_store.get_status() == {GITHUB: "environment_invalid"}
 
 
 def test_valid_environment_value_still_wins(monkeypatch):
@@ -100,17 +96,6 @@ def test_warning_comes_back_after_the_variable_was_fixed_and_broken_again(
     secrets_store.get_secret(GITHUB)
 
     assert len([r for r in caplog.records if GITHUB in r.getMessage()]) == 2
-
-
-def test_each_variable_warns_by_its_own_name(monkeypatch, caplog):
-    caplog.set_level(logging.WARNING, logger="src.secrets_store")
-    monkeypatch.setenv(GITHUB, "bad value")
-    monkeypatch.setenv(LICENCE, "bad value too")
-
-    secrets_store.get_status()
-
-    names = [name for name in (GITHUB, LICENCE) if name in caplog.text]
-    assert names == [GITHUB, LICENCE]
 
 
 @pytest.fixture

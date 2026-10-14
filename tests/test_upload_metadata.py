@@ -7,7 +7,6 @@ from types import SimpleNamespace
 import pytest
 
 from src import main, patcher
-from src.apkmirror_downloader import license_error_for_code
 
 PACKAGE_ID = "com.example.app"
 APK_METADATA = "AppName=Example App\nVersionName=9.8.7\n"
@@ -125,20 +124,6 @@ def test_partial_icon_download_is_removed_and_later_retry_can_replace_it(
     )
     assert icon.read_bytes() == b"complete"
     assert list(icon.parent.iterdir()) == [icon]
-
-
-def test_license_denial_while_fetching_icon_still_propagates(
-    data_dir: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    prepare_apkeditor(data_dir, monkeypatch)
-    denied = license_error_for_code(77)
-    assert denied is not None
-    scraper = FakeScraper(denied)
-
-    with pytest.raises(type(denied)):
-        patcher.extract_app_metadata(data_dir / "app.apk", PACKAGE_ID, scraper)
-
-    assert not (data_dir / "bin" / "metadata.json").exists()
 
 
 def test_upload_persists_apk_and_extracted_metadata(

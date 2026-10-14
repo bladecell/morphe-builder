@@ -28,7 +28,6 @@ from src.apkmirror_downloader import (
     Arch,
     BundleType,
     Dpi,
-    is_invalid_license_error,
 )
 
 from src import secrets_store
@@ -2085,9 +2084,7 @@ def get_supported_versions(
         print(f"Fetching newest version for {package_name} from APKMirror...")
     close_scraper = False
     if scraper is None:
-        scraper = ApkMirror_Downloader(
-            license_key=secrets_store.get_secret(secrets_store.CLOAKBROWSER_LICENSE_KEY)
-        )
+        scraper = ApkMirror_Downloader()
         close_scraper = True
 
     try:
@@ -2101,8 +2098,6 @@ def get_supported_versions(
             return versions, None, None
         return cached_remote, None, None
     except Exception as e:
-        if is_invalid_license_error(e):
-            raise
         if raise_lookup_errors:
             raise VersionLookupError(f"{type(e).__name__}: {e}") from e
         if not quiet:
@@ -2148,11 +2143,7 @@ def extract_app_metadata(apk_path, package_id, scraper=None):
             print(f"    [!] Icon missing for {package_id}, fetching from APKMirror...")
             close_scraper = False
             if scraper is None:
-                scraper = ApkMirror_Downloader(
-                    license_key=secrets_store.get_secret(
-                        secrets_store.CLOAKBROWSER_LICENSE_KEY
-                    )
-                )
+                scraper = ApkMirror_Downloader()
                 close_scraper = True
             temporary_icon = icon_dir / f".{package_id}.{uuid.uuid4().hex}.png"
 
@@ -2167,8 +2158,6 @@ def extract_app_metadata(apk_path, package_id, scraper=None):
                     if downloaded_icon and temporary_icon.is_file():
                         os.replace(temporary_icon, target_icon)
             except Exception as e:
-                if is_invalid_license_error(e):
-                    raise
                 print(f"    [!] Icon lookup failed for {package_id}: {e}")
             finally:
                 try:
@@ -2181,8 +2170,6 @@ def extract_app_metadata(apk_path, package_id, scraper=None):
                     try:
                         scraper.close()
                     except Exception as e:
-                        if is_invalid_license_error(e):
-                            raise
                         if isinstance(
                             e,
                             (
@@ -2212,8 +2199,6 @@ def extract_app_metadata(apk_path, package_id, scraper=None):
 
         return metadata[package_id]
     except Exception as e:
-        if is_invalid_license_error(e):
-            raise
         print(f"    [!] Failed to extract metadata for {package_id}: {e}")
         return None
 
@@ -2247,6 +2232,54 @@ def get_app_preferences(package_name, config):
     return None
 
 
+def download_apk_via_apkeep(
+    package_name: str, target_version: str, dest_directory: str
+) -> Path | None:
+    """Download an exact app version from APKPure with `apkeep`.
+
+    Fallback for when APKMirror's Cloudflare challenge blocks the browser.
+
+    Args:
+        package_name: Android package id.
+        target_version: Exact version to fetch.
+        dest_directory: Existing directory the file is written into.
+
+    Returns:
+        The downloaded file, or None when apkeep is missing or the download failed.
+    """
+    apkeep = shutil.which("apkeep") or str(DATA_DIR / "bin" / "apkeep")
+    if not os.path.exists(apkeep):
+        print("    [!] apkeep is not installed; no fallback source available.")
+        return None
+    try:
+        result = run_child(
+            [
+                apkeep,
+                "-a",
+                f"{package_name}@{target_version}",
+                "-d",
+                "apk-pure",
+                dest_directory,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=900,
+        )
+    except (subprocess.SubprocessError, OSError) as error:
+        print(f"    [!] apkeep failed: {error}")
+        return None
+    if result.returncode != 0:
+        print(
+            f"    [!] apkeep exited {result.returncode}: {result.stderr.strip()[-300:]}"
+        )
+    downloads = sorted(
+        path
+        for path in Path(dest_directory).iterdir()
+        if path.suffix in {".apk", ".xapk"}
+    )
+    return downloads[0] if downloads else None
+
+
 def download_apk(
     package_name,
     target_version,
@@ -2261,9 +2294,7 @@ def download_apk(
 
     close_scraper = False
     if scraper is None:
-        scraper = ApkMirror_Downloader(
-            license_key=secrets_store.get_secret(secrets_store.CLOAKBROWSER_LICENSE_KEY)
-        )
+        scraper = ApkMirror_Downloader()
         close_scraper = True
 
     try:
@@ -2296,19 +2327,28 @@ def download_apk(
             minimum_sdk=minimum_sdk,
         )
 
-        if not app_data:
-            raise Exception(
-                f"Could not find {package_name} v{target_version} on APKMirror"
-            )
-
         with tempfile.TemporaryDirectory(dir=Path(final_path).parent) as temp_dir:
             temp_file_name = f"{package_name}_{target_version}_download.tmp"
 
-            downloaded_path = scraper.download_file(
-                target_url=app_data.download_url,
-                dest_directory=temp_dir,
-                filename=temp_file_name,
-            )
+            if app_data:
+                downloaded_path = scraper.download_file(
+                    target_url=app_data.download_url,
+                    dest_directory=temp_dir,
+                    filename=temp_file_name,
+                )
+            else:
+                print(
+                    f"    [~] APKMirror unavailable for {package_name} "
+                    f"v{target_version}. Trying APKPure via apkeep..."
+                )
+                downloaded_path = download_apk_via_apkeep(
+                    package_name, target_version, temp_dir
+                )
+                if not downloaded_path:
+                    raise Exception(
+                        f"Could not find {package_name} v{target_version} "
+                        "on APKMirror or APKPure"
+                    )
 
             if not downloaded_path or not os.path.exists(downloaded_path):
                 raise Exception("Download failed or file not found.")
@@ -2316,7 +2356,7 @@ def download_apk(
             # Download icon
             icon_dir = DATA_DIR / "apks" / "icons"
             icon_dir.mkdir(parents=True, exist_ok=True)
-            if app_data.icon_url and app_data.icon_url != "Unknown":
+            if app_data and app_data.icon_url and app_data.icon_url != "Unknown":
                 scraper.download_file(
                     target_url=app_data.icon_url,
                     dest_directory=str(icon_dir),
@@ -3124,9 +3164,7 @@ def run_pipeline(package_ids=None, quiet=False, scraper=None):
     close_scraper = False
     private_snapshots: list[Path] = []
     if scraper is None:
-        scraper = ApkMirror_Downloader(
-            license_key=secrets_store.get_secret(secrets_store.CLOAKBROWSER_LICENSE_KEY)
-        )
+        scraper = ApkMirror_Downloader()
         close_scraper = True
 
     try:
@@ -3223,8 +3261,6 @@ def run_pipeline(package_ids=None, quiet=False, scraper=None):
                         download_success = True
                         break
                     except Exception as e:
-                        if is_invalid_license_error(e):
-                            raise
                         print(
                             f"    [!] Failed to download v{v}: {e}. Trying next version..."
                         )
@@ -3332,8 +3368,6 @@ def run_pipeline(package_ids=None, quiet=False, scraper=None):
                         error="Patching failed with SEVERE errors",
                     )
             except Exception as e:
-                if is_invalid_license_error(e):
-                    raise
                 print(f"Error processing {app['id']}: {e}")
                 save_app_result(app["id"], status="Error", error=str(e))
     finally:
@@ -3410,7 +3444,4 @@ def get_all_available_apps(config):
 
 if __name__ == "__main__":
     secrets_store.absorb_environment()
-    from src.apkmirror_downloader import configure_cloakbrowser_cache
-
-    configure_cloakbrowser_cache(DATA_DIR / "bin" / "cloakbrowser")
     run_pipeline()

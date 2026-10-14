@@ -12,20 +12,14 @@ from requests.adapters import HTTPAdapter
 from src import apkmirror_downloader, config_store, main, patcher, secrets_store
 
 TOKEN = "fake-token-for-tests-0101"
-KEY = "fake-licence-for-tests-0102"
 BAD_ENV = "fake bad env value 0103"
 
 
 @pytest.fixture(autouse=True)
-def both_secrets(monkeypatch):
-    """One secret comes from the environment, the other from the file."""
+def environment_token(monkeypatch):
+    """The token comes from the environment, as it does in the container."""
     monkeypatch.setenv(secrets_store.GITHUB_TOKEN, TOKEN)
     secrets_store._warned_invalid_env.clear()
-
-
-@pytest.fixture
-def stored_key(isolated_data_dir):
-    secrets_store.set_secret(secrets_store.CLOAKBROWSER_LICENSE_KEY, KEY)
 
 
 @pytest.fixture
@@ -70,12 +64,12 @@ def notifications(data_dir, monkeypatch):
 
 
 @pytest.fixture
-def failing_build(monkeypatch, stored_key):
-    """A build whose pipeline fails with text holding both secrets."""
+def failing_build(monkeypatch):
+    """A build whose pipeline fails with text holding the token."""
 
     def explode(*args, **kwargs):
         print(f"pipeline output {TOKEN}")
-        raise RuntimeError(f"boom {TOKEN} and {KEY}")
+        raise RuntimeError(f"boom {TOKEN}")
 
     monkeypatch.setattr(patcher, "run_pipeline", explode)
     monkeypatch.setattr(main, "SCRAPER_WORKER", InlineWorker())
@@ -87,14 +81,13 @@ def failing_build(monkeypatch, stored_key):
 
 def assert_clean(text: str) -> None:
     assert TOKEN not in text
-    assert KEY not in text
 
 
 # --- redact itself ---------------------------------------------------------------
 
 
 def test_redact_masks_an_environment_value_that_is_not_a_valid_secret(monkeypatch):
-    monkeypatch.setenv(secrets_store.CLOAKBROWSER_LICENSE_KEY, BAD_ENV)
+    monkeypatch.setenv(secrets_store.GITHUB_TOKEN, BAD_ENV)
 
     redacted = secrets_store.redact(f"quoted {BAD_ENV} here")
 
@@ -103,7 +96,7 @@ def test_redact_masks_an_environment_value_that_is_not_a_valid_secret(monkeypatc
 
 
 def test_redact_leaves_a_short_environment_value_alone(monkeypatch):
-    monkeypatch.setenv(secrets_store.CLOAKBROWSER_LICENSE_KEY, "x")
+    monkeypatch.setenv(secrets_store.GITHUB_TOKEN, "x")
 
     assert secrets_store.redact("xyz") == "xyz"
 
@@ -360,23 +353,23 @@ def test_cron_failure_is_logged_without_the_value(monkeypatch, caplog, capsys):
 # --- logging -----------------------------------------------------------------------
 
 
-def test_logging_redacts_message_arguments(caplog, stored_key):
+def test_logging_redacts_message_arguments(caplog):
     logger = logging.getLogger("src.some_module")
 
     with caplog.at_level(logging.INFO, logger="src.some_module"):
         logger.error("failed with %s", TOKEN)
-        logger.info("direct " + KEY)
+        logger.info("direct " + TOKEN)
 
     assert "failed with ***" in caplog.text
     assert_clean(caplog.text)
 
 
-def test_logging_redacts_a_traceback(caplog, stored_key):
+def test_logging_redacts_a_traceback(caplog):
     logger = logging.getLogger("src.some_module")
 
     with caplog.at_level(logging.ERROR, logger="src.some_module"):
         try:
-            raise RuntimeError(f"inner {TOKEN} {KEY}")
+            raise RuntimeError(f"inner {TOKEN}")
         except RuntimeError:
             logger.exception("it broke")
 

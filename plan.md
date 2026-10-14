@@ -233,6 +233,9 @@ for inspection. No cleanup of existing Docker resources was performed.
 
 ## 8. Secrets, request guards, cloakbrowser key
 
+Superseded 2026-10-14: cloakbrowser and its licence key were replaced by ShardX
+(no key); see `decisions.md`. Items below are kept as history.
+
 Approved 2026-10-05. Decisions and reasons are in `decisions.md`. Work is on
 branch `secrets-guards-worker`.
 

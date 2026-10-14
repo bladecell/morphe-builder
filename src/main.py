@@ -15,6 +15,7 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
 import hashlib
+import shutil
 import json
 import math
 import re
@@ -114,7 +115,7 @@ class _Task:
     result: "queue.Queue[tuple[object, Exception | None]]"
 
 
-def _launch_downloader(license_key: str | None = None) -> Downloader:
+def _launch_downloader() -> Downloader:
     """Start the persistent APKMirror downloader (launches the browser).
 
     Returns:
@@ -122,7 +123,7 @@ def _launch_downloader(license_key: str | None = None) -> Downloader:
     """
     from src.patcher import ApkMirror_Downloader
 
-    return ApkMirror_Downloader(license_key=license_key)
+    return ApkMirror_Downloader()
 
 
 # Global worker to manage a persistent downloader instance
@@ -140,7 +141,6 @@ class ScraperWorker(threading.Thread):
         launch: Callable[..., Downloader] = _launch_downloader,
         clock: Callable[[], float] = time.monotonic,
         cooldown: float = LAUNCH_COOLDOWN_SECONDS,
-        license_key_provider: Callable[[], str | None] | None = None,
     ) -> None:
         """Create the worker; call `start()` to launch the browser.
 
@@ -155,9 +155,6 @@ class ScraperWorker(threading.Thread):
         self.error: str | None = None  # redacted text of the last launch failure
         self.initialized = threading.Event()
         self._launch = launch
-        self._license_key_provider = license_key_provider
-        self._license_key: str | None = None
-        self._license_key_rejected = False
         self._clock = clock
         self._cooldown = cooldown
         self._next_attempt_at = 0.0
@@ -191,7 +188,6 @@ class ScraperWorker(threading.Thread):
     def _run_task_body(self, task: _Task) -> None:
         """Launch the browser if needed, run the task and answer its caller."""
         try:
-            self._refresh_license_key()
             if self.downloader is None and self._clock() >= self._next_attempt_at:
                 self._try_launch()
             if self.downloader is None:
@@ -200,12 +196,6 @@ class ScraperWorker(threading.Thread):
             result = task.func(*task.args, scraper=self.downloader, **task.kwargs)
             task.result.put((result, None))
         except Exception as error:  # noqa: BLE001 - handed to the caller
-            from src.apkmirror_downloader import is_invalid_license_error
-
-            if is_invalid_license_error(error):
-                self._license_key_rejected = True
-                self._close_downloader()
-                self._next_attempt_at = 0.0
             task.result.put((None, error))
         except BaseException as error:  # noqa: BLE001 - SystemExit and the like
             # Must not end the thread or leave the caller waiting.
@@ -218,20 +208,9 @@ class ScraperWorker(threading.Thread):
         logger.info("Initializing persistent ApkMirror_Downloader...")
         self._launching = True
         try:
-            if self._license_key_provider is None:
-                self.downloader = self._launch()
-            else:
-                self._license_key = self._license_key_provider()
-                launch_key = None if self._license_key_rejected else self._license_key
-                self.downloader = self._launch(launch_key)
-                self._license_key_rejected = self._license_key_rejected or bool(
-                    getattr(self.downloader, "license_key_rejected", False)
-                )
+            self.downloader = self._launch()
         except Exception as error:  # noqa: BLE001 - any launch failure is recoverable
             # No exc_info: the traceback would repeat the unredacted message.
-            self._license_key_rejected = self._license_key_rejected or bool(
-                getattr(error, "license_key_rejected", False)
-            )
             self.error = secrets_store.redact(f"{type(error).__name__}: {error}")
             self._next_attempt_at = self._clock() + self._cooldown
             logger.error("Browser launch failed: %s", self.error)
@@ -239,18 +218,6 @@ class ScraperWorker(threading.Thread):
         finally:
             self._launching = False
         self.error = None
-
-    def _refresh_license_key(self) -> None:
-        """Relaunch between tasks when the effective configured key changes."""
-        if self._license_key_provider is None:
-            return
-        current_key = self._license_key_provider()
-        if current_key == self._license_key:
-            return
-        self._close_downloader()
-        self._license_key = current_key
-        self._license_key_rejected = False
-        self._next_attempt_at = 0.0
 
     def _finish(self) -> None:
         """Close the browser and answer every task still queued."""
@@ -323,7 +290,6 @@ class ScraperWorker(threading.Thread):
             "error": self.error,
             "retry_in": self._retry_in(),
             "busy_since": self._busy_since,
-            "license_key_rejected": self._license_key_rejected,
         }
 
     def execute(self, func: Callable[..., T], *args: object, **kwargs: object) -> T:
@@ -386,11 +352,7 @@ class ScraperWorker(threading.Thread):
             self.task_queue.put(None)
 
 
-SCRAPER_WORKER = ScraperWorker(
-    license_key_provider=lambda: secrets_store.get_secret(
-        secrets_store.CLOAKBROWSER_LICENSE_KEY
-    )
-)
+SCRAPER_WORKER = ScraperWorker()
 # True while any scraper activity (a version refresh or a build) is queued or
 # running. It is derived from `_ACTIVITY_COUNT`, so one activity ending cannot
 # clear it while another still runs.
@@ -487,11 +449,9 @@ def ensure_data_dirs():
     (DATA_DIR / "apks" / "icons").mkdir(parents=True, exist_ok=True)
 
 
-def configure_cloakbrowser_cache() -> None:
-    """Use an isolated cloakbrowser cache under the app's data directory."""
-    from src.apkmirror_downloader import configure_cloakbrowser_cache as configure
-
-    configure(DATA_DIR / "bin" / "cloakbrowser")
+def remove_legacy_cloakbrowser_cache() -> None:
+    """Delete the retired cloakbrowser binary cache (and any key file in it)."""
+    shutil.rmtree(DATA_DIR / "bin" / "cloakbrowser", ignore_errors=True)
 
 
 # Cache for update status to prevent excessive polling load
@@ -2025,7 +1985,6 @@ def save_settings(payload: SaveSettingsPayload) -> dict[str, str]:
 
 SECRET_SLUGS = {
     "github-token": secrets_store.GITHUB_TOKEN,
-    "cloakbrowser-license-key": secrets_store.CLOAKBROWSER_LICENSE_KEY,
 }
 MAX_SECRET_BODY_BYTES = 4096
 
@@ -2464,10 +2423,6 @@ def build_task(
                 print(f"\n[FATAL ERROR] {message}")
                 BUILD_STATUS["message"] = f"Failed: {message}"
                 send_notification("Build Failed", f"Pipeline error: {message}")
-                from src.apkmirror_downloader import is_invalid_license_error
-
-                if is_invalid_license_error(e):
-                    raise
             finally:
                 sys.stdout = old_stdout
                 # Invalidate update cache when build finishes
@@ -2787,13 +2742,11 @@ def setup_cron_job(config: dict) -> None:
 async def startup_event() -> None:
     """Start the worker and scheduler, and sync the tools if they are missing."""
     global DIAGNOSTICS
-    # First, before anything is started: take both secrets out of os.environ so
+    # First, before anything is started: take the secrets out of os.environ so
     # no thread, subprocess or library inherits them.
-    # The isolated cloakbrowser cache prevents its implicit license.key lookup;
-    # configured keys are passed explicitly by the worker.
     secrets_store.absorb_environment()
     ensure_data_dirs()
-    configure_cloakbrowser_cache()
+    remove_legacy_cloakbrowser_cache()
     config = load_config()
     _effective_apprise_urls(config)
     setup_cron_job(config)

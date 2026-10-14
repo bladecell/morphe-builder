@@ -20,7 +20,7 @@ def same_length_random(text: str) -> str:
 @pytest.fixture
 def client(isolated_data_dir, monkeypatch):
     (isolated_data_dir / "apks" / "icons").mkdir(parents=True)
-    secrets_store.set_secret(secrets_store.CLOAKBROWSER_LICENSE_KEY, SECRET)
+    secrets_store.set_secret(secrets_store.GITHUB_TOKEN, SECRET)
     monkeypatch.setattr(main, "check_and_download_release", lambda *a, **k: False)
     return TestClient(main.app)
 

@@ -90,20 +90,12 @@
                             unavailable: 'Removed, but no sync could be started. Use Sync Sources.',
                             none: 'Removed.'
                         }
-                    },
-                    {
-                        slug: 'cloakbrowser-license-key',
-                        label: 'Cloakbrowser licence key',
-                        env: 'CLOAKBROWSER_LICENSE_KEY',
-                        hint: 'The browser reads a changed key before its next scraper task. Saving or removing this key does not start a task or validate it immediately.',
-                        saved: {none: 'Saved. The browser will use the new key before its next task.'},
-                        removed: {none: 'Removed. The browser will use the updated setting before its next task.'}
                     }
                 ],
                 secrets: {},
                 secretsLoaded: false,
                 secretsLoadError: null,
-                secretInput: {'github-token': '', 'cloakbrowser-license-key': ''},
+                secretInput: {'github-token': ''},
                 secretBusy: {},
                 secretMessage: {},
 
@@ -1552,7 +1544,7 @@
                                             type="password"
                                             :id="'secret-' + field.slug"
                                             x-model="secretInput[field.slug]"
-                                            :autocomplete="field.slug === 'cloakbrowser-license-key' ? 'off' : 'new-password'"
+                                            autocomplete="new-password"
                                             spellcheck="false"
                                             autocapitalize="off"
                                             autocorrect="off"
@@ -1591,9 +1583,6 @@
                                         </p>
                                     </template>
                                 </div>
-                            </template>
-                            <template x-if="field.slug === 'cloakbrowser-license-key' && (secretState(field.slug) === 'file' || secretState(field.slug) === 'environment')">
-                                <p x-show="browser && browser.license_key_rejected" class="px-4 py-3 bg-red-500/10 border border-red-500/20 rounded-xl text-[11px] font-bold text-red-400" x-text="'The last browser result rejected the configured key. Later tasks use keyless mode until the configured key changes; a changed key is read before the next scraper task.'"></p>
                             </template>
                         </div>
                     </template>

@@ -17,7 +17,7 @@ For design rationale see [architecture.md](architecture.md) and
 - `src/patcher.py`: `python -m src.patcher` runs one full pipeline pass without the web
   app.
 - `Dockerfile`: `python:3.12-slim-bookworm` plus Java 17, `uv sync --frozen`,
-  Playwright Chromium and the cloakbrowser binary. Sets `DATA_DIR=/data`, exposes 8000.
+  Playwright Chromium, the ShardX engine (pre-fetched at build) and the hash-pinned `apkeep`. Sets `DATA_DIR=/data`, exposes 8000.
 - `pyproject.toml`: dependencies and tool config (pytest `pythonpath = ["."]`, ruff
   line length 88, mypy). Python >= 3.12, managed with `uv`.
 
@@ -79,15 +79,15 @@ gitignored.
 | Path | Contents |
 |---|---|
 | `config.yaml` | Sources, apps, settings, last successful build per app |
-| `.env` | Optional plaintext secrets file (`GITHUB_TOKEN`, `CLOAKBROWSER_LICENSE_KEY`, JSON-array `APPRISE_URLS`), atomically written with mode `0600` |
-| `bin/` | Tool jars, per-source `.mpp` and `.json`, `versions.json`, `version_cache.json`, `metadata.json`, `build.log`, isolated `cloakbrowser/` cache |
+| `.env` | Optional plaintext secrets file (`GITHUB_TOKEN`, JSON-array `APPRISE_URLS`), atomically written with mode `0600` |
+| `bin/` | Tool jars, per-source `.mpp` and `.json`, `versions.json`, `version_cache.json`, `metadata.json`, `build.log` |
 | `apks/raw/`, `apks/patched/`, `apks/icons/` | Downloaded APKs, patched APKs, app icons |
 | `apks/.building/` | Scratch output of the patch in progress |
 
 Environment values override `.env`; startup captures and removes them from
 `os.environ`. Do not use `DATA_DIR/.env` as a shell or container environment
 file. Docker runtime variables can be passed with `-e`; see [README deployment
-guidance](README.md#runtime-environment). Cloakbrowser's cache is configured at
-`DATA_DIR/bin/cloakbrowser`, not the operator's home cache.
+guidance](README.md#runtime-environment). Startup removes a stale `CLOAKBROWSER_LICENSE_KEY` and the retired
+`DATA_DIR/bin/cloakbrowser` cache.
 
 File-level ownership of each of these is in [src/codemap.md](src/codemap.md).

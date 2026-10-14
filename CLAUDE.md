@@ -4,7 +4,7 @@ This is a Morphe builder webapp. It manages builds of android app patched with m
 
 Morphe - https://github.com/morpheapp
 
-The user adds patch sources on main app, backend pulls the patches and lists patches for available app. Then the user configures the app patches and can build it. The app downloading uses cloakbrowser downloader that navigates apkmirror website to get specific apk version.
+The user adds patch sources on main app, backend pulls the patches and lists patches for available app. Then the user configures the app patches and can build it. The app downloading uses a ShardX-based downloader that navigates apkmirror website to get specific apk version.
 
 ## Preferred Tools
 

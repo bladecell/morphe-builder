@@ -106,7 +106,7 @@ def test_startup_registers_preexisting_secrets_before_status_and_logs_requests(
     # Startup operations unrelated to registration are isolated; no browser,
     # scheduler job, or tool sync is launched by this test.
     monkeypatch.setattr(main, "ensure_data_dirs", lambda: None)
-    monkeypatch.setattr(main, "configure_cloakbrowser_cache", lambda: None)
+    monkeypatch.setattr(main, "remove_legacy_cloakbrowser_cache", lambda: None)
     monkeypatch.setattr(main, "setup_cron_job", lambda config: None)
     monkeypatch.setattr(main, "check_dependencies", lambda config: {})
     monkeypatch.setattr(main.SCRAPER_WORKER, "start", lambda: None)

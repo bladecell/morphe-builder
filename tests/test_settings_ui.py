@@ -15,7 +15,6 @@ from fastapi.testclient import TestClient
 from src import main
 
 TOKEN = "ghp_exampleExampleExample1234"
-LICENSE_KEY = "fake-license-key-example-1234"
 METHOD_END = "\n                },"
 
 
@@ -106,29 +105,20 @@ def secrets_card(page: str) -> str:
 # --- the card -----------------------------------------------------------------------
 
 
-def test_both_supported_secrets_have_settings_fields(page):
+def test_the_github_token_has_a_settings_field_and_the_retired_key_has_none(page):
     assert "secretFields" in page
     assert "'github-token'" in page
-    assert "'cloakbrowser-license-key'" in page
-    assert "CLOAKBROWSER_LICENSE_KEY" in page
+    assert "cloakbrowser" not in page.lower()
+    assert "CLOAKBROWSER_LICENSE_KEY" not in page
 
 
 def test_secret_input_is_a_password_field_that_password_managers_leave_alone(page):
     card = secrets_card(page)
 
     assert 'type="password"' in card
-    assert (
-        ":autocomplete=\"field.slug === 'cloakbrowser-license-key' ? 'off' : 'new-password'\""
-        in card
-    )
+    assert 'autocomplete="new-password"' in card
     assert 'spellcheck="false"' in card
     assert 'autocapitalize="off"' in card
-
-
-def test_cloakbrowser_key_password_manager_autocomplete_is_off(page):
-    card = secrets_card(page)
-    assert "field.slug === 'cloakbrowser-license-key'" in card
-    assert "field.slug === 'cloakbrowser-license-key' ? 'off' : 'new-password'" in card
 
 
 def test_card_has_no_form_and_the_input_is_labelled_and_described(page):
@@ -163,13 +153,6 @@ def test_card_shows_warning_and_rejection_text_from_the_status(page):
 
     assert "githubTokenWarning" in card
     assert "githubTokenRejected" in card
-
-
-def test_cloakbrowser_rejection_is_a_separate_last_known_browser_status(page):
-    card = secrets_card(page)
-    assert "browser.license_key_rejected" in card
-    assert "last browser result" in card
-    assert "next scraper task" in card
 
 
 def test_card_comes_before_system_settings(page):
@@ -301,16 +284,6 @@ def test_page_never_carries_a_stored_secret_or_its_status(client):
     assert '"github-token": {' not in html
     assert "ghp_" not in html
 
-    assert (
-        client.put(
-            "/api/ui/secrets/cloakbrowser-license-key", json={"value": LICENSE_KEY}
-        ).status_code
-        == 200
-    )
-    html = client.get("/").text
-    assert LICENSE_KEY not in html
-    assert '"cloakbrowser-license-key": {' not in html
-
 
 def test_page_stores_only_the_active_tab_in_session_storage(page):
     uses = re.findall(r"(?:session|local)Storage\.\w+\(([^)]*)\)", page)
@@ -337,67 +310,7 @@ def test_static_hint_does_not_promise_a_check_that_may_not_happen(page):
 
 
 @needs_node
-def test_saving_cloakbrowser_key_uses_only_secret_route_and_does_not_start_work(
-    page, tmp_path
-):
-    result = run_js(
-        page,
-        tmp_path,
-        "setReply(() => respond(200, {'github-token': {set: false, source: null}, "
-        "'cloakbrowser-license-key': {set: true, source: 'file'}, "
-        "'apprise-urls': {set: false, count: 0, source: null, legacy_available: false, migration_state: 'none'}}));"
-        " app.secretsLoaded = true; app.secretInput['cloakbrowser-license-key'] = 'secretvalue123';"
-        " await app.saveSecret('cloakbrowser-license-key');"
-        " return {calls, message: app.secretMessage['cloakbrowser-license-key'], "
-        "input: app.secretInput['cloakbrowser-license-key']};",
-    )
-    assert [call["url"] for call in result["calls"]] == [
-        "/api/ui/secrets/cloakbrowser-license-key",
-        "/api/ui/tools_status",
-    ]
-    assert result["calls"][0]["url"] == "/api/ui/secrets/cloakbrowser-license-key"
-    assert result["calls"][0]["method"] == "PUT"
-    assert (
-        result["message"]["text"]
-        == "Saved. The browser will use the new key before its next task."
-    )
-    assert result["input"] == ""
-
-
-@needs_node
-def test_cloakbrowser_last_known_rejection_remains_independent_of_saved_state(
-    page, tmp_path
-):
-    result = run_js(
-        page,
-        tmp_path,
-        "app.browser.license_key_rejected = true;"
-        " app.secretsLoaded = true; app.secrets['cloakbrowser-license-key'] = {set: true, source: 'file'};"
-        " return {state: app.secretState('cloakbrowser-license-key'), "
-        "rejected: app.browser.license_key_rejected};",
-    )
-    assert result == {"state": "file", "rejected": True}
-
-
-@needs_node
-@pytest.mark.parametrize("status", [400, 403, 500])
-def test_cloakbrowser_write_failure_keeps_typed_value(page, tmp_path, status):
-    result = run_js(
-        page,
-        tmp_path,
-        f"setReply(() => respond({status}, {{detail: '<b>refused</b>'}}));"
-        " app.secretsLoaded = true; app.secretInput['cloakbrowser-license-key'] = 'secretvalue123';"
-        " await app.saveSecret('cloakbrowser-license-key');"
-        " return {input: app.secretInput['cloakbrowser-license-key'], "
-        "message: app.secretMessage['cloakbrowser-license-key']};",
-    )
-    assert result["input"] == "secretvalue123"
-    assert result["message"]["kind"] == "error"
-    assert result["message"]["text"] == "<b>refused</b>"
-
-
-@needs_node
-def test_cloakbrowser_environment_conflict_clears_draft_and_refreshes_status(
+def test_github_token_environment_conflict_clears_draft_and_refreshes_status(
     page, tmp_path
 ):
     result = run_js(
@@ -405,13 +318,12 @@ def test_cloakbrowser_environment_conflict_clears_draft_and_refreshes_status(
         tmp_path,
         "setReply((url, options) => options.method === 'PUT'"
         " ? respond(409, {detail: 'Environment owns this secret'})"
-        " : respond(200, {'github-token': {set: false, source: null}, "
-        "'cloakbrowser-license-key': {set: false, source: 'environment_invalid'}, "
+        " : respond(200, {'github-token': {set: false, source: 'environment_invalid'}, "
         "'apprise-urls': {set: false, count: 0, source: null, legacy_available: false, migration_state: 'none'}}));"
-        " app.secretsLoaded = true; app.secretInput['cloakbrowser-license-key'] = 'secretvalue123';"
-        " await app.saveSecret('cloakbrowser-license-key');"
-        " return {calls, input: app.secretInput['cloakbrowser-license-key'], "
-        "state: app.secretState('cloakbrowser-license-key')};",
+        " app.secretsLoaded = true; app.secretInput['github-token'] = 'secretvalue123';"
+        " await app.saveSecret('github-token');"
+        " return {calls, input: app.secretInput['github-token'], "
+        "state: app.secretState('github-token')};",
     )
     assert len(result["calls"]) == 2
     assert result["calls"][1]["url"] == "/api/ui/secrets"
@@ -420,15 +332,15 @@ def test_cloakbrowser_environment_conflict_clears_draft_and_refreshes_status(
 
 
 @needs_node
-def test_cloakbrowser_network_failure_keeps_the_draft(page, tmp_path):
+def test_github_token_network_failure_keeps_the_draft(page, tmp_path):
     result = run_js(
         page,
         tmp_path,
         "setReply(() => { throw new TypeError('offline'); });"
-        " app.secretInput['cloakbrowser-license-key'] = 'secretvalue123';"
-        " await app.saveSecret('cloakbrowser-license-key');"
-        " return {input: app.secretInput['cloakbrowser-license-key'], "
-        "message: app.secretMessage['cloakbrowser-license-key']};",
+        " app.secretInput['github-token'] = 'secretvalue123';"
+        " await app.saveSecret('github-token');"
+        " return {input: app.secretInput['github-token'], "
+        "message: app.secretMessage['github-token']};",
     )
     assert result["input"] == "secretvalue123"
     assert result["message"] == {
@@ -453,9 +365,9 @@ def test_malformed_successful_secret_load_preserves_current_status(
         page,
         tmp_path,
         f"setReply(() => respond(200, {body}));"
-        " app.secretsLoaded = true; app.secrets = {'cloakbrowser-license-key': {set: true, source: 'file'}};"
+        " app.secretsLoaded = true; app.secrets = {'github-token': {set: true, source: 'file'}};"
         " await app.loadSecrets();"
-        " return {loaded: app.secretsLoaded, state: app.secretState('cloakbrowser-license-key'), error: app.secretsLoadError};",
+        " return {loaded: app.secretsLoaded, state: app.secretState('github-token'), error: app.secretsLoadError};",
     )
     assert result == {
         "loaded": True,
@@ -471,7 +383,7 @@ def test_malformed_successful_secret_load_preserves_current_status(
     [
         "undefined",
         "null",
-        json.dumps({"cloakbrowser-license-key": {"set": "yes", "source": "file"}}),
+        json.dumps({"github-token": {"set": "yes", "source": "file"}}),
     ],
 )
 def test_malformed_successful_secret_mutation_preserves_state_and_draft(
@@ -481,11 +393,11 @@ def test_malformed_successful_secret_mutation_preserves_state_and_draft(
         page,
         tmp_path,
         f"setReply(() => respond(200, {body}));"
-        " app.secretsLoaded = true; app.secrets = {'github-token': {set: false, source: null}, 'cloakbrowser-license-key': {set: false, source: null}};"
-        " app.secretInput['cloakbrowser-license-key'] = 'draft-value-123';"
-        f" await app.{method}('cloakbrowser-license-key');"
-        " return {state: app.secretState('cloakbrowser-license-key'), input: app.secretInput['cloakbrowser-license-key'], "
-        "message: app.secretMessage['cloakbrowser-license-key'], calls};",
+        " app.secretsLoaded = true; app.secrets = {'github-token': {set: false, source: null}};"
+        " app.secretInput['github-token'] = 'draft-value-123';"
+        f" await app.{method}('github-token');"
+        " return {state: app.secretState('github-token'), input: app.secretInput['github-token'], "
+        "message: app.secretMessage['github-token'], calls};",
     )
     assert result["state"] == "unset"
     assert result["input"] == "draft-value-123"
@@ -596,7 +508,6 @@ def test_save_message_follows_the_sync_header_and_clears_the_input(
         page,
         tmp_path,
         "setReply(() => respond(200, {'github-token': {set: true, source: 'file'}, "
-        "'cloakbrowser-license-key': {set: false, source: null}, "
         "'apprise-urls': {set: false, count: 0, source: null, legacy_available: false, migration_state: 'none'}}, "
         f"{json.dumps(headers)}));"
         " app.secretsLoaded = true; app.secretInput['github-token'] = 'abcdefgh12345';"
@@ -630,8 +541,7 @@ def test_clear_message_follows_the_sync_header(page, tmp_path, sync, text):
     result = run_js(
         page,
         tmp_path,
-        "setReply(() => respond(200, {'github-token': {set: false, source: null}, "
-        "'cloakbrowser-license-key': {set: false, source: null}, "
+        "setReply(() => respond(200, {'github-token': {set: false, source: 'environment_invalid'}, "
         "'apprise-urls': {set: false, count: 0, source: null, legacy_available: false, migration_state: 'none'}}, "
         f"{json.dumps(headers)}));"
         " await app.clearSecret('github-token');"
@@ -663,7 +573,6 @@ def test_environment_locked_clear_409_discards_typed_draft(page, tmp_path):
         "setReply(url => url.includes('/github-token')"
         " ? respond(409, {detail: 'Secret is set by the environment'})"
         " : respond(200, {'github-token': {set: true, source: 'environment'}, "
-        "'cloakbrowser-license-key': {set: false, source: null}, "
         "'apprise-urls': {set: false, count: 0, source: null, legacy_available: false, migration_state: 'none'}}));"
         " app.secretInput['github-token'] = 'draft-token-12345';"
         " await app.clearSecret('github-token');"

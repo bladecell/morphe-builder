@@ -15,9 +15,7 @@ pytestmark = pytest.mark.real_sync_scheduling
 
 TOKEN_VALUE = "fake-token-for-tests-0001"
 OTHER_VALUE = "fake-token-for-tests-0002"
-KEY_VALUE = "fake-licence-for-tests-0003"
 GITHUB = "/api/ui/secrets/github-token"
-LICENCE = "/api/ui/secrets/cloakbrowser-license-key"
 
 
 class RecordingScheduler:
@@ -69,7 +67,6 @@ def test_the_body_keeps_the_status_shape(client):
 
     assert set(body) == {
         "github-token",
-        "cloakbrowser-license-key",
         "apprise-urls",
     }
 
@@ -116,14 +113,6 @@ def test_clearing_when_no_token_is_stored_schedules_nothing(client, scheduler):
     assert sync_header(response) == "not-needed"
     assert scheduler.jobs == []
     assert main.TOOLS_UPDATING is False
-
-
-def test_the_licence_key_has_no_sync_header_and_no_job(client, scheduler):
-    put = client.put(LICENCE, json={"value": KEY_VALUE})
-    delete = client.delete(LICENCE)
-
-    assert sync_header(put) is None and sync_header(delete) is None
-    assert scheduler.jobs == []
 
 
 def test_an_invalid_value_schedules_nothing(client, scheduler):
@@ -198,9 +187,7 @@ def test_a_scheduler_failure_releases_the_claim(client, scheduler):
     assert main.TOOLS_UPDATING is False
 
 
-def test_scheduling_does_not_depend_on_the_response_being_delivered(
-    client, scheduler
-):
+def test_scheduling_does_not_depend_on_the_response_being_delivered(client, scheduler):
     # The job is handed to the scheduler before the handler returns, so a client
     # that disconnects (which can skip Starlette background tasks) cannot leave
     # the claim without an owner.

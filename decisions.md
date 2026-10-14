@@ -1,5 +1,22 @@
 # Decisions
 
+## 2026-10-14: Replace cloakbrowser with ShardX
+
+- `src/apkmirror_downloader.py` now drives ShardX (`shardx==2.0.3`, MIT, github.com/ProxyShard/ShardBrowser):
+  engine launched headless through its SDK with `cdp=True`, attached by sync
+  Playwright `connect_over_cdp`, throwaway profile per launch, `--no-sandbox` as
+  root, engine fetched at Docker build time only.
+- Reason: in Docker, cloakbrowser could not pass APKMirror's Cloudflare managed
+  challenge (403 forever). ShardX headless passes it; headed under Xvfb did not.
+- No licence key is needed. The `CLOAKBROWSER_LICENSE_KEY` secret, Settings field,
+  rejection status and keyless fallback were removed. Startup strips a stale key
+  from `.env`/environment and deletes `DATA_DIR/bin/cloakbrowser`.
+- Also in tree: Morphe API variant resolver and an `apkeep` APKPure fallback
+  (hash-pinned in the Dockerfile).
+- Risk: the ~170 MB Chromium engine comes from a ProxyShard CDN and is unsigned.
+  It is fetched at build time only; see the Dockerfile for the verification done.
+- Earlier cloakbrowser entries below are kept as history and marked superseded.
+
 ## 2026-10-11: HushFacebook requires Android API 30 artifacts
 
 Approved policy: constrain `com.facebook.katana` builds only when resolved,
@@ -347,6 +364,9 @@ never logged and never returned; the UI shows only whether one is set.
 
 ## 2026-10-05: Bump cloakbrowser to 0.5.x, keyless unless a key is set
 
+> Superseded 2026-10-14: cloakbrowser was replaced by ShardX; see the entry at the top.
+
+
 Decided by the user. This reverses the 2026-10-01 note about not bumping. It is not
 known to fix the container page crash; that cause is still open.
 
@@ -369,6 +389,9 @@ disk fails to load. Accepted cost: while a list stays unreadable, each sync cont
 GitHub for that source despite the 6-hour throttle.
 
 ## 2026-10-05: Secrets live in `DATA_DIR/.env`, set through their own routes
+
+> Cloakbrowser and licence-key parts superseded 2026-10-14 (ShardX switch, top entry).
+
 
 Decided by the user, for the GitHub token and the cloakbrowser licence key.
 
@@ -479,6 +502,9 @@ Decided by the user. These replace two points of the section above.
   GitHub calls any site could trigger.
 
 ## 2026-10-05: Before the GitHub token is sent
+
+> Cloakbrowser and licence-key parts superseded 2026-10-14 (ShardX switch, top entry).
+
 
 Decided by the user after the security review of the hardening step.
 
@@ -612,6 +638,9 @@ CDNs or vendoring the in-browser Tailwind script.
 
 ## 2026-10-07: Settings UI for the GitHub token
 
+> Cloakbrowser and licence-key parts superseded 2026-10-14 (ShardX switch, top entry).
+
+
 Decided by the user: state field for fine-grained tokens, automatic sync after a
 token change, real-token trial after this step. The rest are the recommendations.
 
@@ -640,6 +669,9 @@ token change, real-token trial after this step. The rest are the recommendations
   claim held), a follow-up sync when one is already running.
 
 ## 2026-10-08: Pass cloakbrowser key explicitly and downgrade only code 77
+
+> Superseded 2026-10-14: cloakbrowser was replaced by ShardX; see the entry at the top.
+
 
 - The downloader passes a configured effective key as `launch(license_key=...)`
   and omits that argument when unset. Cloakbrowser 0.5.12 maps exit code 77 to
@@ -694,6 +726,9 @@ token change, real-token trial after this step. The rest are the recommendations
   so no test suite was run.
 
 ## 2026-10-10: Cloakbrowser licence-key Settings field
+
+> Superseded 2026-10-14: cloakbrowser was replaced by ShardX; see the entry at the top.
+
 
 - Add the existing `cloakbrowser-license-key` secret to the generic Secrets card;
   keep environment ownership, invalid-environment state, password input, and

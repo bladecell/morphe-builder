@@ -13,9 +13,8 @@ import pytest
 from src import config_store, secrets_store
 
 FAKE_TOKEN = "fake-token-for-tests-0001"
-FAKE_KEY = "fake-licence-for-tests-0002"
+FAKE_KEY = "fake-env-token-for-tests-0002"
 GITHUB = secrets_store.GITHUB_TOKEN
-LICENCE = secrets_store.CLOAKBROWSER_LICENSE_KEY
 
 
 def env_file(data_dir):
@@ -43,7 +42,7 @@ def test_file_mode_is_0600(isolated_data_dir):
 
 def test_rewrite_keeps_mode_0600_and_leaves_no_temp_files(isolated_data_dir):
     secrets_store.set_secret(GITHUB, FAKE_TOKEN)
-    secrets_store.set_secret(LICENCE, FAKE_KEY)
+    secrets_store.set_apprise_urls(["json://example.com"])
     secrets_store.clear_secret(GITHUB)
 
     assert stat.S_IMODE(env_file(isolated_data_dir).stat().st_mode) == 0o600
@@ -85,7 +84,6 @@ def test_other_lines_and_comments_are_preserved(isolated_data_dir):
     )
 
     secrets_store.set_secret(GITHUB, FAKE_TOKEN)
-    secrets_store.clear_secret(LICENCE)
 
     assert env_file(isolated_data_dir).read_text() == (
         f"# my notes\nOTHER=keep me\n\nlast=1\nGITHUB_TOKEN={FAKE_TOKEN}\n"
@@ -97,7 +95,7 @@ def test_unrecognised_names_are_never_loaded(isolated_data_dir):
 
     with pytest.raises(KeyError):
         secrets_store.get_secret("OTHER")
-    assert set(secrets_store.get_status()) == {GITHUB, LICENCE}
+    assert set(secrets_store.get_status()) == {GITHUB}
 
 
 def test_environment_beats_file(isolated_data_dir, monkeypatch):
@@ -151,9 +149,9 @@ def test_invalid_values_are_rejected_without_echo(isolated_data_dir, bad):
 
 def test_length_bounds_are_accepted(isolated_data_dir):
     secrets_store.set_secret(GITHUB, "a" * 8)
-    secrets_store.set_secret(LICENCE, "a" * 512)
+    secrets_store.set_secret(GITHUB, "a" * 512)
 
-    assert secrets_store.get_secret(LICENCE) == "a" * 512
+    assert secrets_store.get_secret(GITHUB) == "a" * 512
 
 
 def test_unknown_name_raises_key_error(isolated_data_dir):
@@ -166,19 +164,18 @@ def test_unknown_name_raises_key_error(isolated_data_dir):
 def test_malformed_lines_do_not_raise(isolated_data_dir):
     env_file(isolated_data_dir).write_text(
         "GITHUB_TOKEN\n=\n\x00\xff garbage\nGITHUB_TOKEN=\n"
-        "CLOAKBROWSER_LICENSE_KEY=has space inside\n"
+        "GITHUB_TOKEN=has space inside\n"
     )
 
     assert secrets_store.get_secret(GITHUB) is None
-    assert secrets_store.get_secret(LICENCE) is None
-    assert secrets_store.get_status() == {GITHUB: None, LICENCE: None}
+    assert secrets_store.get_status() == {GITHUB: None}
     secrets_store.set_secret(GITHUB, FAKE_TOKEN)
     assert secrets_store.get_secret(GITHUB) == FAKE_TOKEN
 
 
 def test_redact_replaces_current_values(isolated_data_dir, monkeypatch):
     secrets_store.set_secret(GITHUB, FAKE_TOKEN)
-    monkeypatch.setenv(LICENCE, FAKE_KEY)
+    monkeypatch.setenv(GITHUB, FAKE_KEY)
 
     text = f"failed with {FAKE_TOKEN} and {FAKE_KEY} twice {FAKE_TOKEN}"
 
@@ -318,16 +315,23 @@ def test_concurrent_writers_keep_each_others_secrets(isolated_data_dir, monkeypa
     monkeypatch.setattr(secrets_store, "_read_lines", slow_read)
     errors: list[BaseException] = []
 
-    def hammer(name: str, label: str) -> None:
+    def hammer_token() -> None:
         try:
             for index in range(15):
-                secrets_store.set_secret(name, f"fake-{label}-value-{index:04d}")
+                secrets_store.set_secret(GITHUB, f"fake-gh-value-{index:04d}")
+        except BaseException as error:  # noqa: BLE001 - surfaced by the assert
+            errors.append(error)
+
+    def hammer_urls() -> None:
+        try:
+            for index in range(15):
+                secrets_store.set_apprise_urls([f"json://host-{index:04d}.example"])
         except BaseException as error:  # noqa: BLE001 - surfaced by the assert
             errors.append(error)
 
     threads = [
-        threading.Thread(target=hammer, args=(GITHUB, "gh")),
-        threading.Thread(target=hammer, args=(LICENCE, "lic")),
+        threading.Thread(target=hammer_token),
+        threading.Thread(target=hammer_urls),
     ]
     for thread in threads:
         thread.start()
@@ -336,7 +340,7 @@ def test_concurrent_writers_keep_each_others_secrets(isolated_data_dir, monkeypa
 
     assert not errors
     assert secrets_store.get_secret(GITHUB) == "fake-gh-value-0014"
-    assert secrets_store.get_secret(LICENCE) == "fake-lic-value-0014"
+    assert secrets_store.read_apprise_urls()[0] == ("json://host-0014.example",)
 
 
 def test_non_ascii_preserved_line_survives_a_non_utf8_locale(isolated_data_dir):
@@ -376,3 +380,69 @@ def test_stale_temp_files_are_removed_at_the_next_write(isolated_data_dir):
 
     assert not stale.exists()
     assert other.exists()
+
+
+LEGACY_KEY = "CLOAKBROWSER_LICENSE_KEY"
+
+
+def test_discard_legacy_license_key_removes_it_from_file_and_environment(
+    isolated_data_dir, monkeypatch
+):
+    env_file(isolated_data_dir).write_text(f"{LEGACY_KEY}=fake-retired-key-0020\n")
+    monkeypatch.setenv(LEGACY_KEY, "fake-retired-key-0020")
+
+    secrets_store.discard_legacy_license_key()
+
+    assert LEGACY_KEY not in os.environ
+    assert LEGACY_KEY not in env_file(isolated_data_dir).read_text()
+
+
+def test_discard_legacy_license_key_keeps_other_lines_and_mode(isolated_data_dir):
+    path = env_file(isolated_data_dir)
+    path.write_text(
+        f"# notes\nOTHER=keep me\n{LEGACY_KEY}=fake-retired-key-0021\n"
+        "GITHUB_TOKEN=fake-file-token-0022\n"
+    )
+    path.chmod(0o644)
+
+    secrets_store.discard_legacy_license_key()
+
+    assert path.read_text() == (
+        "# notes\nOTHER=keep me\nGITHUB_TOKEN=fake-file-token-0022\n"
+    )
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_discard_legacy_license_key_leaves_the_file_alone_when_absent(
+    isolated_data_dir,
+):
+    path = env_file(isolated_data_dir)
+    path.write_text("OTHER=keep me\n")
+    path.chmod(0o644)
+    before = path.stat().st_mtime_ns
+
+    secrets_store.discard_legacy_license_key()
+
+    assert path.read_text() == "OTHER=keep me\n"
+    assert path.stat().st_mtime_ns == before
+    assert stat.S_IMODE(path.stat().st_mode) == 0o644
+
+
+def test_discard_legacy_license_key_without_a_file_creates_nothing(
+    isolated_data_dir,
+):
+    secrets_store.discard_legacy_license_key()
+
+    assert not env_file(isolated_data_dir).exists()
+
+
+def test_absorbing_the_environment_discards_the_legacy_license_key(
+    isolated_data_dir, monkeypatch
+):
+    env_file(isolated_data_dir).write_text(f"{LEGACY_KEY}=fake-retired-key-0023\n")
+    monkeypatch.setenv(LEGACY_KEY, "fake-retired-key-0023")
+
+    secrets_store.absorb_environment()
+
+    assert LEGACY_KEY not in os.environ
+    assert LEGACY_KEY not in env_file(isolated_data_dir).read_text()

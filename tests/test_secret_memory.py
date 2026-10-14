@@ -6,7 +6,6 @@ from fastapi.testclient import TestClient
 from src import config_store, main, secrets_store
 
 GITHUB = secrets_store.GITHUB_TOKEN
-LICENCE = secrets_store.CLOAKBROWSER_LICENSE_KEY
 ENV_TOKEN = "env-token-for-tests-9001"
 WORD = "workflow"  # an ordinary word that passes the secret pattern
 
@@ -107,18 +106,15 @@ def test_refused_puts_never_grow_the_memory(monkeypatch):
 
 def test_the_memory_has_a_cap_even_for_values_that_were_written():
     for number in range(300):
-        secrets_store.set_secret(LICENCE, f"rotated-value-{number:05d}")
+        secrets_store.set_secret(GITHUB, f"rotated-value-{number:05d}")
 
     assert count_known() <= secrets_store.MAX_REMEMBERED_VALUES
 
 
-def test_values_in_effect_are_never_evicted_by_a_flood_of_rotations(monkeypatch):
-    monkeypatch.setenv(GITHUB, ENV_TOKEN)
-    secrets_store.absorb_environment()
+def test_the_value_in_effect_is_never_evicted_by_a_flood_of_rotations():
     for number in range(300):
-        secrets_store.set_secret(LICENCE, f"rotated-value-{number:05d}")
+        secrets_store.set_secret(GITHUB, f"rotated-value-{number:05d}")
 
-    assert secrets_store.redact(ENV_TOKEN) == "***"
     assert secrets_store.redact("rotated-value-00299") == "***"  # the one in effect
 
 

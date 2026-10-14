@@ -43,11 +43,16 @@ class FakePage:
 
 @dataclass
 class FakeBrowser:
-    """Stand-in for a cloakbrowser browser."""
+    """Stand-in for the Playwright browser attached to the ShardX engine."""
 
     page: FakePage = field(default_factory=FakePage)
     close_error: PlaywrightError | None = None
     close_calls: int = 0
+
+    @property
+    def contexts(self) -> list["FakeBrowser"]:
+        """Play the default context too; it only has to hand out the page."""
+        return [self]
 
     def new_page(self) -> FakePage:
         """Return this browser's only page."""
@@ -79,12 +84,68 @@ class FakeScraper:
         self.search_calls.append(package_name)
 
 
+@dataclass
+class FakeEngine:
+    """Stand-in for a running ShardX engine process."""
+
+    cdp_url: str | None = "http://127.0.0.1:9222"
+    stop_calls: int = 0
+
+    @property
+    def process(self) -> "FakeEngine":
+        """Expose poll() the way the engine's subprocess does."""
+        return self
+
+    def poll(self) -> None:
+        """Report the engine as still running."""
+
+    def stop(self) -> None:
+        """Count the call."""
+        self.stop_calls += 1
+
+
 @pytest.fixture
-def browsers(monkeypatch: pytest.MonkeyPatch) -> list[FakeBrowser]:
-    """Two fake browsers that the patched launch() hands out in order."""
+def launches(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
+    """Replace ShardX and Playwright; each launch() call's keywords are recorded."""
+    recorded: list[dict] = []
+    engines = iter([FakeEngine(), FakeEngine()])
+
+    class FakeShardX:
+        def __init__(self, profiles_dir: str) -> None:
+            self.runtime = type("Runtime", (), {"installed": True})()
+
+        def create_profile(self, platform: str) -> str:
+            return f"profile-{platform}"
+
+        def launch(self, profile: str, **kwargs) -> FakeEngine:
+            recorded.append({"profile": profile, **kwargs})
+            return next(engines)
+
+    monkeypatch.setattr(apkmirror_downloader, "ShardX", FakeShardX)
+    return recorded
+
+
+@pytest.fixture
+def browsers(
+    monkeypatch: pytest.MonkeyPatch, launches: list[dict]
+) -> list[FakeBrowser]:
+    """Two fake browsers that Playwright hands out, in order, over CDP."""
     queue = [FakeBrowser(), FakeBrowser()]
     remaining = iter(queue)
-    monkeypatch.setattr(apkmirror_downloader, "launch", lambda: next(remaining))
+    playwright = type(
+        "Playwright",
+        (),
+        {
+            "chromium": type(
+                "Chromium",
+                (),
+                {"connect_over_cdp": staticmethod(lambda url: next(remaining))},
+            )(),
+            "stop": lambda self: None,
+        },
+    )()
+    starter = type("Starter", (), {"start": lambda self: playwright})()
+    monkeypatch.setattr(apkmirror_downloader, "sync_playwright", lambda: starter)
     return queue
 
 
@@ -128,6 +189,35 @@ def test_goto_relaunches_and_retries_on_dead_browser(
     assert downloader.browser is second
     assert downloader.page is second.page
     assert second.page.visited == [SEARCH_URL]
+
+
+def test_launch_runs_headless_over_cdp_with_a_sandbox_when_not_root(
+    browsers: list[FakeBrowser],
+    launches: list[dict],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The engine is headless with CDP; --no-sandbox is for root only."""
+    monkeypatch.setattr(apkmirror_downloader.os, "geteuid", lambda: 1000)
+
+    downloader = ApkMirror_Downloader()
+
+    assert launches[0]["headless"] is True
+    assert launches[0]["cdp"] is True
+    assert "--no-sandbox" not in launches[0]["extra_args"]
+    assert downloader.page is browsers[0].page
+
+
+def test_launch_adds_no_sandbox_as_root(
+    browsers: list[FakeBrowser],
+    launches: list[dict],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Chromium cannot sandbox as root, so the container launch disables it."""
+    monkeypatch.setattr(apkmirror_downloader.os, "geteuid", lambda: 0)
+
+    ApkMirror_Downloader()
+
+    assert "--no-sandbox" in launches[0]["extra_args"]
 
 
 def test_goto_reraises_unrelated_error_without_relaunch(

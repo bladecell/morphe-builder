@@ -372,7 +372,7 @@ def log_for(client: TestClient, monkeypatch, path: str) -> str:
     "template", ["/download/{}", "/view/{}", "/api/apps/{}", "/download/{}.apk"]
 )
 def test_request_input_is_not_written_to_the_build_log(client, monkeypatch, template):
-    secrets_store.set_secret(secrets_store.CLOAKBROWSER_LICENSE_KEY, SECRET)
+    secrets_store.set_secret(secrets_store.GITHUB_TOKEN, SECRET)
 
     with_secret = log_for(client, monkeypatch, template.format(SECRET))
     with_random = log_for(

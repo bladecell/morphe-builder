@@ -13,7 +13,7 @@ import pytest
 from src import patcher, secrets_store
 
 TOKEN = "fake-token-for-tests-0201"
-KEY = "fake-licence-for-tests-0202"
+KEY = "json://fake-urls-for-tests-0202"
 KEPT = {
     "PATH": "/usr/bin:/bin",
     "JAVA_HOME": "/opt/fake-java",
@@ -29,18 +29,18 @@ PRINT_ENV = "import json, os; print(json.dumps(dict(os.environ)))"
 
 @pytest.fixture
 def full_environment(monkeypatch):
-    """A process environment holding both secrets and the usual variables."""
+    """A process environment holding the secrets and the usual variables."""
     monkeypatch.setenv(secrets_store.GITHUB_TOKEN, TOKEN)
-    monkeypatch.setenv(secrets_store.CLOAKBROWSER_LICENSE_KEY, KEY)
+    monkeypatch.setenv(secrets_store.APPRISE_URLS, KEY)
     for name, value in KEPT.items():
         monkeypatch.setenv(name, value)
 
 
-def test_child_environment_drops_both_secrets_and_keeps_the_rest(full_environment):
+def test_child_environment_drops_the_secrets_and_keeps_the_rest(full_environment):
     env = secrets_store.child_environment()
 
     assert secrets_store.GITHUB_TOKEN not in env
-    assert secrets_store.CLOAKBROWSER_LICENSE_KEY not in env
+    assert secrets_store.APPRISE_URLS not in env
     assert {name: env[name] for name in KEPT} == KEPT
 
 
@@ -65,7 +65,7 @@ def test_run_child_gives_a_real_process_no_secrets(full_environment):
 
     seen = json.loads(result.stdout)
     assert secrets_store.GITHUB_TOKEN not in seen
-    assert secrets_store.CLOAKBROWSER_LICENSE_KEY not in seen
+    assert secrets_store.APPRISE_URLS not in seen
     assert TOKEN not in result.stdout and KEY not in result.stdout
     assert {name: seen[name] for name in KEPT} == KEPT
 
@@ -131,7 +131,7 @@ def assert_filtered(seen: list[dict[str, str] | None]) -> None:
     for env in seen:
         assert env is not None
         assert secrets_store.GITHUB_TOKEN not in env
-        assert secrets_store.CLOAKBROWSER_LICENSE_KEY not in env
+        assert secrets_store.APPRISE_URLS not in env
         assert env["PATH"] == KEPT["PATH"]
 
 
@@ -242,7 +242,9 @@ def test_no_source_file_starts_a_process_except_through_the_helpers():
     ]
 
     # The two helpers in patcher.py are the only allowed direct calls.
-    expected = [f"patcher.py:{line} subprocess.{name}" for line, name in _helper_lines()]
+    expected = [
+        f"patcher.py:{line} subprocess.{name}" for line, name in _helper_lines()
+    ]
     assert sorted(found) == sorted(expected)
 
 

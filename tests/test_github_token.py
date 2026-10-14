@@ -751,8 +751,8 @@ def test_a_remembered_word_does_not_remove_a_scope_from_the_warning(
     transport, monkeypatch, tmp_path, data_dir
 ):
     monkeypatch.setenv(secrets_store.GITHUB_TOKEN, TOKEN)
-    monkeypatch.setenv(secrets_store.CLOAKBROWSER_LICENSE_KEY, "workflow")
-    secrets_store.redact("")  # the licence key is now remembered for masking
+    secrets_store.set_apprise_urls(["json://workflow"])
+    secrets_store.redact("")  # the URL is now remembered for masking
     lookup_with_scopes(transport, "repo, workflow", tmp_path)
 
     warning = patcher.github_token_warning()
@@ -761,9 +761,7 @@ def test_a_remembered_word_does_not_remove_a_scope_from_the_warning(
     assert "workflow" in status_body()["github_token_warning"]
 
 
-def test_scope_header_is_bounded_and_limited_to_plain_names(
-    transport, token, tmp_path
-):
+def test_scope_header_is_bounded_and_limited_to_plain_names(transport, token, tmp_path):
     many = ", ".join(f"scope{n}" for n in range(60))
     lookup_with_scopes(transport, f"repo, UPPER, a b, {'z' * 40}, {many}", tmp_path)
 
@@ -942,9 +940,7 @@ def test_permissions_is_present_for_a_classic_token_with_scopes(
     assert patcher.github_token_permissions() == "present"
 
 
-def test_permissions_is_unverifiable_without_a_scope_header(
-    transport, token, tmp_path
-):
+def test_permissions_is_unverifiable_without_a_scope_header(transport, token, tmp_path):
     lookup_with_scopes(transport, None, tmp_path)
 
     assert patcher.github_token_permissions() == "unverifiable"

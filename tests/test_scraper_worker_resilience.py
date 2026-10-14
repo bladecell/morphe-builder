@@ -124,7 +124,7 @@ def test_second_failure_starts_a_new_cooldown():
 def test_launch_error_text_is_redacted_and_logged_not_printed(
     monkeypatch, caplog, capsys
 ):
-    monkeypatch.setenv("CLOAKBROWSER_LICENSE_KEY", SECRET)
+    monkeypatch.setenv("GITHUB_TOKEN", SECRET)
     launcher = FakeLauncher(failures=99, message=f"bad key {SECRET}")
 
     with caplog.at_level("ERROR", logger=main.logger.name):
@@ -211,7 +211,7 @@ def test_updates_with_scraper_down_still_serves_cached_versions(
 def test_updates_with_a_failing_lookup_degrades_and_redacts(
     updates_env, monkeypatch, caplog
 ):
-    monkeypatch.setenv("CLOAKBROWSER_LICENSE_KEY", SECRET)
+    monkeypatch.setenv("GITHUB_TOKEN", SECRET)
     monkeypatch.setattr(main, "SCRAPER_WORKER", BrokenLookupWorker())
 
     results = main.check_updates()
@@ -250,7 +250,6 @@ def test_tools_status_reports_available_browser(monkeypatch):
         "error": None,
         "retry_in": None,
         "busy_since": None,
-        "license_key_rejected": False,
     }
 
 
@@ -508,7 +507,7 @@ def _start(
 def test_build_with_browser_down_sets_a_redacted_failure_and_logs_it(
     monkeypatch, caplog
 ):
-    monkeypatch.setenv("CLOAKBROWSER_LICENSE_KEY", SECRET)
+    monkeypatch.setenv("GITHUB_TOKEN", SECRET)
 
     class SecretDown:
         def execute(self, func, *args, **kwargs):
@@ -586,7 +585,7 @@ def test_get_supported_versions_raises_lookup_errors_only_when_asked(updates_env
 def test_updates_shows_a_lookup_failure_and_keeps_cached_versions(
     updates_env, monkeypatch
 ):
-    monkeypatch.setenv("CLOAKBROWSER_LICENSE_KEY", SECRET)
+    monkeypatch.setenv("GITHUB_TOKEN", SECRET)
     monkeypatch.setattr(main, "SCRAPER_WORKER", ScraperInlineWorker(FailingScraper()))
     patcher.save_version_cache(
         {"com.a": {"versions": ["9.9"], "timestamp": time.time() - 99999}}
@@ -614,7 +613,6 @@ def test_error_is_cleared_after_a_successful_relaunch():
         "error": None,
         "retry_in": None,
         "busy_since": None,
-        "license_key_rejected": False,
     }
     worker.shutdown()
 

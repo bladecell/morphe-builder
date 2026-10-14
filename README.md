@@ -116,14 +116,13 @@ docker run -d \
   -p 8000:8000 \
   -v "$(pwd)/data:/data" \
   -e GITHUB_TOKEN \
-  -e CLOAKBROWSER_LICENSE_KEY \
   -e APPRISE_URLS \
   -e ALLOWED_HOSTS='builder.example.net,https://builder.example.net' \
   --name morphe-builder \
   bladecell/morphe-builder:latest
 ```
 
-Omit any of `GITHUB_TOKEN`, `CLOAKBROWSER_LICENSE_KEY`, or `APPRISE_URLS` when
+Omit either of `GITHUB_TOKEN` or `APPRISE_URLS` when
 not configured. `APPRISE_URLS`, when supplied, must be a JSON array of strings.
 Use a deployment secret manager or a protected host environment to supply
 values; do not put real values in shell history, compose files committed to a
@@ -131,17 +130,14 @@ repository, or this documentation.
 
 ### Secrets
 
-`GITHUB_TOKEN`, `CLOAKBROWSER_LICENSE_KEY`, and notification URLs are
-write-only secret-store entries. The Settings Secrets card exposes the token
-and licence key; notification URL management is available through
+`GITHUB_TOKEN` and notification URLs are
+write-only secret-store entries. The Settings Secrets card exposes the token;
+notification URL management is available through
 `PUT`/`DELETE /api/ui/secrets/apprise-urls`, with an explicit legacy import at
 `POST /api/ui/secrets/apprise-urls/migration`. Status endpoints report count,
 source and migration state, never URL values; other secret statuses report
-whether a value is set and its source, never the value. Changing the
-cloakbrowser key does not start browser work; the worker reads it before its
-next scraper task. A rejected-key indicator reports the last browser result,
-not a validation of the currently saved value. Only GitHub-token changes can
-schedule a source sync.
+whether a value is set and its source, never the value. Only GitHub-token
+changes can schedule a source sync.
 
 Without an environment value, the app stores secrets in `DATA_DIR/.env`
 (`./.env` for a local install, `/data/.env` in Docker). It writes this file
@@ -161,15 +157,22 @@ to permissions held by the token. GitHub's scope header can report permissions
 for classic tokens; fine-grained and GitHub App token permissions are not
 verifiable by this status check.
 
-Cloakbrowser receives a configured licence key explicitly at browser launch.
-The app isolates its cache at `DATA_DIR/bin/cloakbrowser` so a key cached in the
-operator's default `~/.cloakbrowser` is not selected implicitly. If the
-app-owned cache contains `license.key`, startup refuses to use it; the app does
-not delete the file. Point the operator to back up/remove it deliberately before
-restarting. The isolated cache may need to download a browser binary again.
-Only an invalid-key code-77 denial falls back to keyless mode. A later code-77
-denial fails the current task; subsequent tasks use keyless mode until the
-configured key changes. Other licence failures do not trigger keyless fallback.
+### Browser and APK sources
+
+APKMirror is scraped with [ShardX](https://github.com/ProxyShard/ShardBrowser)
+(`shardx==2.0.3`, MIT), a patched Chromium. No licence key is needed. The app
+launches the engine headless, attaches Playwright over CDP, and uses a throwaway
+profile per launch (`--no-sandbox` when running as root). The engine (about
+170 MB) is downloaded from a ProxyShard CDN, unsigned, at Docker build time
+only; see the Dockerfile. It replaced cloakbrowser because that browser could
+not pass APKMirror's Cloudflare challenge in Docker.
+
+An old `CLOAKBROWSER_LICENSE_KEY` is removed from `.env` and the environment at
+startup, and the retired `DATA_DIR/bin/cloakbrowser` cache is deleted.
+
+The app first asks the Morphe API to resolve the APKMirror variant page for an
+exact version. If APKMirror cannot be downloaded from, it falls back to APKPure
+through `apkeep` (pinned by SHA-256 in the Dockerfile).
 
 ### Host and reverse-proxy checks
 

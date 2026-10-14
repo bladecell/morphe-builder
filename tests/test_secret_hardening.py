@@ -17,10 +17,8 @@ from uvicorn.logging import AccessFormatter, DefaultFormatter
 from src import config_store, main, patcher, secrets_store
 
 GITHUB = secrets_store.GITHUB_TOKEN
-LICENCE = secrets_store.CLOAKBROWSER_LICENSE_KEY
 TOKEN = "fake-token-for-tests-0301"
 OLD_TOKEN = "fake-old-token-for-tests-0302"
-KEY = "fake-licence-for-tests-0303"
 FILE_TOKEN = "fake-file-token-for-tests-0304"
 
 
@@ -311,16 +309,14 @@ def test_a_basic_auth_base64_form_is_masked(monkeypatch):
 # --- D1: the secrets leave the process environment at startup ------------------
 
 
-def test_absorbing_removes_both_variables_and_keeps_them_available(monkeypatch):
+def test_absorbing_removes_the_variable_and_keeps_it_available(monkeypatch):
     monkeypatch.setenv(GITHUB, TOKEN)
-    monkeypatch.setenv(LICENCE, KEY)
 
     secrets_store.absorb_environment()
 
-    assert GITHUB not in os.environ and LICENCE not in os.environ
+    assert GITHUB not in os.environ
     assert secrets_store.get_secret(GITHUB) == TOKEN
-    assert secrets_store.get_secret(LICENCE) == KEY
-    assert secrets_store.get_status() == {GITHUB: "environment", LICENCE: "environment"}
+    assert secrets_store.get_status() == {GITHUB: "environment"}
 
 
 def test_absorbed_values_are_still_locked_and_masked(monkeypatch, isolated_data_dir):
@@ -363,7 +359,6 @@ def test_absorbing_twice_keeps_the_values(monkeypatch):
 
 def test_nothing_started_after_absorbing_inherits_the_secrets(monkeypatch):
     monkeypatch.setenv(GITHUB, TOKEN)
-    monkeypatch.setenv(LICENCE, KEY)
     secrets_store.absorb_environment()
 
     result = subprocess.run(  # a plain subprocess call: it inherits os.environ
@@ -373,17 +368,16 @@ def test_nothing_started_after_absorbing_inherits_the_secrets(monkeypatch):
         check=True,
     )
 
-    assert GITHUB not in result.stdout and LICENCE not in result.stdout
+    assert GITHUB not in result.stdout
 
 
 def test_app_startup_absorbs_before_anything_is_started(data_dir, monkeypatch):
     monkeypatch.setenv(GITHUB, TOKEN)
-    monkeypatch.setenv(LICENCE, KEY)
     seen: list[bool] = []
 
     class FakeWorker:
         def start(self):
-            seen.append(GITHUB in os.environ or LICENCE in os.environ)
+            seen.append(GITHUB in os.environ)
 
         def shutdown(self):
             pass
@@ -404,7 +398,7 @@ def test_app_startup_absorbs_before_anything_is_started(data_dir, monkeypatch):
             pass
 
     def deps(config):
-        seen.append(GITHUB in os.environ or LICENCE in os.environ)
+        seen.append(GITHUB in os.environ)
         return {}
 
     monkeypatch.setattr(main, "SCRAPER_WORKER", FakeWorker())
@@ -415,10 +409,9 @@ def test_app_startup_absorbs_before_anything_is_started(data_dir, monkeypatch):
 
     with TestClient(main.app):
         assert secrets_store.get_secret(GITHUB) == TOKEN
-        assert secrets_store.get_secret(LICENCE) == KEY
 
     assert seen == [False, False, False]
-    assert GITHUB not in os.environ and LICENCE not in os.environ
+    assert GITHUB not in os.environ
 
 
 # --- also fix: an invalid file entry warns once ---------------------------------

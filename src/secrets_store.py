@@ -1,11 +1,11 @@
 """Secrets kept in DATA_DIR/.env or the environment, never in the config.
 
-`GITHUB_TOKEN`, `CLOAKBROWSER_LICENSE_KEY`, and `APPRISE_URLS` are recognised.
+`GITHUB_TOKEN` and `APPRISE_URLS` are recognised.
 Environment values win over the file; invalid environment values are never
 returned and do not fall back to the file. Other lines and comments in the file
 are kept verbatim when it is rewritten but never loaded.
 
-At startup `absorb_environment` moves all three variables out of `os.environ` into
+At startup `absorb_environment` moves both variables out of `os.environ` into
 memory, so nothing the app starts afterwards (a subprocess, the browser, library
 code) inherits them. The store keeps reporting them as coming from the
 environment and keeps validating and locking them. Nothing here ever writes a
@@ -43,9 +43,9 @@ from src import config_store
 logger = logging.getLogger(__name__)
 
 GITHUB_TOKEN = "GITHUB_TOKEN"
-CLOAKBROWSER_LICENSE_KEY = "CLOAKBROWSER_LICENSE_KEY"
+_LEGACY_LICENSE_KEY = "CLOAKBROWSER_LICENSE_KEY"
 APPRISE_URLS = "APPRISE_URLS"
-SECRET_NAMES = (GITHUB_TOKEN, CLOAKBROWSER_LICENSE_KEY)
+SECRET_NAMES = (GITHUB_TOKEN,)
 MAX_APPRISE_URL_COUNT = 16
 MAX_APPRISE_URL_BYTES = 2048
 MAX_APPRISE_URLS_BYTES = 32768
@@ -62,7 +62,7 @@ def contains_line_separator(text: str) -> bool:
 
 Source = Literal["environment", "environment_invalid", "file"]
 
-# Tokens and licence keys only: no shell syntax, quotes, whitespace or control
+# Tokens only: no shell syntax, quotes, whitespace or control
 # characters (splitlines also splits on \x0b, \x0c, \x1c-\x1e, \x85, U+2028).
 # fullmatch rejects a trailing newline too.
 _VALUE_PATTERN = re.compile(r"[A-Za-z0-9._+/=:@-]{8,512}")
@@ -204,7 +204,7 @@ def _valid_env_value(name: str) -> str | None:
 
 
 def _check_name(name: str) -> None:
-    """Raise KeyError unless `name` is one of the two recognised secrets."""
+    """Raise KeyError unless `name` is a recognised secret."""
     if name not in SECRET_NAMES:
         raise KeyError(name)
 
@@ -379,7 +379,7 @@ def get_secret(name: str) -> str | None:
     """Return the current value of a secret, the environment first.
 
     Args:
-        name: `GITHUB_TOKEN` or `CLOAKBROWSER_LICENSE_KEY`.
+        name: `GITHUB_TOKEN`.
 
     Returns:
         The value, or None when it is set nowhere. A set but invalid
@@ -400,7 +400,7 @@ def secret_source(name: str) -> Source | None:
     """Report where a secret's value comes from.
 
     Args:
-        name: `GITHUB_TOKEN` or `CLOAKBROWSER_LICENSE_KEY`.
+        name: `GITHUB_TOKEN`.
 
     Returns:
         "environment", "environment_invalid" (the variable is set but its value
@@ -485,7 +485,7 @@ def set_secret(name: str, value: str) -> None:
     """Store a secret in the .env file, replacing any earlier assignment.
 
     Args:
-        name: `GITHUB_TOKEN` or `CLOAKBROWSER_LICENSE_KEY`.
+        name: `GITHUB_TOKEN`.
         value: The secret; see `validate_secret`.
 
     Raises:
@@ -514,7 +514,7 @@ def clear_secret(name: str) -> None:
     """Remove a secret from the .env file.
 
     Args:
-        name: `GITHUB_TOKEN` or `CLOAKBROWSER_LICENSE_KEY`.
+        name: `GITHUB_TOKEN`.
 
     Raises:
         KeyError: `name` is not a recognised secret.
@@ -532,11 +532,8 @@ def absorb_environment() -> None:
     The store still reports them as coming from the environment, validates them
     and refuses to change them; an invalid or blank variable is removed too.
     The file values are read once so they are masked from the start.
-
-    NOTE: cloakbrowser reads `CLOAKBROWSER_LICENSE_KEY` from `os.environ` by
-    itself when it launches the browser. After this call an environment key no
-    longer reaches the browser, until the launch passes it explicitly.
     """
+    discard_legacy_license_key()
     for name in SECRET_NAMES:
         value = os.environ.pop(name, None)
         if value is not None and value.strip():
@@ -550,6 +547,31 @@ def absorb_environment() -> None:
             _file_value(name)
         except OSError:
             logger.error("Could not read the secrets file at startup")
+
+
+def discard_legacy_license_key() -> None:
+    """Remove the retired CLOAKBROWSER_LICENSE_KEY from the environment and .env.
+
+    The browser it unlocked is gone, so a key left in the file would only sit
+    there readable. Every other line of the file is kept as it was.
+    """
+    os.environ.pop(_LEGACY_LICENSE_KEY, None)
+    try:
+        with _FILE_LOCK:
+            lines = _read_lines()
+            kept = [
+                line
+                for line in lines
+                if (match := _LINE_PATTERN.fullmatch(line)) is None
+                or match.group(1) != _LEGACY_LICENSE_KEY
+            ]
+            if len(kept) != len(lines):
+                config_store.write_file_atomic(
+                    _env_path(), "".join(f"{line}\n" for line in kept), mode=0o600
+                )
+                logger.info("Removed the retired CLOAKBROWSER_LICENSE_KEY from .env")
+    except OSError:
+        logger.error("Could not remove the retired licence key from the .env file")
 
 
 def redact(text: str) -> str:

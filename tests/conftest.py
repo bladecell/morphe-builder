@@ -77,13 +77,9 @@ def isolated_data_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("ALLOWED_HOSTS", "testserver")
     for secret_name in (
         "GITHUB_TOKEN",
-        "CLOAKBROWSER_LICENSE_KEY",
         "APPRISE_URLS",
     ):
         monkeypatch.delenv(secret_name, raising=False)
-    cache_dir = tmp_path.with_name(f"{tmp_path.name}-cloakbrowser-cache")
-    monkeypatch.setenv("CLOAKBROWSER_CACHE_DIR", str(cache_dir))
-    apkmirror_downloader.configure_cloakbrowser_cache(cache_dir)
     return tmp_path
 
 
@@ -119,7 +115,7 @@ def no_real_browser_or_network(monkeypatch):
         attempts.append(f"socket connect_ex {address!r}")
         raise OSError("tests must not open network connections")
 
-    monkeypatch.setattr(apkmirror_downloader, "launch", blocked_launch)
+    monkeypatch.setattr(apkmirror_downloader, "ShardX", blocked_launch)
     monkeypatch.setattr(socket.socket, "connect", blocked_connect)
     monkeypatch.setattr(socket.socket, "connect_ex", blocked_connect_ex)
     yield attempts

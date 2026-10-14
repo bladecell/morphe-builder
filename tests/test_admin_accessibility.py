@@ -82,7 +82,6 @@ class LocalHandler(BaseHTTPRequestHandler):
             },
             "/api/ui/secrets": {
                 "github-token": {"set": False, "source": None},
-                "cloakbrowser-license-key": {"set": False, "source": None},
                 "apprise-urls": {
                     "set": False,
                     "count": 0,
@@ -703,7 +702,6 @@ def test_notification_body_error_is_inline_even_on_success_http_status(
             body=json.dumps(
                 {
                     "github-token": {"set": False, "source": None},
-                    "cloakbrowser-license-key": {"set": False, "source": None},
                     "apprise-urls": {
                         "set": True,
                         "count": 1,
@@ -733,7 +731,6 @@ def test_notification_body_error_is_inline_even_on_success_http_status(
 def test_apprise_destination_is_masked_write_only_and_responsive(local_page: Page):
     stored_status = {
         "github-token": {"set": False, "source": None},
-        "cloakbrowser-license-key": {"set": False, "source": None},
         "apprise-urls": {
             "set": True,
             "count": 1,

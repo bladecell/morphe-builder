@@ -2,13 +2,21 @@
 
 Current working checklist. The full list lives in `plan.md`.
 
+## State 2026-10-14: ShardX switch
+
+- [x] cloakbrowser replaced by ShardX 2.0.3 (headless, CDP); licence key, Settings
+      field and fallback removed; legacy key and cache cleaned at startup. See
+      `decisions.md` (2026-10-14). The cloakbrowser items below are historical.
+- [ ] Verify the ShardX engine download in the Dockerfile (unsigned CDN, ~170 MB);
+      see the Dockerfile for what is checked.
+
 ## State 2026-10-14: commit checkpoint
 
 - [x] Full suite: 1709 passed, 1 skipped, 1 xfailed. Updated the stale header-badge
       assertion to match the requested removal; no runtime change was needed.
 - [x] Commit preflight found no confirmed introduced secrets or runtime artifacts;
       diff whitespace checks passed.
-- Docker/Facebook verification remains unresolved: latest CloakBrowser 0.6.2 and
+- Docker/Facebook verification remains unresolved (historical, pre-ShardX): latest CloakBrowser 0.6.2 and
   0.3.31 both selected the same Chromium binary; Facebook results loaded on the
   host but remained on verification in Docker. Experimental dependencies/images
   did not change the production Dockerfile or project lockfile.

@@ -2,22 +2,20 @@ import json
 import logging
 import os
 import re
+import shutil
+import tempfile
+import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode, urljoin, urlunparse
+from urllib.parse import quote, urlencode, urljoin, urlparse, urlunparse
 
-from cloakbrowser import (  # type: ignore[import-untyped]
-    CloakBrowserLicenseError,
-    launch,
-)
-from cloakbrowser.license import (  # type: ignore[import-untyped]
-    license_error_for_code,
-)
 from playwright.sync_api import Error as PlaywrightError
+from playwright.sync_api import Playwright, sync_playwright
 from selectolax.parser import HTMLParser, Node
+from shardx import BrowserSession, ShardX  # type: ignore[import-untyped]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,55 +40,7 @@ _stdout_handler.setFormatter(
 )
 logger.addHandler(_stdout_handler)
 logger.propagate = False
-_CLOAKBROWSER_CACHE_DIR: Path | None = None
-
-
-def is_invalid_license_error(error: BaseException) -> bool:
-    """Identify cloakbrowser's specific invalid-key denial (exit code 77)."""
-    if not isinstance(error, CloakBrowserLicenseError):
-        return False
-    invalid_key_error = license_error_for_code(77)
-    return invalid_key_error is not None and str(error) == str(invalid_key_error)
-
-
-def configure_cloakbrowser_cache(cache_dir: Path) -> None:
-    """Configure cloakbrowser to use an app-owned cache with no stored key.
-
-    The supported cache-dir environment setting is configured once before any
-    browser launch. Existing `license.key` files are rejected by existence
-    check only; their contents are never read.
-
-    Raises:
-        OSError: The app-owned cache directory could not be prepared.
-        RuntimeError: The cache already contains a cloakbrowser key file.
-    """
-    global _CLOAKBROWSER_CACHE_DIR
-    cache_dir = cache_dir.resolve()
-    cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if os.path.lexists(cache_dir / "license.key"):
-        raise RuntimeError("Cloakbrowser cache contains an unmanaged licence key")
-    cache_dir.chmod(0o700)
-    os.environ["CLOAKBROWSER_CACHE_DIR"] = str(cache_dir)
-    _CLOAKBROWSER_CACHE_DIR = cache_dir
-
-
-def _require_isolated_cloakbrowser_cache(keyless: bool) -> None:
-    """Fail closed if cache configuration changes or a cached key appears."""
-    cache_dir = _CLOAKBROWSER_CACHE_DIR
-    if cache_dir is None or os.environ.get("CLOAKBROWSER_CACHE_DIR") != str(cache_dir):
-        raise RuntimeError("Cloakbrowser isolated cache is not configured")
-    if os.path.lexists(cache_dir / "license.key"):
-        raise RuntimeError("Cloakbrowser cache contains an unmanaged licence key")
-    if keyless and os.environ.get("CLOAKBROWSER_LICENSE_KEY", "").strip():
-        raise RuntimeError(
-            "Cloakbrowser keyless launch refused while an environment key exists"
-        )
-
-
-class LicenseFallbackError(RuntimeError):
-    """Keyless launch failed after cloakbrowser rejected the configured key."""
-
-    license_key_rejected = True
+SHARDX_ARGS = ("--disable-dev-shm-usage",)
 
 
 class Arch(str, Enum):
@@ -204,6 +154,17 @@ def _android_minimum_api(row_text: str) -> int:
     return api_level
 
 
+_PAGE_MINIMUM_API = re.compile(r"Min:\s*Android[^()]*\(API\s*(\d+)\)", re.IGNORECASE)
+
+
+def _page_minimum_api(parser: HTMLParser) -> int | None:
+    """Read the "Min: Android 11 (API 30)" spec of a variant page, if present."""
+    for node in parser.css(".appspec-value"):
+        if match := _PAGE_MINIMUM_API.search(node.text(strip=True)):
+            return int(match.group(1))
+    return None
+
+
 @dataclass
 class AppMetadata:
     title: str
@@ -217,57 +178,130 @@ class AppMetadata:
         return json.dumps(asdict(self), indent=4)
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Stop urllib from following redirects so the Location can be inspected."""
+
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+        """Decline every redirect."""
+        return None  # noqa: RET501 - urllib expects None to decline
+
+
+MORPHE_RESOLVER_URL = "https://api.morphe.software"
+
+
+def resolve_variant_url(
+    package_name: str, version: str, arch: str, timeout: float = 20
+) -> str | None:
+    """Ask the Morphe API which APKMirror variant page matches an exact version.
+
+    The API answers with a redirect to the variant page, or to its own fallback
+    route, which is followed for at most two hops.
+
+    Args:
+        package_name: Android package id.
+        version: Exact app version.
+        arch: ABI such as "arm64-v8a" or "universal".
+        timeout: Seconds to wait per request.
+
+    Returns:
+        An https www.apkmirror.com URL, or None when the API has no match, is
+        unreachable, or redirects anywhere else.
+    """
+    opener = urllib.request.build_opener(_NoRedirect)
+    url = (
+        f"{MORPHE_RESOLVER_URL}/v2/web-search/"
+        f"{quote(package_name, safe='')}~{quote(version, safe='')}~{quote(arch, safe='')}"
+    )
+    for _ in range(3):
+        try:
+            opener.open(
+                urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"}),
+                timeout=timeout,
+            )
+        except urllib.error.HTTPError as error:
+            location = error.headers.get("Location")
+            if error.code not in (301, 302, 303, 307, 308) or not location:
+                logger.warning(f"Morphe resolver returned HTTP {error.code}")
+                return None
+            url = urljoin(url, location)
+        except (urllib.error.URLError, TimeoutError) as error:
+            logger.warning(f"Morphe resolver unreachable: {error}")
+            return None
+        else:
+            return None
+        parsed = urlparse(url)
+        if parsed.scheme == "https" and parsed.netloc == "www.apkmirror.com":
+            return url
+        if parsed.netloc != urlparse(MORPHE_RESOLVER_URL).netloc:
+            logger.warning("Morphe resolver redirected to an unexpected host")
+            return None
+    return None
+
+
 class ApkMirror_Downloader:
     BASE_URL = "https://www.apkmirror.com"
     BASE_NETLOC = "www.apkmirror.com"
 
-    def __init__(self, license_key: str | None = None) -> None:
-        """Launch the browser session used for all navigation.
-
-        Args:
-            license_key: Effective cloakbrowser key, or None for keyless launch.
-        """
-        self._license_key = license_key
-        self.license_key_rejected = False
+    def __init__(self) -> None:
+        """Launch the browser session used for all navigation."""
         self._launch()
 
     def _launch(self) -> None:
-        """Start a fresh browser and open the page used for navigation."""
-        logger.info("Initializing cloakbrowser context session...")
-        _require_isolated_cloakbrowser_cache(self._license_key is None)
-        try:
-            self.browser, self.page = self._launch_browser(self._license_key)
-        except CloakBrowserLicenseError as error:
-            if self._license_key is None or not is_invalid_license_error(error):
-                raise
-            self.license_key_rejected = True
-            self._license_key = None
-            logger.warning(
-                "Cloakbrowser licence key rejected; launching keyless instead"
-            )
-            try:
-                self.browser, self.page = self._launch_browser(None)
-            except Exception:  # noqa: BLE001 - fallback error must not echo key data
-                raise LicenseFallbackError(
-                    "Cloakbrowser rejected the licence key and keyless launch failed"
-                ) from None
+        """Start a fresh ShardX engine and attach Playwright to it over CDP.
 
-    @staticmethod
-    def _launch_browser(license_key: str | None) -> tuple[Any, Any]:
-        """Launch cloakbrowser and create its first page, closing on failure."""
-        if license_key is None:
-            browser = launch()
-        else:
-            browser = launch(license_key=license_key)
+        The engine is headless: ShardX passes APKMirror's Cloudflare challenge
+        that way, and headed under Xvfb it does not. Each launch gets a new
+        throwaway profile.
+
+        Raises:
+            RuntimeError: The engine did not expose its debugging endpoint.
+        """
+        logger.info("Initializing ShardX browser session...")
+        self._profiles_dir = Path(tempfile.mkdtemp(prefix="shardx-profiles-"))
+        self._engine: BrowserSession | None = None
+        self._playwright: Playwright | None = None
         try:
-            page = browser.new_page()
+            sdk = ShardX(profiles_dir=str(self._profiles_dir))
+            # The engine is fetched at image build time; do not let a changed
+            # upstream manifest trigger a download while the app runs.
+            sdk.runtime._checked_in_process = sdk.runtime.installed
+            profile = sdk.create_profile(platform="Windows")
+            # Chromium refuses its sandbox as root, which is how the container runs.
+            extra_args = [
+                *SHARDX_ARGS,
+                *(["--no-sandbox"] if os.geteuid() == 0 else []),
+            ]
+            self._engine = sdk.launch(
+                profile,
+                cdp=True,
+                headless=True,
+                extra_args=extra_args,
+            )
+            if not self._engine.cdp_url:
+                raise RuntimeError("ShardX engine did not expose a CDP endpoint")
+            self._playwright = sync_playwright().start()
+            self.browser = self._playwright.chromium.connect_over_cdp(
+                self._engine.cdp_url
+            )
+            self.page = self.browser.contexts[0].new_page()
         except Exception:
-            try:
-                browser.close()
-            except Exception:  # noqa: BLE001 - preserve the initialization error
-                logger.warning("Browser close failed after page initialization error")
+            self._teardown()
             raise
-        return browser, page
+
+    def _teardown(self) -> None:
+        """Stop Playwright, the engine process and the profile; log failures."""
+        steps = (
+            ("browser", lambda: self.browser.close()),
+            ("playwright", lambda: self._playwright.stop()),
+            ("engine", lambda: self._engine.stop()),
+        )
+        for name, step in steps:
+            try:
+                step()
+            except (AttributeError, PlaywrightError, OSError) as error:
+                logger.debug(f"Closing the {name} failed: {error}")
+        self.browser = None
+        shutil.rmtree(self._profiles_dir, ignore_errors=True)
 
     def _goto(self, url: str) -> None:
         """Navigate to url, relaunching the browser once if it has died."""
@@ -276,24 +310,18 @@ class ApkMirror_Downloader:
         except PlaywrightError as e:
             # Timeouts are PlaywrightError too; only a dead browser is retried
             message = str(e).lower()
-            if "crash" not in message and "closed" not in message:
+            engine_dead = self._engine is not None and self._engine.process.poll()
+            if not engine_dead and not any(
+                word in message for word in ("crash", "closed", "disconnected")
+            ):
                 raise
             logger.warning(
                 f"Browser died during navigation ({e}). "
                 "Relaunching and retrying once..."
             )
-            try:
-                self.browser.close()
-            except PlaywrightError as close_error:
-                logger.debug(f"Closing the dead browser failed: {close_error}")
+            self._teardown()
             self._launch()
             self.page.goto(url, wait_until="domcontentloaded")
-
-    def _propagate_license_denial(self, error: Exception) -> None:
-        """Mark code-77 denial and let the worker fail the current operation."""
-        if is_invalid_license_error(error):
-            self.license_key_rejected = True
-            raise error
 
     def _build_search_url(
         self, package_name, version=None, archs=None, dpis=None, bundles=None
@@ -337,12 +365,17 @@ class ApkMirror_Downloader:
         prefer_bundle=False,
         minimum_sdk: int | None = None,
     ) -> AppMetadata | None:
+        if version:
+            resolved = self._search_via_morphe(
+                package_name, version, preferred_arch, minimum_sdk
+            )
+            if resolved:
+                return resolved
         url = self._build_search_url(package_name, version)
         logger.info(f"Navigating to search results endpoint for '{package_name}'...")
         try:
             self._goto(url)
         except Exception as e:
-            self._propagate_license_denial(e)
             logger.error(f"Navigation to search page failed: {e}")
             return None
 
@@ -350,8 +383,7 @@ class ApkMirror_Downloader:
             self.page.wait_for_selector(
                 ".appRow, .variants-table, .downloadButton", timeout=15000
             )
-        except Exception as error:  # noqa: BLE001 - classify license denial before fallback
-            self._propagate_license_denial(error)
+        except Exception:  # noqa: BLE001 - any failure means the page did not load
             logger.error("Timeout reached. No valid target layouts loaded.")
             return None
 
@@ -382,8 +414,7 @@ class ApkMirror_Downloader:
                 self.page.wait_for_selector(
                     ".variants-table, .downloadButton", timeout=15000
                 )
-            except Exception as error:
-                self._propagate_license_denial(error)
+            except Exception:
                 logger.error("Failed to load subsequent release page components.")
                 return None
 
@@ -417,8 +448,7 @@ class ApkMirror_Downloader:
             self._goto(variant_page_url)
             try:
                 self.page.wait_for_selector(".downloadButton", timeout=15000)
-            except Exception as error:
-                self._propagate_license_denial(error)
+            except Exception:
                 logger.error("Final download button missing from layout DOM context.")
                 return None
 
@@ -435,6 +465,51 @@ class ApkMirror_Downloader:
         logger.info(
             "Successfully extracted complete validated package payload asset target info."
         )
+        return self._extract_final_metadata(parser)
+
+    def _search_via_morphe(
+        self,
+        package_name: str,
+        version: str,
+        preferred_arch: Arch | str,
+        minimum_sdk: int | None = None,
+    ) -> AppMetadata | None:
+        """Open the variant page the Morphe API resolves and read its metadata.
+
+        Args:
+            package_name: Android package id.
+            version: Exact app version.
+            preferred_arch: ABI to ask the API for.
+            minimum_sdk: Required minimum Android API. The page must state a
+                "Min: Android N (API X)" with X at or above it.
+
+        Returns:
+            The metadata, or None when the API or the page did not deliver or
+            does not meet minimum_sdk, so the caller falls back to searching
+            APKMirror itself.
+        """
+        arch = (
+            preferred_arch.value if isinstance(preferred_arch, Enum) else preferred_arch
+        )
+        variant_url = resolve_variant_url(package_name, version, arch)
+        if not variant_url:
+            return None
+        logger.info(f"Morphe API resolved {package_name} {version}: {variant_url}")
+        try:
+            self._goto(variant_url)
+            self.page.wait_for_selector(".downloadButton", timeout=15000)
+        except Exception:  # noqa: BLE001 - any failure means the page did not load
+            logger.warning("Resolved variant page did not load; searching instead.")
+            return None
+        parser = HTMLParser(self.page.content())
+        if minimum_sdk is not None:
+            page_minimum = _page_minimum_api(parser)
+            if page_minimum is None or page_minimum < minimum_sdk:
+                logger.info(
+                    "Resolved variant does not verifiably meet Android API "
+                    f"{minimum_sdk}; searching instead."
+                )
+                return None
         return self._extract_final_metadata(parser)
 
     def latest_version(
@@ -638,8 +713,7 @@ class ApkMirror_Downloader:
                     out_file.write(chunk)
             logger.info(f"File payload asset safely saved locally: {filename}")
             return dest_path
-        except Exception as e:  # noqa: BLE001 - classify license denial before fallback
-            self._propagate_license_denial(e)
+        except Exception as e:  # noqa: BLE001 - fall back to the browser
             logger.warning(
                 f"Standard chunk connection dropped: {e}. Falling back to browser..."
             )
@@ -654,8 +728,7 @@ class ApkMirror_Downloader:
 
             try:
                 self.page.wait_for_selector("#download-link", timeout=10000)
-            except Exception as error:
-                self._propagate_license_denial(error)
+            except Exception:
                 logger.error(
                     "Timed out waiting for direct '#download-link' to appear on the page."
                 )
@@ -702,26 +775,18 @@ class ApkMirror_Downloader:
             )
             return dest_path
 
-        except Exception as e:  # noqa: BLE001 - classify license denial before fallback
-            self._propagate_license_denial(e)
+        except Exception as e:  # noqa: BLE001 - fall back to the browser
             logger.error(f"Direct browser download extraction sequence failed: {e}")
             return None
 
-    def close(self):
-        logger.info(
-            "Closing active cloaked browser environment process components cleanly."
-        )
-        self.browser.close()
+    def close(self) -> None:
+        """Close the page connection, stop the engine and delete its profile."""
+        logger.info("Closing the ShardX browser and its engine process.")
+        self._teardown()
 
 
 if __name__ == "__main__":
-    from src import config_store, secrets_store
-
-    secrets_store.absorb_environment()
-    configure_cloakbrowser_cache(config_store.DATA_DIR / "bin" / "cloakbrowser")
-    downloader = ApkMirror_Downloader(
-        license_key=secrets_store.get_secret(secrets_store.CLOAKBROWSER_LICENSE_KEY)
-    )
+    downloader = ApkMirror_Downloader()
     output_dir = "./test_downloads"
 
     try:

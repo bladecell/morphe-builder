@@ -10,9 +10,9 @@ and Jinja templates:
 | `main.py` | Presentation + orchestration | FastAPI app, UI JSON API, Obtainium endpoints, APScheduler jobs, `ScraperWorker`, build task |
 | `patcher.py` | Pipeline / service | GitHub release sync for tools and patch sources, version selection, APK download and split merge, morphe-cli invocation, metadata |
 | `config_store.py` | Persistence | All `config.yaml` I/O: `load_config`, `update_config`, atomic write, `DATA_DIR`, `DEFAULT_CONFIG` |
-| `secrets_store.py` | Secret persistence | Environment/file precedence for GitHub, cloakbrowser and Apprise secrets; atomic `DATA_DIR/.env`, redaction, child-environment stripping |
+| `secrets_store.py` | Secret persistence | Environment/file precedence for GitHub and Apprise secrets, plus `discard_legacy_license_key`; atomic `DATA_DIR/.env`, redaction, child-environment stripping |
 | `request_guards.py` | Request security | Host, Origin, and Fetch Metadata checks; no authentication |
-| `apkmirror_downloader.py` | Gateway | `ApkMirror_Downloader`: drives one cloakbrowser (Playwright sync API) page through APKMirror |
+| `apkmirror_downloader.py` | Gateway | `ApkMirror_Downloader`: drives one headless ShardX engine (sync Playwright over CDP) page through APKMirror; Morphe API variant resolver |
 | `templates/` | View | See [templates/codemap.md](templates/codemap.md) |
 
 ## Design
@@ -60,13 +60,12 @@ no locks. Only `config.yaml` is protected.
 | File | Written by | Contents |
 |---|---|---|
 | `config.yaml` | `config_store.update_config` | `repositories`, `sources`, `tools`, `apps`, `settings`. Shape in `config_store.DEFAULT_CONFIG`. Seeded from the project root copy or the defaults on first load |
-| `.env` | `secrets_store` | Optional plaintext GitHub/cloakbrowser secrets and JSON-array `APPRISE_URLS`; atomic mode `0600`; never source/load as an environment file |
+| `.env` | `secrets_store` | Optional plaintext GitHub secrets and JSON-array `APPRISE_URLS`; atomic mode `0600`; never source/load as an environment file |
 | `bin/versions.json` | `patcher.save_local_versions` | Release tag per GitHub repo, plus `<repo>#last_check` timestamps |
 | `bin/version_cache.json` | `patcher.save_version_cache` | Newest APKMirror version per package, 12 h TTL |
 | `bin/metadata.json` | `patcher.extract_app_metadata`, `patcher.save_metadata` | `real_name` and `version` per package |
 | `bin/patches-<owner>-<repo>.{mpp,json}` | `patcher.check_and_download_release` | Patch bundle and patch list per source; paths from `get_source_paths` |
 | `bin/build.log` | `main.build_task` | Captured stdout of the current or last build |
-| `bin/cloakbrowser/` | `main.startup_event` | Isolated browser cache; an existing `license.key` causes refusal and is not automatically removed |
 | `apks/raw/<pkg>-<version>.apk` | `download_apk`, `/api/ui/upload_apk` | Unpatched APKs |
 | `apks/patched/<pkg>-<version>-<patch tag>-<hash>.apk` | `run_pipeline` | Output served to Obtainium; moved in atomically from `apks/.building/` |
 | `apks/.building/` | `run_pipeline` | Scratch output of the patch in progress; wiped at the start of every build |
@@ -92,7 +91,7 @@ opened with `newline=""` so the UI can collapse them.
 
 1. `secrets_store.absorb_environment` captures recognized environment secrets
    and removes them from `os.environ`; then prepare data directories and the
-   app-owned cloakbrowser cache at `DATA_DIR/bin/cloakbrowser`.
+   delete the retired `DATA_DIR/bin/cloakbrowser` cache.
 2. Load config, schedule jobs, and fill `DIAGNOSTICS` (Java on PATH, scraper
    importable).
 3. `SCRAPER_WORKER.start()` launches the browser with the effective configured
@@ -198,10 +197,10 @@ returns `(True, [repos used])`.
 - `_goto` is the only navigation entry point apart from the final download hop. It
   relaunches the browser and retries once when the Playwright error mentions `crash`
   or `closed`; timeouts are re-raised.
-- A code-77 invalid-key denial is preserved across selector, download, version lookup,
-  metadata and build catches so the worker can close the browser and fail the current
-  task. Later tasks run keyless until the configured key changes. Only code 77
-  permits keyless fallback; other licence codes do not downgrade.
+- `_launch` starts ShardX headless (`cdp=True`) in a throwaway temp profile, adds
+  `--no-sandbox` as root, and attaches with `connect_over_cdp`; `_teardown` stops
+  Playwright, the engine and removes the profile. `_goto` also relaunches when the
+  engine process has exited.
 
 ## Integration
 
@@ -221,7 +220,7 @@ See [README API notes](../README.md#patch-selection-api) and
 | Sources | `POST /api/ui/add_source`, `toggle_source`, `delete_source`, `GET /api/ui/discovery` | `add_source` syncs first with `force=True`, judges success by files on disk, and re-checks for a duplicate inside the config update. `POST /api/ui/discovery/sync` queues `update_tools_task`; `/api/ui/source_updates` was deleted |
 | Status | `GET /api/ui/updates`, `build_status`, `tools_status`, `logs`, `metadata` | `updates` blocks on the worker for unpinned apps; returns the stale cache while a build or refresh is active |
 | Build | `POST /api/ui/trigger_build` | `package_ids` null or empty means all apps |
-| Settings | `POST /api/ui/save_settings`, `POST /api/ui/test_notification`, `GET /api/ui/secrets`, `PUT`/`DELETE /api/ui/secrets/{slug}`, `PUT`/`DELETE /api/ui/secrets/apprise-urls`, `POST /api/ui/secrets/apprise-urls/migration` | General settings reject non-empty notification URL bodies; tests use the effective stored list. Apprise status is count/source/migration metadata only; explicit migration removes legacy config only after secret persistence. The UI card currently exposes GitHub and cloakbrowser fields, not Apprise URL editing. Token changes report sync scheduling in `X-Sync` |
+| Settings | `POST /api/ui/save_settings`, `POST /api/ui/test_notification`, `GET /api/ui/secrets`, `PUT`/`DELETE /api/ui/secrets/{slug}`, `PUT`/`DELETE /api/ui/secrets/apprise-urls`, `POST /api/ui/secrets/apprise-urls/migration` | General settings reject non-empty notification URL bodies; tests use the effective stored list. Apprise status is count/source/migration metadata only; explicit migration removes legacy config only after secret persistence. The UI card currently exposes the GitHub field, not Apprise URL editing. Token changes report sync scheduling in `X-Sync` |
 | Obtainium | `GET /view/{package_id}`, `GET /api/apps`, `GET /api/apps/{obtainium_id}`, `GET /download/{package_name}` | `/view` accepts package id or `obtainium_id`. `/download` takes an exact filename or a package id and serves the newest APK of exactly that package, or 404. Unknown ids on `/api/apps/{id}` give 404 |
 | Static | `/icons` | `DATA_DIR/apks/icons` |
 | Static | `/static` | `src/static`: `app.css` (URL carries a content hash) and the vendored Alpine.js |
@@ -235,7 +234,7 @@ trusted. See [README host/proxy guidance](../README.md#host-and-reverse-proxy-ch
 ### External
 
 - GitHub REST (`/releases/latest`) and `raw.githubusercontent.com`, unauthenticated.
-- APKMirror through cloakbrowser.
+- APKMirror through ShardX; Morphe API (`api.morphe.software`) for variant resolution; APKPure via `apkeep` as fallback.
 - `java` subprocesses for `morphe-cli.jar` and `APKEditor.jar` (`settings.java_path`
   overrides the binary).
 - Apprise for notifications, resolving `APPRISE_URLS` before the legacy
