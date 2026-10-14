@@ -27,7 +27,7 @@ For design rationale see [architecture.md](architecture.md) and
 |-----------|------------------------|--------------|
 | `src/` | Backend: FastAPI routes and scheduling (`main.py`), locked atomic config I/O (`config_store.py`), sync, version selection, download and patch pipeline (`patcher.py`), APKMirror browser scraper (`apkmirror_downloader.py`). | [View Map](src/codemap.md) |
 | `src/templates/` | Jinja2 views: Alpine.js single-page admin UI and the Obtainium HTML page. | [View Map](src/templates/codemap.md) |
-| `src/static/` | Served at `/static`: the generated stylesheet `app.css` and the vendored Alpine.js file. | none |
+| `src/static/` | Served at `/static`: the generated stylesheet `app.css`, the vendored Alpine.js file and `fonts/` (Space Grotesk woff2 and its OFL text). | none |
 
 Not mapped:
 

@@ -394,7 +394,7 @@ def test_patch_dialog_contains_focus_and_escape_restores_its_opener(
 
     expect(dialog).to_be_visible()
     expect(local_page.locator('[role="dialog"]:visible')).to_have_count(1)
-    expect(local_page.locator(".glass-surface:visible")).to_have_count(2)
+    expect(local_page.locator(".nb-dialog:visible")).to_have_count(1)
     assert dialog.locator("h2").inner_text() == "Edit Configuration"
     assert local_page.evaluate("document.activeElement.matches('[role=dialog]')")
     local_page.keyboard.press("Shift+Tab")
@@ -428,7 +428,7 @@ def test_upload_dialog_contains_focus_and_escape_restores_its_opener(
 
     expect(dialog).to_be_visible()
     expect(local_page.locator('[role="dialog"]:visible')).to_have_count(1)
-    expect(local_page.locator(".glass-surface:visible")).to_have_count(2)
+    expect(local_page.locator(".nb-dialog:visible")).to_have_count(1)
     assert dialog.locator("h2").inner_text() == "Upload Manual APK"
     assert local_page.evaluate("document.activeElement.matches('[role=dialog]')")
     local_page.keyboard.press("Shift+Tab")

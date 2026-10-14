@@ -1,43 +1,70 @@
 # Morphe Builder UI direction
 
-## Product surface
+Neo-brutalism, applied to the existing Jinja and Alpine admin. Loud, visible
+structure: if it has no border it does not exist. Preserve the pipeline, discovery
+and settings workflows; add no controls, icons, images or network assets.
 
-Restyle the existing Jinja and Alpine admin application. Preserve its current
-pipeline, discovery and settings workflows, existing cards, dialogs and controls.
-Do not add landing-page sections, new controls, images, icons, fonts or network
-assets.
+## Tokens
 
-## Visual direction
+- Light (default): canvas `#FFFDF5`, ink `#000` for all text, borders and shadows,
+  white `#FFF` surfaces. Red `#FF6B6B` primary, yellow `#FFD93D` secondary and
+  hover/focus, violet `#C4B5FD` card headers and notices. No grays.
+- Dark (follows `prefers-color-scheme`, no toggle): canvas `#121212`, surface
+  `#1E1E1E`, ink `#FFFDF5` for text, borders and shadows. Same accents. Text on any
+  red, yellow or violet fill is `#000`.
+- Contrast (WCAG 2.x): ink on canvas 20.6:1 light, 18.4:1 dark; black on red 7.6,
+  yellow 15.2, violet 11.4; cream on `#1E1E1E` 16.4. Placeholder is ink at 65%
+  (the source spec's 40% fails AA). Disabled controls are exempt and use opacity.
+- Variables live in `tailwind/input.css`; Tailwind names them `ink`, `paper`,
+  `canvas`, `pop-red`, `pop-yellow`, `pop-violet`.
 
-- Keep the existing dark theme and system sans typography.
-- Keep content cards solid and neutral; use a restrained frosted treatment only
-  on the sticky header and the currently visible dialog surface.
-- Use blue as the sole brand accent and neutral text. The supplied blue
-  `#0080FF` is adjusted to lighter or darker blue shades where needed for text
-  and control contrast. Do not use the supplied purple or pink as accents.
-- Use compact 4px and 8px radii, an 8px spacing rhythm and a 1280px content
-  maximum width.
-- Use 2.25rem as the page-heading reference and 1rem as the body-text reference;
-  retain smaller sizes for dense admin labels where needed for hierarchy.
-- Use opaque dark surfaces when backdrop blur is unsupported.
+## Type
 
-## Accessibility and motion
+Space Grotesk, vendored in `src/static/fonts/` (weights 500 and 700, latin, SIL OFL,
+`font-display: swap`). Body, labels and buttons 700; 500 for secondary text only,
+never 400. The family has no 900, so `font-black` renders the 700 face. Uppercase
+for headings, labels, buttons, tabs and badges; tight tracking on headings, wide on
+labels and badges.
 
-- Maintain WCAG AA text contrast and visible keyboard focus.
-- Interactive controls have at least 44px targets; layouts reflow below 768px.
-- Restrict motion to brief hover and focus feedback, and honor reduced-motion
-  preferences.
+## Shape, borders, shadows
 
-## Design dials
+- Radius 0. Borders 4px by default; 2px for separators, ghost buttons and badges; 8px
+  for the header rule.
+- Hard offset shadows, no blur: 4px small, 8px cards (6px below 768px), 12px dialogs
+  (8px below 768px). Shadows use ink, so they turn cream in dark.
+- No blur, gradients or alpha fills. The only alpha is the modal scrim and the page
+  grid texture (ink at 10%, 40px), which sits on the canvas and never behind data.
 
-ENERGY 2 / RHYTHM 2 / MOTION 1.
+## Components
+
+Button: 48px minimum, uppercase bold; primary red, default outline, ghost with a
+transparent border that fills yellow on hover; press moves 2px and drops the shadow.
+Card: surface, 4px border, 8px shadow, violet `nb-head`, yellow `nb-foot`; pipeline
+cards lift 4px on hover. Input: 56px, bold, focus turns yellow with a 4px shadow.
+Navigation: bordered tabs, active and hover red with a shadow. Badge: bordered,
+uppercase. Alerts: error red, warning yellow, success violet, info outlined.
+
+## Layout and motion
+
+7xl content width, gaps 24 to 40px. Rotation (1 to 3 degrees) only on the logo, the
+Active Pipeline heading and badges; tables, forms, patch lists and dialogs stay
+straight. Motion is 100 to 200ms, linear or ease-out, no loops except the existing
+spinners. `prefers-reduced-motion` removes transitions and hover/press transforms.
+
+## Accessibility
+
+3px ink focus outline with 2px offset (black inside yellow and violet regions);
+44px minimum targets; layouts reflow below 768px; status is never colour-only.
+
+## Dials
+
+ENERGY 3 / RHYTHM 2 / MOTION 1.
 
 ## Reasons
 
-- The existing dark theme and solid cards preserve the admin tool's familiar
-  information hierarchy; glass is reserved for navigation and the active dialog
-  to distinguish transient surfaces without flattening content.
-- Blue is the only accent because the owner selected blue-only accents; its
-  contrast-safe variants preserve that choice without sacrificing readability.
-- Compact radii, readable neutral text and restrained transitions keep dense
-  administrative tasks legible and predictable.
+- Neo-brutalism is the owner's chosen identity; the admin keeps its hierarchy and
+  gains structure from borders and colour blocking.
+- Red is the one primary action colour; yellow marks hover, focus and selection;
+  violet marks headers.
+- The grid texture is the paper-canvas motif the spec asks for, kept off dense data.
+- Space Grotesk is the spec's face, vendored so the page needs no network.

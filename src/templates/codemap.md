@@ -11,6 +11,9 @@ scrapes.
 templates by `scripts/build_css.py`) and Alpine.js (vendored in `src/static/`) are
 served by the app; nothing loads from a CDN. Rebuild the stylesheet after changing
 classes here.
+Styling is Neo-brutalism (`DESIGN.md`): semantic `nb-*` component classes in
+`tailwind/input.css`, themed by CSS variables so light and dark follow the system
+setting without `dark:` variants. Space Grotesk is served from `/static/fonts/`.
 All client state and behaviour live in a single Alpine component,
 `Alpine.data('morphe', ...)`, bound on `<body x-data="morphe">`.
 

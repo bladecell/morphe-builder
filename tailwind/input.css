@@ -2,10 +2,69 @@
 @tailwind components;
 @tailwind utilities;
 
+/*
+ * Neo-brutalism (see DESIGN.md): cream paper, ink borders and hard offset shadows,
+ * flat red/yellow/violet fills, square corners. Light is the default; dark follows
+ * the system setting by swapping the variables below (tailwind darkMode "media").
+ * Text on a red, yellow or violet fill is always #000 (7.5:1 or better).
+ */
+
+@font-face {
+  font-family: "Space Grotesk";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("fonts/space-grotesk-latin-500-normal.woff2") format("woff2");
+}
+
+/* Space Grotesk stops at 700; 700-900 requests use this face. */
+@font-face {
+  font-family: "Space Grotesk";
+  font-style: normal;
+  font-weight: 700 900;
+  font-display: swap;
+  src: url("fonts/space-grotesk-latin-700-normal.woff2") format("woff2");
+}
+
 :root {
   --tap-target: 44px;
-  --blue-accent: #60a5fa;
-  --glass-surface: rgba(15, 23, 42, 0.88);
+  --canvas: #fffdf5;
+  --paper: #fff;
+  --ink: #000;
+  --on-ink: #fffdf5;
+  --red: #ff6b6b;
+  --red-hover: #e85555;
+  --yellow: #ffd93d;
+  --violet: #c4b5fd;
+  --placeholder: rgba(0, 0, 0, 0.65);
+  --grid-line: rgba(0, 0, 0, 0.1);
+  --sh-sm: 4px;
+  --sh-md: 8px;
+  --sh-lg: 12px;
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --canvas: #121212;
+    --paper: #1e1e1e;
+    --ink: #fffdf5;
+    --on-ink: #121212;
+    --placeholder: rgba(255, 253, 245, 0.65);
+    --grid-line: rgba(255, 253, 245, 0.1);
+  }
+}
+
+@media (max-width: 767px) {
+  :root {
+    --sh-md: 6px;
+    --sh-lg: 8px;
+  }
+}
+
+body {
+  font-family: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
+  font-weight: 700;
 }
 
 button {
@@ -21,55 +80,365 @@ a.p-2 {
   min-height: var(--tap-target);
 }
 
-input,
-select,
-textarea {
-  border-color: #74839a;
-}
-
 :focus-visible {
-  outline: 2px solid #60a5fa;
+  outline: 3px solid var(--ink);
   outline-offset: 2px;
 }
 
-.glass-surface {
-  background-color: #0f172a;
-  border-radius: 8px;
+.nb-head :focus-visible,
+.nb-foot :focus-visible {
+  outline-color: #000;
 }
 
-@supports (backdrop-filter: blur(1px)) {
-  .glass-surface {
-    background-color: var(--glass-surface);
-    -webkit-backdrop-filter: blur(12px);
-    backdrop-filter: blur(12px);
+* {
+  scrollbar-color: var(--ink) var(--paper);
+}
+
+::-webkit-scrollbar {
+  width: 16px;
+  height: 16px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--paper);
+  border-left: 4px solid var(--ink);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--yellow);
+  border: 4px solid var(--ink);
+}
+
+.nb-checkbox {
+  appearance: none;
+  position: relative;
+  flex: none;
+  width: 1.75rem;
+  height: 1.75rem;
+  border: 4px solid var(--ink);
+  background: var(--paper);
+  cursor: pointer;
+}
+
+.nb-checkbox:checked {
+  background: var(--yellow);
+}
+
+.nb-checkbox:checked::after {
+  content: "";
+  position: absolute;
+  left: 5px;
+  top: -1px;
+  width: 7px;
+  height: 14px;
+  border: solid #000;
+  border-width: 0 4px 4px 0;
+  transform: rotate(45deg);
+}
+
+.nb-checkbox:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+@layer components {
+  .nb-page {
+    background-color: var(--canvas);
+    background-image:
+      linear-gradient(var(--grid-line) 1px, transparent 1px),
+      linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
+    background-size: 40px 40px;
+    color: var(--ink);
   }
-}
 
-@supports not (backdrop-filter: blur(1px)) {
-  .glass-surface {
-    background-color: #0f172a;
+  .nb-muted {
+    font-weight: 500;
   }
-}
 
-.rounded-3xl,
-.rounded-2xl,
-.rounded-xl {
-  border-radius: 8px;
-}
+  .nb-surface {
+    border: 4px solid var(--ink);
+    background: var(--paper);
+    color: var(--ink);
+  }
 
-.rounded-lg {
-  border-radius: 4px;
-}
+  .nb-card {
+    @apply nb-surface;
+    box-shadow: var(--sh-md) var(--sh-md) 0 0 var(--ink);
+  }
 
-.transition-all,
-.transition-colors,
-.transition-opacity {
-  transition-duration: 200ms;
-}
+  .nb-card-selected {
+    border: 4px solid var(--ink);
+    background: var(--yellow);
+    color: #000;
+    box-shadow: var(--sh-md) var(--sh-md) 0 0 var(--ink);
+  }
 
-.text-2xl {
-  font-size: 2.25rem;
-  line-height: 2.5rem;
+  .nb-lift {
+    transition: transform 200ms ease-out, box-shadow 200ms ease-out;
+  }
+
+  .nb-lift:hover {
+    transform: translateY(-4px);
+    box-shadow: 10px 10px 0 0 var(--ink);
+  }
+
+  .nb-dialog {
+    @apply nb-surface;
+    box-shadow: var(--sh-lg) var(--sh-lg) 0 0 var(--ink);
+  }
+
+  .nb-rule {
+    border-color: var(--ink);
+  }
+
+  .nb-head {
+    border-bottom: 4px solid var(--ink);
+    background: var(--violet);
+    color: #000;
+  }
+
+  .nb-foot {
+    border-top: 4px solid var(--ink);
+    background: var(--yellow);
+    color: #000;
+  }
+
+  .nb-header {
+    border-bottom: 8px solid var(--ink);
+    background: var(--paper);
+    color: var(--ink);
+  }
+
+  .nb-btn {
+    @apply inline-flex min-h-12 items-center justify-center gap-2 px-5 py-2 text-sm font-bold uppercase tracking-wide;
+    border: 4px solid var(--ink);
+    background: var(--paper);
+    color: var(--ink);
+    box-shadow: var(--sh-sm) var(--sh-sm) 0 0 var(--ink);
+    transition: background-color 100ms linear, transform 100ms linear,
+      box-shadow 100ms linear;
+  }
+
+  .nb-btn:hover {
+    background: var(--yellow);
+    color: #000;
+  }
+
+  .nb-btn:active:not(:disabled) {
+    transform: translate(2px, 2px);
+    box-shadow: none;
+  }
+
+  .nb-btn:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+    box-shadow: none;
+  }
+
+  .nb-btn:disabled:hover {
+    background: var(--paper);
+    color: var(--ink);
+  }
+
+  .nb-btn-primary {
+    @apply nb-btn;
+    background: var(--red);
+    color: #000;
+  }
+
+  .nb-btn-primary:hover {
+    background: var(--red-hover);
+  }
+
+  .nb-btn-primary:disabled:hover {
+    background: var(--red);
+    color: #000;
+  }
+
+  .nb-btn-danger {
+    @apply nb-btn;
+  }
+
+  .nb-btn-danger:hover {
+    background: var(--red);
+  }
+
+  .nb-btn-ghost {
+    @apply inline-flex min-h-12 items-center justify-center gap-2 px-3 py-2 text-sm font-bold uppercase tracking-wide;
+    border: 2px solid transparent;
+    background: transparent;
+    color: var(--ink);
+    transition: background-color 100ms linear;
+  }
+
+  .nb-btn-ghost:hover:not(:disabled) {
+    border-color: var(--ink);
+    background: var(--yellow);
+    color: #000;
+  }
+
+  .nb-btn-ghost:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+  }
+
+  .nb-btn-icon {
+    @apply nb-btn min-h-12 min-w-12 px-2;
+  }
+
+  .nb-btn-dashed {
+    @apply inline-flex min-h-12 w-full items-center justify-center px-4 py-3 text-sm font-bold uppercase tracking-wide;
+    border: 4px dashed var(--ink);
+    background: transparent;
+    color: var(--ink);
+    transition: background-color 100ms linear;
+  }
+
+  .nb-btn-dashed:hover {
+    background: var(--yellow);
+    color: #000;
+  }
+
+  .nb-tab {
+    @apply inline-flex min-h-12 items-center justify-center gap-2 px-4 py-2 text-sm font-bold uppercase tracking-wide;
+    border: 4px solid transparent;
+    color: var(--ink);
+    transition: background-color 100ms linear, box-shadow 100ms linear;
+  }
+
+  .nb-tab:hover {
+    border-color: var(--ink);
+    background: var(--red);
+    color: #000;
+    box-shadow: var(--sh-sm) var(--sh-sm) 0 0 var(--ink);
+  }
+
+  .nb-tab-active,
+  .nb-tab-active:hover {
+    border-color: var(--ink);
+    background: var(--red);
+    color: #000;
+    box-shadow: var(--sh-sm) var(--sh-sm) 0 0 var(--ink);
+  }
+
+  .nb-input {
+    @apply min-h-14 w-full px-3 py-2 text-lg font-bold;
+    border: 4px solid var(--ink);
+    background: var(--paper);
+    color: var(--ink);
+    border-radius: 0;
+    transition: background-color 100ms linear, box-shadow 100ms linear;
+  }
+
+  .nb-input::placeholder {
+    color: var(--placeholder);
+  }
+
+  .nb-input:focus {
+    background: var(--yellow);
+    color: #000;
+    box-shadow: var(--sh-sm) var(--sh-sm) 0 0 var(--ink);
+  }
+
+  .nb-input:focus::placeholder {
+    color: rgba(0, 0, 0, 0.65);
+  }
+
+  .nb-input:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+  }
+
+  .nb-label {
+    @apply text-sm font-bold uppercase tracking-widest;
+    color: var(--ink);
+  }
+
+  .nb-badge {
+    @apply inline-flex items-center px-2 py-1 text-xs font-black uppercase tracking-widest;
+    border: 2px solid var(--ink);
+    color: #000;
+    box-shadow: 2px 2px 0 0 var(--ink);
+    transition: transform 100ms linear;
+  }
+
+  .nb-badge:hover {
+    transform: rotate(2deg);
+  }
+
+  .nb-badge-neutral {
+    @apply nb-badge;
+    background: var(--paper);
+    color: var(--ink);
+  }
+
+  .nb-badge-green,
+  .nb-badge-blue {
+    @apply nb-badge;
+    background: var(--violet);
+  }
+
+  .nb-badge-red {
+    @apply nb-badge;
+    background: var(--red);
+  }
+
+  .nb-badge-yellow {
+    @apply nb-badge;
+    background: var(--yellow);
+  }
+
+  .nb-alert {
+    @apply px-4 py-3 text-sm font-bold;
+    border: 4px solid var(--ink);
+    box-shadow: var(--sh-sm) var(--sh-sm) 0 0 var(--ink);
+  }
+
+  .nb-alert-info {
+    background: var(--paper);
+    color: var(--ink);
+  }
+
+  .nb-alert-success {
+    background: var(--violet);
+    color: #000;
+  }
+
+  .nb-alert-error {
+    background: var(--red);
+    color: #000;
+  }
+
+  .nb-alert-warning {
+    background: var(--yellow);
+    color: #000;
+  }
+
+  .nb-text-error,
+  .nb-text-warning {
+    border: 2px solid var(--ink);
+    color: #000;
+  }
+
+  .nb-text-error {
+    background: var(--red);
+  }
+
+  .nb-text-warning {
+    background: var(--yellow);
+  }
+
+  .nb-console {
+    border: 0;
+    background: #000;
+    color: #fffdf5;
+    @apply font-mono text-xs font-medium;
+  }
+
+  .nb-console ::selection {
+    background: var(--yellow);
+    color: #000;
+  }
 }
 
 @media (max-width: 767px) {
@@ -77,31 +446,6 @@ textarea {
     font-size: 1.75rem;
     line-height: 2rem;
   }
-}
-
-.text-slate-500 {
-  color: #b0bfd3;
-}
-
-.text-slate-600 {
-  color: #9aadc5;
-}
-
-.text-indigo-300,
-.text-indigo-400,
-.text-indigo-500,
-.text-indigo-600 {
-  color: var(--blue-accent);
-}
-
-.bg-indigo-500,
-.hover\\:bg-indigo-500:hover {
-  background-color: #0066d6;
-}
-
-.bg-indigo-600,
-.hover\\:bg-indigo-600:hover {
-  background-color: #0057b8;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -112,5 +456,11 @@ textarea {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
+  }
+
+  .nb-lift:hover,
+  .nb-badge:hover,
+  .nb-btn:active:not(:disabled) {
+    transform: none;
   }
 }

@@ -1,5 +1,22 @@
 # Decisions
 
+## 2026-10-14: Neo-brutalism admin UI, light and dark
+
+- Restyled `index.html` to the owner's Neo-brutalism spec (DESIGN.md). Components are
+  `nb-*` classes in `tailwind/input.css` driven by CSS variables; the markup carries
+  no `dark:` variants. Light and dark follow the system setting (`darkMode: "media"`,
+  no toggle, no `class="dark"`).
+- Space Grotesk is vendored in `src/static/fonts/` (SIL OFL 1.1, fontsource 5.3.0
+  files, latin subset, 500 and 700). The family has no 900 weight, so 900 requests
+  render the 700 face. No CDN. sha256: 500 `1b1a8131d9edf975d9decee81e2f2bf504812f7a4f498e5500f28a613e22e64c`,
+  700 `35f8aec56cfd5cbfdb03cc68733a54a0b05bb3617ffcd5fd332badc0b045ca55`,
+  OFL.txt `18a4de52385f6b988782639d5d0cc1326e5a8c2de9a7f01d7b20d9aedcc60943`.
+- Rotation only on the logo, two headings and badges; marquees, floaters and extra
+  icons rejected. Tables, forms, patch lists and dialogs stay straight.
+- Deviations from the spec: no grays, so disabled controls use opacity 0.55; muted
+  text is weight 500 instead of a gray; placeholder is ink at 65% (the spec's 40% is
+  below AA); success/info/status badges reuse violet because the palette has no green.
+
 ## 2026-10-14: Replace cloakbrowser with ShardX
 
 - `src/apkmirror_downloader.py` now drives ShardX (`shardx==2.0.3`, MIT, github.com/ProxyShard/ShardBrowser):
