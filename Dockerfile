@@ -1,8 +1,8 @@
-FROM python:3.12-slim-bookworm
+FROM python:3.14-slim-trixie
 
-# Install Java 17 and essential system dependencies
+# Install Java 21 and essential system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    openjdk-17-jre-headless \
+    openjdk-21-jre-headless \
     curl \
     ca-certificates \
     unzip \
