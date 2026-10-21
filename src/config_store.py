@@ -121,8 +121,27 @@ def _seed_if_missing() -> None:
             print(f"[Init] Generated default {config_path}")
 
 
+def _load_config_file() -> dict:
+    """Read the persisted config.yaml, creating it on first run."""
+    config_path = DATA_DIR / "config.yaml"
+    if not config_path.exists():
+        _seed_if_missing()
+    with open(config_path, "r", encoding="utf-8") as file:
+        return yaml.safe_load(file)
+
+
+def runtime_environment_settings() -> dict[str, str]:
+    """Return settings explicitly controlled by the process environment."""
+    settings: dict[str, str] = {}
+    if "SERVER_URL" in os.environ:
+        settings["server_url"] = os.environ["SERVER_URL"].rstrip("/")
+    if "CRON_SCHEDULE" in os.environ:
+        settings["cron_schedule"] = os.environ["CRON_SCHEDULE"]
+    return settings
+
+
 def load_config() -> dict:
-    """Read config.yaml, creating it on first run.
+    """Read effective config.yaml settings, creating it on first run.
 
     Returns:
         The parsed config. Mutating it does not change the file.
@@ -131,12 +150,13 @@ def load_config() -> dict:
         OSError: The file could not be read or created.
         yaml.YAMLError: The file is not valid YAML.
     """
-    config_path = DATA_DIR / "config.yaml"
-    if not config_path.exists():
-        _seed_if_missing()
     # Writes replace the file atomically, so no lock is needed to read it.
-    with open(config_path, "r") as file:
-        return yaml.safe_load(file)
+    config = _load_config_file()
+    overrides = runtime_environment_settings()
+    settings = config.setdefault("settings", {}) if isinstance(config, dict) else None
+    if isinstance(settings, dict):
+        settings.update(overrides)
+    return config
 
 
 def update_config(mutate: Callable[[dict], None]) -> dict:
@@ -157,7 +177,8 @@ def update_config(mutate: Callable[[dict], None]) -> dict:
         Exception: Whatever `mutate` raises, unchanged.
     """
     with _CONFIG_LOCK:
-        config = load_config()
+        # Mutations must operate on persisted values, never runtime overrides.
+        config = _load_config_file()
         original = copy.deepcopy(config)
         mutate(config)
         if config != original:

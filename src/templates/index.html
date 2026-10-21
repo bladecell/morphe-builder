@@ -121,6 +121,37 @@
                     return this.availablePatches.filter(p => this.patchTabKey(p.repo) === key && p.selected).length;
                 },
 
+                sourcePatchCount(repo) {
+                    const key = this.patchTabKey(repo);
+                    return this.availablePatches.filter(p =>
+                        this.patchTabKey(p.repo) === key
+                        && p.source_status === 'available'
+                        && p.status !== 'patch_unavailable'
+                    ).length;
+                },
+
+                isEmptyUnselectedSource(tab) {
+                    return this.sourcePatchCount(tab.repo) === 0
+                        && this.selectedPatchCount(tab.repo) === 0
+                        && this.activePatchTab !== tab.key;
+                },
+
+                patchTabIndex(tab, emptyGroup) {
+                    const groupTabs = this.patchTabs.filter(item =>
+                        this.isEmptyUnselectedSource(item) === emptyGroup
+                    );
+                    if (this.activePatchTab === tab.key) return 0;
+                    const activeInGroup = groupTabs.some(item => item.key === this.activePatchTab);
+                    return !activeInGroup && groupTabs[0]?.key === tab.key ? 0 : -1;
+                },
+
+                activatePatchTab(tab, focus = false) {
+                    this.activePatchTab = tab.key;
+                    if (focus) {
+                        this.$nextTick(() => document.getElementById(this.patchTabId(tab.repo))?.focus());
+                    }
+                },
+
                 patchesForRepo(repo) {
                     const key = this.patchTabKey(repo);
                     return this.availablePatches.filter(p => this.patchTabKey(p.repo) === key);
@@ -131,8 +162,7 @@
                     const current = this.patchTabs.findIndex(tab => tab.key === this.patchTabKey(repo));
                     const next = (current + direction + this.patchTabs.length) % this.patchTabs.length;
                     const tab = this.patchTabs[next];
-                    this.activePatchTab = tab.key;
-                    this.$nextTick(() => document.getElementById(this.patchTabId(tab.repo))?.focus());
+                    this.activatePatchTab(tab, true);
                 },
 
                 handlePatchTabKey(event, repo) {
@@ -145,8 +175,7 @@
                     } else if (event.key === 'Home' || event.key === 'End') {
                         event.preventDefault();
                         const tab = event.key === 'Home' ? this.patchTabs[0] : this.patchTabs[this.patchTabs.length - 1];
-                        this.activePatchTab = tab.key;
-                        this.$nextTick(() => document.getElementById(this.patchTabId(tab.repo))?.focus());
+                        this.activatePatchTab(tab, true);
                     }
                 },
 
@@ -207,8 +236,11 @@
                             });
                         });
                     });
-                    const firstAvailable = this.patchTabs.find(tab => tab.status === 'available');
-                    this.activePatchTab = (firstAvailable || this.patchTabs[0])?.key || '';
+                    const firstSelected = this.patchTabs.find(tab => this.selectedPatchCount(tab.repo) > 0);
+                    const firstAvailable = this.patchTabs.find(tab =>
+                        tab.status === 'available' && this.sourcePatchCount(tab.repo) > 0
+                    );
+                    this.activePatchTab = (firstSelected || firstAvailable || this.patchTabs[0])?.key || '';
                 },
 
                 diagnostics: {java: true, scraper: true},
@@ -1080,16 +1112,31 @@
                     </div>
 
                         <!-- Patch Source Tabs -->
-                    <div x-show="!loadingPatches && patchTabs.length" role="tablist" aria-label="Patch sources" class="flex flex-wrap gap-2">
-                        <template x-for="tab in patchTabs" :key="tab.key">
+                    <div x-show="!loadingPatches && patchTabs.some(tab => !isEmptyUnselectedSource(tab))" role="tablist" aria-label="Patch sources" class="flex flex-wrap gap-2">
+                        <template x-for="tab in patchTabs.filter(tab => !isEmptyUnselectedSource(tab))" :key="tab.key">
                             <button type="button" role="tab" :id="patchTabId(tab.repo)" :data-repo="tab.repo" :aria-controls="patchPanelId(tab.repo)" :aria-selected="activePatchTab === tab.key" :tabindex="activePatchTab === tab.key ? 0 : -1" @click="activePatchTab = tab.key" @keydown="handlePatchTabKey($event, tab.repo)" :class="activePatchTab === tab.key ? 'nb-tab-active' : ''" class="nb-tab max-w-full !justify-start !px-3 text-left text-xs">
                                 <span class="block min-w-0">
                                     <span class="block" x-text="tab.source"></span>
-                                    <span class="block break-all font-normal text-xs" x-text="`${tab.repo} · ${selectedPatchCount(tab.repo)} selected`"></span>
+                                    <span class="block break-all font-normal text-xs" x-text="`${tab.repo} · ${sourcePatchCount(tab.repo)} available · ${selectedPatchCount(tab.repo)} selected`"></span>
+                                    <span x-show="selectedPatchCount(tab.repo) > 0" class="nb-badge-yellow mt-1">Selected</span>
                                 </span>
                             </button>
                         </template>
                     </div>
+
+                    <details x-ref="emptyPatchSources" x-show="!loadingPatches && patchTabs.some(tab => isEmptyUnselectedSource(tab))" class="nb-surface">
+                        <summary class="nb-btn-ghost min-h-11 w-full px-3 text-left" x-text="`Sources with no patches (${patchTabs.filter(tab => isEmptyUnselectedSource(tab)).length})`"></summary>
+                        <div role="tablist" aria-label="Sources with no patches" class="flex flex-wrap gap-2 p-3">
+                            <template x-for="tab in patchTabs.filter(tab => isEmptyUnselectedSource(tab))" :key="'empty-' + tab.key">
+                                <button type="button" role="tab" :id="patchTabId(tab.repo)" :data-repo="tab.repo" :aria-controls="patchPanelId(tab.repo)" :aria-selected="activePatchTab === tab.key" :tabindex="patchTabIndex(tab, true)" @click="activatePatchTab(tab, true)" @keydown="handlePatchTabKey($event, tab.repo)" :class="activePatchTab === tab.key ? 'nb-tab-active' : ''" class="nb-tab max-w-full !justify-start !px-3 text-left text-xs">
+                                    <span class="block min-w-0">
+                                        <span class="block" x-text="tab.source"></span>
+                                        <span class="block break-all font-normal text-xs" x-text="`${tab.repo} · 0 patches · 0 selected`"></span>
+                                    </span>
+                                </button>
+                            </template>
+                        </div>
+                    </details>
 
                         <p x-show="loadingPatches" role="status" class="py-8 text-center text-sm">Loading patch sources and saved selections...</p>
                         <p x-show="!loadingPatches && !patchTabs.length" role="status" class="nb-muted py-8 text-center text-sm">No patch sources are configured for this app.</p>
@@ -1584,17 +1631,17 @@
                     <div class="space-y-2">
                         <label for="settings-server-url" class="nb-label block">Server URL</label>
                         <div class="flex gap-3">
-                            <input id="settings-server-url" type="text" x-model="settings.server_url" placeholder="https://morphe.yourdomain.com" class="nb-input flex-1 min-w-0 font-mono">
+                            <input id="settings-server-url" type="text" x-model="settings.server_url" placeholder="https://morphe.yourdomain.com" class="nb-input flex-1 min-w-0 font-mono" {% if environment_settings is defined and environment_settings.server_url %}readonly aria-readonly="true"{% endif %}>
                         </div>
-                        <p class="nb-muted text-xs">The public URL of this server. Used to generate download links for Obtainium.</p>
+                        <p class="nb-muted text-xs">{% if environment_settings is defined and environment_settings.server_url %}Controlled by SERVER_URL in the process environment.{% else %}The public URL of this server. Used to generate download links for Obtainium.{% endif %}</p>
                     </div>
 
                     <div class="space-y-2">
                         <label for="settings-cron" class="nb-label block">Background Build Schedule (Cron)</label>
                         <div class="flex gap-3">
-                            <input id="settings-cron" type="text" x-model="settings.cron_schedule" placeholder="0 */4 * * * (Every 4 hours)" class="nb-input flex-1 min-w-0 font-mono">
+                            <input id="settings-cron" type="text" x-model="settings.cron_schedule" placeholder="0 */4 * * * (Every 4 hours)" class="nb-input flex-1 min-w-0 font-mono" {% if environment_settings is defined and environment_settings.cron_schedule %}readonly aria-readonly="true"{% endif %}>
                         </div>
-                        <p class="nb-muted text-xs">Use standard crontab format: <code>minute hour day month day_of_week</code>. Use <a href="https://crontab.guru" target="_blank" class="inline-flex min-h-11 items-center font-bold underline underline-offset-4 hover:bg-pop-yellow hover:text-black">crontab.guru</a> to format your schedule. Leave empty to disable.</p>
+                        <p class="nb-muted text-xs">{% if environment_settings is defined and environment_settings.cron_schedule %}Controlled by CRON_SCHEDULE in the process environment.{% else %}Use standard crontab format: <code>minute hour day month day_of_week</code>. Use <a href="https://crontab.guru" target="_blank" class="inline-flex min-h-11 items-center font-bold underline underline-offset-4 hover:bg-pop-yellow hover:text-black">crontab.guru</a> to format your schedule. Leave empty to disable.{% endif %}</p>
                     </div>
 
                     <div class="pt-6 border-t-2 nb-rule space-y-4">

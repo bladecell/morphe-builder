@@ -35,7 +35,12 @@ mutation, never nest `update_config`, and never write a snapshot loaded earlier.
 `load_config` takes no lock and returns a private copy. The pipeline writes through
 `patcher.save_app_result` (per-app `status`, `error`, `last_successful_build`; no-op if
 the app was deleted) and `patcher._apply_versions` (source and tool versions). The lock
-is per process, so the app must run as a single uvicorn worker.
+  is per process, so the app must run as a single uvicorn worker.
+
+`config_store.load_config` overlays explicitly set `SERVER_URL` and
+`CRON_SCHEDULE` on the returned copy. `update_config` always mutates persisted
+values, so runtime overrides never leak into `config.yaml`; `request_guards`
+uses the same effective `SERVER_URL` as link generation.
 
 **Single-owner browser (actor).** `ScraperWorker` in `main.py` is a daemon thread that
 owns the only `ApkMirror_Downloader`. Work is submitted with

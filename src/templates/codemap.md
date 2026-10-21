@@ -41,6 +41,9 @@ stored/unresolved selection state; the UI converts to a repo-keyed mapping only 
 explicit save. Unavailable mapped selections remain selected until explicitly removed.
 Mapping saves are full replacements; the modal round-trips inactive/deleted entries and
 omits exclusions so the backend preserves them.
+The dialog opens on the first source with a saved selection, labels selected sources and
+patch counts, and puts zero-patch unselected sources in a native disclosure. Selected
+unavailable entries stay in the main source list so they remain visible and removable.
 
 **`obtainium.html`** is a static card. Its contract with Obtainium's HTML source is one
 anchor whose `href` is the APK download URL and whose text ends in `.apk`, plus the

@@ -357,7 +357,7 @@ def test_grouped_dialog_uses_repo_identity_and_keeps_duplicate_names_independent
     page, _ = patch_dialog_page
     dialog = open_edit(page)
     tabs = dialog.get_by_role("tab")
-    expect(tabs).to_have_count(6)
+    expect(tabs).to_have_count(5)
     shared = tabs.filter(has_text="Shared Name")
     expect(shared).to_have_count(2)
     assert shared.nth(0).get_attribute("data-repo") == "one/patches"
@@ -376,6 +376,68 @@ def test_grouped_dialog_uses_repo_identity_and_keeps_duplicate_names_independent
     expect(
         dialog.get_by_role("checkbox", name="Select Same from one/patches")
     ).to_be_checked()
+
+
+def test_selected_source_opens_first_and_empty_sources_are_disclosed(
+    patch_dialog_page,
+):
+    page, state = patch_dialog_page
+    state["catalog"]["sources"][0]["patches"][0]["selected"] = False
+    state["catalog"]["selection"]["stored"] = {"two/patches": ["Same"]}
+    state["catalog"]["selection"]["resolved"] = {"two/patches": ["Same"]}
+
+    dialog = open_edit(page)
+    selected_tab = dialog.get_by_role("tab").filter(has_text="two/patches")
+    expect(selected_tab).to_have_attribute("aria-selected", "true")
+    expect(selected_tab).to_contain_text("1 available")
+    expect(selected_tab).to_contain_text("Selected")
+
+    disclosure = dialog.locator("details summary")
+    expect(disclosure).to_be_visible()
+    disclosure.focus()
+    page.keyboard.press("Enter")
+    page.keyboard.press("Tab")
+    empty_tab = dialog.get_by_role("tab").filter(has_text="unreadable/patches")
+    expect(empty_tab).to_be_visible()
+    expect(empty_tab).to_have_attribute("tabindex", "0")
+    expect(empty_tab).to_be_focused()
+    empty_tab.click()
+    expect(dialog.get_by_role("status").filter(has_text="unreadable")).to_be_visible()
+
+
+def test_active_source_stays_visible_when_last_saved_patch_is_removed(
+    patch_dialog_page,
+):
+    page, _ = patch_dialog_page
+    dialog = open_edit(page)
+    stale_tab = dialog.get_by_role("tab").filter(has_text="stale/patches")
+    stale_tab.click()
+    dialog.get_by_role("checkbox", name="Removed upstream").uncheck()
+
+    expect(stale_tab).to_be_visible()
+    expect(stale_tab).to_have_attribute("aria-selected", "true")
+    expect(
+        dialog.get_by_role("tabpanel").filter(has_text="Removed upstream")
+    ).to_be_visible()
+
+
+def test_all_empty_catalog_keeps_initial_source_tab_discoverable(patch_dialog_page):
+    page, state = patch_dialog_page
+    for source in state["catalog"]["sources"]:
+        source["patches"] = []
+    state["catalog"]["selection"] = {
+        "stored": {},
+        "resolved": {},
+        "status": "empty",
+        "unresolved": [],
+        "error": None,
+    }
+
+    dialog = open_edit(page)
+    first_tab = dialog.get_by_role("tab").filter(has_text="one/patches")
+    expect(first_tab).to_be_visible()
+    expect(first_tab).to_have_attribute("aria-selected", "true")
+    expect(dialog.get_by_role("tabpanel")).to_be_visible()
 
 
 def test_newer_app_catalog_request_owns_loading_selection_and_save_payload(
@@ -589,6 +651,7 @@ def test_partial_grouped_selection_keeps_healthy_duplicate_provider_choices(
 def test_unreadable_source_warning_does_not_block_other_sources(patch_dialog_page):
     page, _ = patch_dialog_page
     dialog = open_edit(page)
+    dialog.locator("details summary").click()
     dialog.get_by_role("tab").filter(has_text="unreadable/patches").click()
     expect(dialog.get_by_role("status").filter(has_text="unreadable")).to_be_visible()
     dialog.get_by_role("tab").filter(has_text="one/patches").click()
@@ -634,6 +697,8 @@ def test_source_tabs_are_keyboard_operable_and_reflow_at_phone_width(patch_dialo
     page.keyboard.press("ArrowRight")
     expect(tabs.nth(1)).to_have_attribute("aria-selected", "true")
     expect(tabs.nth(1)).to_be_focused()
+    assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+    page.set_viewport_size({"width": 390, "height": 844})
     assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
     page.keyboard.press("Escape")
     expect(dialog).to_be_hidden()

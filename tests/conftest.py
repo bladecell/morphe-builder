@@ -78,6 +78,8 @@ def isolated_data_dir(tmp_path, monkeypatch):
     for secret_name in (
         "GITHUB_TOKEN",
         "APPRISE_URLS",
+        "SERVER_URL",
+        "CRON_SCHEDULE",
     ):
         monkeypatch.delenv(secret_name, raising=False)
     return tmp_path

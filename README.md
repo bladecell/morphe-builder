@@ -15,8 +15,11 @@ Morphe Builder is an automated Android application patcher with a Web UI and Obt
 
 - **Docker:** (Recommended) No other dependencies are required.
 - **Manual Installation:**
+  - [uv](https://docs.astral.sh/uv/)
   - Python 3.12+
   - Java 21+ (required for [Morphe CLI](https://github.com/MorpheApp/morphe-cli) and APKEditor)
+  - ShardX browser engine and Chromium system libraries (see below)
+  - `apkeep` on `PATH` for the optional APKPure fallback
 
 ## Getting Started
 
@@ -61,14 +64,32 @@ docker run -d \
 
 1. Install dependencies:
    ```bash
-   uv sync
+   uv sync --frozen
    ```
 2. Run the application:
    ```bash
    uv run uvicorn src.main:app --host 0.0.0.0 --port 8000
    ```
 
+The Python packages alone are not the complete browser setup. Install the
+Chromium system libraries and provision the ShardX engine before running the
+app; the [Dockerfile](Dockerfile) contains the Linux setup and pinned engine
+archive hashes. Playwright connects to ShardX, so a separate Playwright Chromium
+browser download is not needed. Docker is the recommended way to get the
+complete runtime.
+
+Open `http://localhost:8000`. Run **one Uvicorn worker**: configuration locking
+is process-local, and multiple workers would also start separate schedulers and
+browser workers. The manual command binds to all interfaces; the same network
+access and HTTPS precautions described above apply.
+
 ## Development
+
+Install the locked dependencies with `uv sync --frozen`. Run the test suite with:
+
+```bash
+uv run pytest
+```
 
 ### Page styles and scripts
 
@@ -103,7 +124,10 @@ and `THIRD_PARTY_NOTICES`.
 
 ## Configuration
 
-Settings are managed via `config.yaml` in the root directory or through the Web UI's Settings tab.
+Settings are managed through the Web UI's Settings tab or `DATA_DIR/config.yaml`.
+`DATA_DIR` defaults to the project root for local runs and is `/data` in Docker.
+Keep this directory persistent: it also contains downloaded tools, APKs, build
+metadata and the optional secrets file.
 
 ### Runtime environment
 
@@ -117,16 +141,39 @@ docker run -d \
   -v "$(pwd)/data:/data" \
   -e GITHUB_TOKEN \
   -e APPRISE_URLS \
+  -e SERVER_URL='https://builder.example.net' \
+  -e CRON_SCHEDULE='0 */4 * * *' \
   -e ALLOWED_HOSTS='builder.example.net,https://builder.example.net' \
   --name morphe-builder \
   bladecell/morphe-builder:latest
 ```
 
-Omit either of `GITHUB_TOKEN` or `APPRISE_URLS` when
+All of these variables are optional:
+
+| Variable | Purpose | When omitted |
+| --- | --- | --- |
+| `SERVER_URL` | Public HTTP(S) address used for app links and request trust checks | Uses the saved server URL |
+| `CRON_SCHEDULE` | Five-field build schedule, e.g. `0 */4 * * *` (every four hours) | Uses the saved schedule |
+| `GITHUB_TOKEN` | GitHub API token, passed from the host environment without exposing it in the command | Uses the stored token, if any |
+| `APPRISE_URLS` | Notification URLs as a JSON array of strings | Uses stored notification configuration |
+| `ALLOWED_HOSTS` | Comma-separated trusted host names and origins | Uses the server URL and built-in local-host rules |
+
+Omit `GITHUB_TOKEN`, `APPRISE_URLS`, `SERVER_URL`, or `CRON_SCHEDULE` when
 not configured. `APPRISE_URLS`, when supplied, must be a JSON array of strings.
 Use a deployment secret manager or a protected host environment to supply
 values; do not put real values in shell history, compose files committed to a
 repository, or this documentation.
+
+`SERVER_URL` and `CRON_SCHEDULE` optionally override the corresponding Settings
+values at runtime without changing `config.yaml`; the overridden fields are
+read-only in the UI and cannot be changed by settings saves. `SERVER_URL` must
+be a non-empty HTTP(S) URL. `CRON_SCHEDULE` uses five-field crontab syntax; an
+empty value disables scheduled builds. Invalid values prevent startup. When
+unset, each setting continues to use its saved configuration value.
+
+To explicitly disable scheduling, pass `-e CRON_SCHEDULE=''`. Removing the
+variable instead restores the saved schedule. These are runtime options for
+`docker run`; do not pass tokens as build arguments or bake them into the image.
 
 ### Secrets
 
@@ -163,8 +210,10 @@ APKMirror is scraped with [ShardX](https://github.com/ProxyShard/ShardBrowser)
 (`shardx==2.0.3`, MIT), a patched Chromium. No licence key is needed. The app
 launches the engine headless, attaches Playwright over CDP, and uses a throwaway
 profile per launch (`--no-sandbox` when running as root). The engine (about
-170 MB) is downloaded from a ProxyShard CDN, unsigned, at Docker build time
-only; see the Dockerfile. It replaced cloakbrowser because that browser could
+170 MB) is downloaded from a ProxyShard CDN at Docker build time. The archives
+are unsigned, but the Docker build verifies pinned SHA-256 hashes before
+extraction and checks for missing shared libraries; see the Dockerfile. It
+replaced cloakbrowser because that browser could
 not pass APKMirror's Cloudflare challenge in Docker.
 
 An old `CLOAKBROWSER_LICENSE_KEY` is removed from `.env` and the environment at
@@ -239,8 +288,13 @@ patch was loaded.
 
 To add an app to Obtainium:
 1. Open the Morphe Builder Web UI.
-2. In the **Pipeline** tab, click the **+ (Plus)** icon on an app card.
-3. If you have Obtainium installed, it will prompt to add the app using the generated API link.
+2. Set **Server URL** in Settings to the address your Android device can reach.
+3. Build the app, then use the **Add to Obtainium (App API)** action on its
+   Pipeline card.
+4. If Obtainium is installed, it will open the generated `/view/<obtainium_id>`
+   URL as an HTML source for version extraction and APK downloads.
 
-Alternatively, add the following URL to Obtainium:
-`http://<your-server-ip>:8000/api/apps/<obtainium_id>`
+The button's current label says “App API”, but its link uses the HTML view.
+You can also add that view URL manually, or use the JSON endpoint:
+`http://<your-server-ip>:8000/api/apps/<obtainium_id>`. Replace the base address
+with your configured public HTTPS URL when using a reverse proxy.

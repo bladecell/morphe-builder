@@ -18,6 +18,7 @@ import hashlib
 import shutil
 import json
 import math
+import os
 import re
 import sys
 import io
@@ -746,6 +747,10 @@ async def web_ui(request: Request):
             "config": config,
             "available_apps": available_apps,
             "metadata": metadata,
+            "environment_settings": {
+                "server_url": "SERVER_URL" in os.environ,
+                "cron_schedule": "CRON_SCHEDULE" in os.environ,
+            },
         },
     )
 
@@ -1960,13 +1965,17 @@ def save_settings(payload: SaveSettingsPayload) -> dict[str, str]:
         raise HTTPException(status_code=400, detail=APPRISE_SETTINGS_REJECTED)
     with NOTIFICATION_URLS_LOCK:
         stored = load_config().get("settings", {}).get("server_url")
+        server_url_from_environment = "SERVER_URL" in os.environ
+        cron_from_environment = "CRON_SCHEDULE" in os.environ
         unchanged = isinstance(stored, str) and payload.server_url.rstrip(
             "/"
         ) == stored.rstrip("/")
         # A value already stored never blocks saving the other settings (the page
         # posts all of them); only a changed value has to be valid. Empty means
         # unset.
-        acceptable = unchanged or payload.server_url == ""
+        acceptable = (
+            server_url_from_environment or unchanged or payload.server_url == ""
+        )
         if not acceptable and not request_guards.is_valid_server_url(
             payload.server_url
         ):
@@ -1974,8 +1983,10 @@ def save_settings(payload: SaveSettingsPayload) -> dict[str, str]:
 
         def apply(config: dict) -> None:
             settings = config.setdefault("settings", {})
-            settings["server_url"] = payload.server_url.rstrip("/")
-            settings["cron_schedule"] = payload.cron_schedule
+            if not server_url_from_environment:
+                settings["server_url"] = payload.server_url.rstrip("/")
+            if not cron_from_environment:
+                settings["cron_schedule"] = payload.cron_schedule
 
         update_config(apply)
         with CRON_LOCK:
@@ -2705,6 +2716,21 @@ def get_apps(request: Request):
 CRON_JOB_IDS = ("periodic_build", "version_refresh")
 
 
+def validate_environment_settings() -> None:
+    """Reject invalid environment overrides before startup proceeds."""
+    if "SERVER_URL" in os.environ and not request_guards.is_valid_server_url(
+        os.environ["SERVER_URL"]
+    ):
+        raise ValueError("Invalid SERVER_URL: expected a non-empty http(s) URL")
+    if cron_schedule := os.environ.get("CRON_SCHEDULE"):
+        try:
+            CronTrigger.from_crontab(cron_schedule)
+        except ValueError as error:
+            raise ValueError(
+                "Invalid CRON_SCHEDULE: expected a five-field crontab expression"
+            ) from error
+
+
 def setup_cron_job(config: dict) -> None:
     """Replace the scheduled build and version refresh from the settings.
 
@@ -2742,6 +2768,7 @@ def setup_cron_job(config: dict) -> None:
 async def startup_event() -> None:
     """Start the worker and scheduler, and sync the tools if they are missing."""
     global DIAGNOSTICS
+    validate_environment_settings()
     # First, before anything is started: take the secrets out of os.environ so
     # no thread, subprocess or library inherits them.
     secrets_store.absorb_environment()

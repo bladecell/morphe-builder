@@ -413,7 +413,7 @@ _server_url_cache: dict[str, object] = {"key": None, "value": None}
 
 
 def read_server_url() -> str | None:
-    """Return `settings.server_url` from config.yaml without side effects.
+    """Return the effective server URL without side effects.
 
     Unlike `config_store.load_config` this never seeds a missing file and takes no
     lock. The result, including a failure, is cached per file version (inode,
@@ -421,6 +421,9 @@ def read_server_url() -> str | None:
     returns None, so the allow-list falls back to IP literals, localhost and
     `ALLOWED_HOSTS` (fail closed).
     """
+    if "SERVER_URL" in os.environ:
+        env_value = os.environ["SERVER_URL"]
+        return env_value.rstrip("/") if is_valid_server_url(env_value) else None
     path = config_store.DATA_DIR / "config.yaml"
     try:
         info = path.stat()
