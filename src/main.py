@@ -41,6 +41,7 @@ from src.patcher import (
     normalize_repo,
     current_patch_catalog,
     plan_source_sync,
+    reconcile_app_patches,
     update_tools,
     get_current_version,
     check_dependencies,
@@ -2784,6 +2785,7 @@ async def startup_event() -> None:
     secrets_store.absorb_environment()
     ensure_data_dirs()
     remove_legacy_cloakbrowser_cache()
+    update_config(reconcile_app_patches)
     config = load_config()
     _effective_apprise_urls(config)
     setup_cron_job(config)
