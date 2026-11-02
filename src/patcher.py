@@ -1647,6 +1647,69 @@ def active_selected_repos(app: dict, config: dict | None) -> set[str]:
     }
 
 
+def _default_enabled(patch: dict[str, object]) -> bool:
+    """Tell whether a patch record is on by default, across schema variants."""
+    return bool(
+        patch.get("default", patch.get("enabled_by_default", patch.get("use", True)))
+    )
+
+
+def current_patch_catalog(config: dict, package_id: str) -> dict[str, dict[str, bool]]:
+    """Map each readable active source to its compatible patches and defaults.
+
+    Args:
+        config: The loaded config.
+        package_id: Package the patches must apply to.
+
+    Returns:
+        `{repo: {patch name: enabled by default}}`. Sources that are inactive,
+        invalid, missing or unreadable are left out.
+    """
+    catalog: dict[str, dict[str, bool]] = {}
+    for source in config.get("sources", []):
+        repo = source.get("repo")
+        if not is_valid_repo(repo) or not source.get("active", True):
+            continue
+        try:
+            records = compatible_patches(repo, package_id)
+        except PatchListError:
+            continue
+        catalog[repo] = {str(r["name"]): _default_enabled(r) for r in records}
+    return catalog
+
+
+def reconcile_app_patches(config: dict) -> None:
+    """Drop removed patches and add new default ones in every app, in place.
+
+    Per source-keyed app, `known_patches` records the patches seen at the last
+    reconcile or save. A selected patch no longer in the source is deselected; a
+    patch not in `known_patches` that is on by default is selected. Without a
+    record only removals apply. Legacy list selections are left alone.
+
+    Args:
+        config: Config dict to update.
+    """
+    for app in config.get("apps", []):
+        included = app.get("include_patches")
+        if not isinstance(included, dict):
+            continue
+        known = app.setdefault("known_patches", {})
+        for repo, patches in current_patch_catalog(config, app["id"]).items():
+            key = next((k for k in included if k.casefold() == repo.casefold()), None)
+            if key is None:
+                continue
+            by_fold = {name.casefold(): name for name in patches}
+            kept = [n for n in included[key] if n.casefold() in by_fold]
+            old = {n.casefold() for n in known.get(repo, [])} if repo in known else None
+            if old is not None:
+                have = {n.casefold() for n in kept}
+                kept += [
+                    n for n in patches if patches[n] and n.casefold() not in old | have
+                ]
+            included[key] = kept
+            known[repo] = list(patches)
+
+
 def save_app_result(app_id: str, **fields: object) -> None:
     """Merge pipeline-owned fields into one app of the current config.
 
@@ -1793,7 +1856,11 @@ def _update_tools_locked(config: dict, quiet: bool, force: bool) -> bool:
     _apply_versions(config, local_versions)
     if any_updated:
         # Persist onto the file as it is now: `config` may be a stale snapshot.
-        update_config(lambda current: _apply_versions(current, local_versions))
+        def persist(current: dict) -> None:
+            _apply_versions(current, local_versions)
+            reconcile_app_patches(current)
+
+        update_config(persist)
 
     if not quiet:
         print("---------------------------------\n")

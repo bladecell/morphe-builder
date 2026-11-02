@@ -16,7 +16,7 @@ For design rationale see [architecture.md](architecture.md) and
   `uv run uvicorn src.main:app --host 0.0.0.0 --port 8000`.
 - `src/patcher.py`: `python -m src.patcher` runs one full pipeline pass without the web
   app.
-- `Dockerfile`: `python:3.12-slim-bookworm` plus Java 17, `uv sync --frozen`,
+- `Dockerfile`: `python:3.12-slim-bookworm` plus Java 21 (Temurin JRE), `uv sync --frozen`,
   Playwright Chromium, the ShardX engine (pre-fetched at build) and the hash-pinned `apkeep`. Sets `DATA_DIR=/data`, exposes 8000.
 - `pyproject.toml`: dependencies and tool config (pytest `pythonpath = ["."]`, ruff
   line length 88, mypy). Python >= 3.12, managed with `uv`.

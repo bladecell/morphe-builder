@@ -39,6 +39,7 @@ from src.patcher import (
     find_file_collision,
     get_source_paths,
     normalize_repo,
+    current_patch_catalog,
     plan_source_sync,
     update_tools,
     get_current_version,
@@ -1245,6 +1246,15 @@ def add_app_to_config(payload: AddAppPayload) -> dict[str, str]:
             "obtainium_id": f"morphe_{payload.package_id.split('.')[-1]}",
             "include_patches": includes,
             "exclude_patches": existing.get("exclude_patches", []) if existing else [],
+        }
+        new_app["known_patches"] = {
+            **((existing or {}).get("known_patches") or {}),
+            **{
+                repo: list(patches)
+                for repo, patches in current_patch_catalog(
+                    config, payload.package_id
+                ).items()
+            },
         }
         # Preserve state (pinned version, last build, status) when editing an app
         if existing is not None:
