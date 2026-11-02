@@ -14,7 +14,7 @@ dependencies = [
     "python-multipart>=0.0.20",
     "apprise>=1.9.2",
     "uvicorn>=0.42.0",
-    "shardx==2.0.3",
+    "shardx==2.1.0",
     "selectolax>=0.4.10",
     "playwright>=1.60.0",
 ]

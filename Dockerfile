@@ -51,7 +51,7 @@ RUN mkdir -p /data
 # fails on mismatch. To update: re-download, sha256sum, replace the pins below.
 ENV XDG_CACHE_HOME=/opt/xdg-cache
 RUN uv run python -c "import hashlib,sys,zipfile; from shardx import ShardX, runtime as r; \
-P={'.ShardX-Linux.zip.tmp':'3ead1629a1c893f248cd01ee7c9125552b2cac5c91846cb71d6cb1b24883c213','.ShardX-Widevine-Linux.zip.tmp':'44fb1a3afd884d650904b88637eef8cede162ea5d302292a7b8813deafb751dc','bundle.zip':'6ed51c9571b0100a5fa56b578cbc6e118b3d47eb5182759d66be4f55712bb66f'}; seen=set(); \
+P={'.ShardX-Linux.zip.tmp':'1de8a89ea228e4a0a602fd0c13c7a324fe5f310e9b08b0c4bf37e9ed0c474fcd','.ShardX-Widevine-Linux.zip.tmp':'44fb1a3afd884d650904b88637eef8cede162ea5d302292a7b8813deafb751dc','bundle.zip':'c16c6c6a680a9b6b364558970a24b5d0c421e5374f57db085d346e3fe24be68d'}; seen=set(); \
 chk=lambda p:(seen.add(str(p)),None)[1] if hashlib.sha256(open(p,'rb').read()).hexdigest()==P[__import__('os').path.basename(p)] else sys.exit('sha256 mismatch: '+str(p)); \
 r._system_unzip=lambda a,d,o=r._system_unzip:(chk(a),o(a,d))[1]; \
 r.zipfile.ZipFile=lambda p,*a,o=zipfile.ZipFile:(chk(p),o(p,*a))[1]; \
