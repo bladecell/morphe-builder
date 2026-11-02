@@ -1854,13 +1854,15 @@ def _update_tools_locked(config: dict, quiet: bool, force: bool) -> bool:
     # SYNC VERSIONS BACK TO CONFIG
     local_versions = load_local_versions()
     _apply_versions(config, local_versions)
-    if any_updated:
-        # Persist onto the file as it is now: `config` may be a stale snapshot.
-        def persist(current: dict) -> None:
-            _apply_versions(current, local_versions)
-            reconcile_app_patches(current)
 
-        update_config(persist)
+    def persist(current: dict) -> None:
+        _apply_versions(current, local_versions)
+        reconcile_app_patches(current)
+
+    # Reconcile even when nothing was downloaded: the patch lists on disk may
+    # already differ from the saved selections (an earlier sync, a throttled check).
+    # Persist onto the file as it is now: `config` may be a stale snapshot.
+    update_config(persist)
 
     if not quiet:
         print("---------------------------------\n")
